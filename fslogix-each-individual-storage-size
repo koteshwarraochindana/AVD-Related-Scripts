@@ -1,0 +1,73 @@
+$FSLogixPath = "\\fileserver\FSLogixProfiles"
+$OutputCsv = "C:\FSLogixUsageReport.csv"
+
+Write-Host "Scanning FSLogix containers in: $FSLogixPath" -ForegroundColor Cyan
+
+# Get all VHDX files (Profile + Office)
+$ProfileFiles = Get-ChildItem -Path $FSLogixPath -Recurse -Filter *.vhdx -ErrorAction SilentlyContinue
+
+if (-not $ProfileFiles) {
+    Write-Host "No FSLogix containers found." -ForegroundColor Red
+    exit
+}
+
+$Results = @()
+
+foreach ($File in $ProfileFiles) {
+    Write-Host "Processing: $($File.FullName)" -ForegroundColor Yellow
+
+    # Identify container type
+    $ContainerType = if ($File.Name -match "ODFC|Office|O365") {
+        "Office Container"
+    } else {
+        "Profile Container"
+    }
+
+    # Extract username from folder name
+    $FolderName = $File.Directory.Name
+    if ($FolderName -match "S-1-5-\d{2,}-\d{2,}-\d{2,}-\d{2,}-(?<User>[A-Za-z0-9._-]+)") {
+        $UserName = $Matches['User']
+    } else {
+        # Fallback if not SID-based
+        $UserName = $FolderName
+    }
+
+    # Mount read-only
+    $Mount = Mount-VHD -Path $File.FullName -Passthru -ReadOnly -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    $Disk = Get-DiskImage -ImagePath $File.FullName | Get-Disk | Get-Partition | Get-Volume
+    if ($Disk) {
+        $Results += [PSCustomObject]@{
+            UserName      = $UserName
+            ContainerType = $ContainerType
+            FileName      = $File.Name
+            TotalGB       = [math]::Round($Disk.Size / 1GB, 2)
+            UsedGB        = [math]::Round(($Disk.Size - $Disk.SizeRemaining) / 1GB, 2)
+            FreeGB        = [math]::Round($Disk.SizeRemaining / 1GB, 2)
+            FilePath      = $File.FullName
+        }
+    }
+
+    # Dismount
+    Dismount-VHD -Path $File.FullName -ErrorAction SilentlyContinue
+}
+
+# Display table
+$Results | Format-Table -AutoSize
+
+# --- Summary ---
+$TotalContainers = $Results.Count
+$TotalAllocated = ($Results.TotalGB | Measure-Object -Sum).Sum
+$TotalUsed = ($Results.UsedGB | Measure-Object -Sum).Sum
+$TotalFree = ($Results.FreeGB | Measure-Object -Sum).Sum
+
+Write-Host "`n--- Storage Summary ---" -ForegroundColor Cyan
+Write-Host "Total Containers : $TotalContainers"
+Write-Host "Total Allocated  : $([math]::Round($TotalAllocated,2)) GB"
+Write-Host "Total Used       : $([math]::Round($TotalUsed,2)) GB"
+Write-Host "Total Free       : $([math]::Round($TotalFree,2)) GB"
+
+# --- Export to CSV ---
+$Results | Export-Csv -Path $OutputCsv -NoTypeInformation
+Write-Host "`nReport saved to: $OutputCsv" -ForegroundColor Green
