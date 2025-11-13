@@ -1,0 +1,23 @@
+# List of critical AVD service URLs
+$avdUrls = @(
+    "https://rdgateway.wvd.microsoft.com",
+    "https://rdbroker.wvd.microsoft.com",
+    "https://wvd.microsoft.com",
+    "https://servicebus.windows.net",
+    "https://wvdportalstorageblob.blob.core.windows.net"
+)
+
+Write-Host "Testing AVD URL Reachability..." -ForegroundColor Cyan
+
+foreach ($url in $avdUrls) {
+    try {
+        $result = Test-NetConnection -ComputerName ($url -replace 'https://','') -Port 443 -WarningAction SilentlyContinue
+        if ($result.TcpTestSucceeded) {
+            Write-Host "$url : Reachable" -ForegroundColor Green
+        } else {
+            Write-Host "$url : Blocked/Unreachable" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "$url : Error testing" -ForegroundColor Yellow
+    }
+}
