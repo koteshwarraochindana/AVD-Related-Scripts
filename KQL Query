@@ -96,4 +96,37 @@ disk_free_space_percent
 | project Computer, InstanceName, Disc_Space_Percent, Free_MB
 | order by Disc_Space_Percent desc
 
+---------------------------------------------------------------
+
+// 1. Percentage of free space (% Free Space)
+let disk_free_space_percent =
+    Perf
+    | where TimeGenerated > ago(5m)
+    | where Computer startswith "pavw4"
+    | where ObjectName == "LogicalDisk"           // update if your workspace uses: "Logical Disk"
+    | where CounterName == "% Free Space"         // update if workspace uses: "Free Space %"
+    | where InstanceName contains "C"             // update if workspace uses "C:"
+    | summarize Disc_Space_Percent = (100 - avg(CounterValue))
+        by Computer, InstanceName
+    | where Disc_Space_Percent > 90;
+
+// 2. Free Megabytes (to show actual GB remaining)
+let disk_free_MB =
+    Perf
+    | where TimeGenerated > ago(5m)
+    | where Computer startswith "pavw4"
+    | where ObjectName == "LogicalDisk"           
+    | where CounterName == "Free Megabytes"
+    | summarize (TimeGenerated, Free_MB) = arg_max(TimeGenerated, CounterValue)
+        by Computer, InstanceName;
+
+// 3. Join both datasets
+disk_free_space_percent
+| join kind=inner disk_free_MB on Computer, InstanceName
+| project Computer,
+          Drive = InstanceName,
+          Disc_Space_Percent,
+          Free_MB,
+          Free_GB = round(Free_MB / 1024.0, 2)
+| order by Disc_Space_Percent desc
 
