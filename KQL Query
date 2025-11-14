@@ -63,9 +63,12 @@ connectionSummary
 
 ---------------------------------------------
 
-let connectionSummary = 
+let connectionSummary =
     WVDConnections
     | where TimeGenerated > ago(31d)
-    | summarize NumberOfConnections = count() by UserName, ClientIPAddress
-    | take 5;
+    | summarize NumberOfConnections = count() by UserName, ClientIPAddress;
+
+connectionSummary
+| take 5
+
 
