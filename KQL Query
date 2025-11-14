@@ -60,3 +60,12 @@ connectionSummary
           DurationHours, 
           DurationDays
 | order by NumberOfConnections desc
+
+---------------------------------------------
+
+let connectionSummary = 
+    WVDConnections
+    | where TimeGenerated > ago(31d)
+    | summarize NumberOfConnections = count() by UserName, ClientIPAddress
+    | take 5;
+
