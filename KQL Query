@@ -70,5 +70,30 @@ let connectionSummary =
 
 connectionSummary
 | take 5
+---------------------------------------
+
+let disk_free_space_percent =
+    Perf
+    | where TimeGenerated > ago(5m)
+    | where Computer contains "avd"
+    | where ObjectName == "LogicalDisk"
+    | where CounterName == "% Free Space"
+    | where InstanceName contains "C:"
+    | summarize Disc_Space_Percent = (100 - avg(CounterValue)) by Computer, InstanceName
+    | where strlen(InstanceName) == 2 and InstanceName contains ":"
+    | where Disc_Space_Percent > 90;
+
+let disk_free_MB =
+    Perf
+    | where TimeGenerated > ago(5m)
+    | where ObjectName == "LogicalDisk"
+    | where CounterName == "Free Megabytes"
+    | summarize (TimeGenerated, Free_MB) = arg_max(TimeGenerated, CounterValue) by Computer, InstanceName
+    | where strlen(InstanceName) == 2 and InstanceName contains ":";
+
+disk_free_space_percent
+| join kind=inner (disk_free_MB) on Computer, InstanceName
+| project Computer, InstanceName, Disc_Space_Percent, Free_MB
+| order by Disc_Space_Percent desc
 
 
