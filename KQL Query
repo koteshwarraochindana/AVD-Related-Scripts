@@ -1,1 +1,63 @@
 
+let daysAgo = 31d;
+
+// Connection summary
+let connectionSummary = 
+    WVDConnections
+    | where TimeGenerated > ago(daysAgo)
+    | extend ConnectionType = case(
+        TransportType == "Reverse Connect" or TransportType == "TCP", "TCP",
+        TransportType == "Shortpath" or TransportType == "UDP", "UDP",
+        TransportType == "RDP", "RDP",
+        isnull(TransportType) or TransportType == "", "Unknown",
+        "Other"
+    )
+    | summarize NumberOfConnections = count(), 
+                ConnectionTypes = make_set(ConnectionType), 
+                SessionHosts = make_set(SessionHostName) 
+        by UserName, ClientIPAddress
+    | extend ip_location = parse_json(ip_location_from_ip_address(ClientIPAddress))
+    | extend Country = tostring(ip_location.country), 
+             City = tostring(ip_location.city);
+
+// Error summary
+let errorSummary = 
+    WVDErrors
+    | where TimeGenerated > ago(daysAgo)
+    | summarize ErrorCount = count(), 
+                ErrorCodes = make_set(CodeSymbolic) 
+        by UserName;
+
+// Duration summary
+let durationSummary = 
+    WVDConnections
+    | where TimeGenerated > ago(daysAgo)
+    | where State == "Connected"
+    | project CorrelationId, UserName, ConnectionType, StartTime = TimeGenerated
+    | join kind=leftouter (
+        WVDConnections
+        | where State == "Completed"
+        | project EndTime = TimeGenerated, CorrelationId
+    ) on CorrelationId
+    | extend SessionDuration = EndTime - StartTime
+    | summarize TotalDuration = sum(SessionDuration) by UserName, ConnectionType
+    | extend DurationHours = round(TotalDuration / 1h, 2), 
+             DurationDays = round(DurationHours / 24, 2);
+
+// Final query that starts after all let blocks
+connectionSummary
+| join kind=leftouter errorSummary on UserName
+| join kind=leftouter durationSummary on UserName
+| project UserName, 
+          SessionHosts, 
+          NumberOfConnections, 
+          ClientIPAddress, 
+          ConnectionTypes, 
+          Country, 
+          State, 
+          City, 
+          ErrorCount, 
+          ErrorCodes, 
+          DurationHours, 
+          DurationDays
+| order by NumberOfConnections desc
