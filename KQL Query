@@ -130,3 +130,23 @@ disk_free_space_percent
           Free_GB = round(Free_MB / 1024.0, 2)
 | order by Disc_Space_Percent desc
 
+----------------------------------------------------------------
+
+$urls = @(
+"global.wvd.microsoft.com",
+"rdweb.wvd.microsoft.com",
+"ncus.rdbroker.wvd.microsoft.com",
+"ncus.gcs.wvd.microsoft.com",
+"scus.rdbroker.wvd.microsoft.com",
+"scus.gcs.wvd.microsoft.com"
+)
+
+while ($true) {
+    foreach ($url in $urls) {
+        $r = Test-NetConnection $url -Port 443
+        Write-Host "$($url) : $($r.TcpTestSucceeded)" -ForegroundColor Yellow
+    }
+    Start-Sleep 5
+}
+
+
