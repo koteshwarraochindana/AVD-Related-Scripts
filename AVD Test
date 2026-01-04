@@ -1,0 +1,88 @@
+# ============================================================
+# AVD Workspace → HostPool → VM Assignment Report
+# Multi-Subscription Version
+# ============================================================
+
+# ----------------------------
+# LOGIN
+# ----------------------------
+Connect-AzAccount
+
+# ----------------------------
+# SUBSCRIPTIONS TO REPORT
+# ----------------------------
+$SubscriptionIds = @(
+    "a1b2c3d4-5678-90ab-cdef-111213141516",  # Subscription 1
+    "b2c3d4e5-6789-01bc-def2-222324252627"   # Subscription 2
+)
+
+# ----------------------------
+# MAIN REPORT ARRAY
+# ----------------------------
+$finalReport = @()
+
+foreach ($SubscriptionId in $SubscriptionIds) {
+
+    Write-Host "`nProcessing subscription: $SubscriptionId ..." -ForegroundColor Cyan
+
+    # Set the context to this subscription
+    Set-AzContext -SubscriptionId $SubscriptionId
+
+    # Safety check
+    if ((Get-AzContext).Subscription.Id -ne $SubscriptionId) {
+        Write-Warning "Failed to switch context to $SubscriptionId. Skipping..."
+        continue
+    }
+
+    # Get all Workspaces in this subscription
+    $workspaces = Get-AzWvdWorkspace
+
+    foreach ($ws in $workspaces) {
+
+        foreach ($agRef in $ws.ApplicationGroupReference) {
+
+            # Get Application Group
+            $ag = Get-AzWvdApplicationGroup -ResourceId $agRef
+
+            # Extract Host Pool info from ARM path
+            $hpIdParts = $ag.HostPoolArmPath -split "/"
+            $hpRG   = $hpIdParts[$hpIdParts.IndexOf("resourceGroups") + 1]
+            $hpName = $hpIdParts[-1]
+
+            # Get Host Pool
+            $hp = Get-AzWvdHostPool -ResourceGroupName $hpRG -Name $hpName
+
+            # Get Session Hosts
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $hpRG -HostPoolName $hpName
+
+            # Assignment counts (Personal desktops)
+            $assignedVMs   = $sessionHosts | Where-Object { $_.AssignedUser }
+            $unassignedVMs = $sessionHosts | Where-Object { -not $_.AssignedUser }
+
+            # Add to final report
+            $finalReport += [PSCustomObject]@{
+                SubscriptionId    = $SubscriptionId
+                WorkspaceName     = $ws.Name
+                WorkspaceRG       = $ws.ResourceGroupName
+                ApplicationGroup  = $ag.Name
+                HostPoolName      = $hpName
+                HostPoolType      = $hp.HostPoolType
+                TotalVMs          = $sessionHosts.Count
+                AssignedVMs       = $assignedVMs.Count
+                UnassignedVMs     = $unassignedVMs.Count
+            }
+        }
+    }
+}
+
+# ----------------------------
+# DISPLAY REPORT
+# ----------------------------
+$finalReport | Sort-Object SubscriptionId, WorkspaceName, HostPoolName | Format-Table -AutoSize
+
+# ----------------------------
+# OPTIONAL: EXPORT TO CSV
+# ----------------------------
+$csvFile = "AVD-MultiSubscription-Report.csv"
+$finalReport | Export-Csv $csvFile -NoTypeInformation
+Write-Host "`nReport exported to $csvFile" -ForegroundColor Green
