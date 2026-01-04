@@ -86,3 +86,15 @@ $finalReport | Sort-Object SubscriptionId, WorkspaceName, HostPoolName | Format-
 $csvFile = "AVD-MultiSubscription-Report.csv"
 $finalReport | Export-Csv $csvFile -NoTypeInformation
 Write-Host "`nReport exported to $csvFile" -ForegroundColor Green
+
+
+--------------------------------------------------------------------
+
+# Install main Azure module
+Install-Module -Name Az -Force
+
+# Install AVD (Desktop Virtualization) module
+Install-Module -Name Az.DesktopVirtualization -Force
+-----------------------------------------------------------------------
+Get-Module -ListAvailable | Where-Object {$_.Name -like "Az*"}
+
