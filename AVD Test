@@ -97,4 +97,7 @@ Install-Module -Name Az -Force
 Install-Module -Name Az.DesktopVirtualization -Force
 -----------------------------------------------------------------------
 Get-Module -ListAvailable | Where-Object {$_.Name -like "Az*"}
+----------------------------------
+Register-PSRepository -Name PSGallery -SourceLocation https://www.powershellgallery.com/api/v2 -InstallationPolicy Trusted
+
 
