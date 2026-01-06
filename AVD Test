@@ -100,4 +100,61 @@ Get-Module -ListAvailable | Where-Object {$_.Name -like "Az*"}
 ----------------------------------
 Register-PSRepository -Name PSGallery -SourceLocation https://www.powershellgallery.com/api/v2 -InstallationPolicy Trusted
 
+--------------------------------------------------------------------------------------------
+
+
+WVDConnections
+| where TimeGenerated > ago(1d)
+| extend SessionDurationHours = datetime_diff("hour", TimeGenerated, now())
+| where SessionDurationHours >= 8
+| where State in ("Active", "Disconnected")
+| project
+    TimeGenerated,
+    UserName,
+    SessionHostName,
+    State,
+    SessionDurationHours
+| order by SessionDurationHours desc
+
+------------------------------------------------
+
+WVDConnections
+| extend EndTimeFixed = iff(isnull(EndTime), now(), EndTime)
+| extend SessionDurationHours = datetime_diff("hour", StartTime, EndTimeFixed)
+| where SessionDurationHours >= 8
+| where State in ("Active", "Disconnected")
+| project
+    UserName,
+    SessionHostName,
+    State,
+    StartTime,
+    EndTimeFixed,
+    SessionDurationHours
+| order by SessionDurationHours desc
+
+--------------------------------------------
+
+WVDSessions
+| where SessionState in ("Active", "Disconnected")
+| extend SessionDurationHours = datetime_diff("hour", StartTime, now())
+| where SessionDurationHours >= 8
+| project
+    UserPrincipalName,
+    SessionHostName,
+    SessionState,
+    StartTime,
+    SessionDurationHours
+| order by SessionDurationHours desc
+
+-------------------------------------------------
+
+WVDConnections
+| extend SessionDurationHours = datetime_diff("hour", StartTime, now())
+| where SessionDurationHours >= 8
+| where State in ("Active", "Disconnected")
+| summarize LongRunningSessions = count() by SessionHostName
+| order by LongRunningSessions desc
+
+------------------------------------------------------------
+
 
