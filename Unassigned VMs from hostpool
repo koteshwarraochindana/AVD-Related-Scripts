@@ -1,0 +1,290 @@
+<#
+Interactive AVD Personal Host Pool Assignment Report (READ-ONLY)
+
+What it does:
+- Ensures PSGallery is Trusted
+- Installs required Az modules (CurrentUser) if missing
+- Authenticates (falls back to DeviceCode if interactive browser isn't supported)
+- Lets you pick Subscription and Resource Group via menu
+- Discovers all AVD Host Pools in that RG
+- For each pool: counts total session hosts, assigned, unassigned (AssignedUser empty)
+- Optional CSV export (off by default)
+
+Required Modules:
+- Az.Accounts
+- Az.Resources
+- Az.DesktopVirtualization
+#>
+
+# ----------------------------
+# Settings
+# ----------------------------
+$MaxSubscriptionMenuItems = 10
+$MaxRGMenuItems           = 30
+
+$ExportCsv = $false
+$CsvPath   = "C:\Temp\AVD_AssignmentReport_AllHostPools.csv"
+
+# ----------------------------
+# Helper: Ensure NuGet + TLS (helps in locked environments)
+# ----------------------------
+function Initialize-PSGalleryPreReqs {
+    try {
+        # TLS 1.2 for older hosts
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+    } catch {
+        Write-Host "WARNING: Could not install/verify NuGet provider. If module install fails, this is likely why." -ForegroundColor Yellow
+    }
+}
+
+# ----------------------------
+# Helper: Ensure PSGallery Trusted
+# ----------------------------
+function Set-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne "Trusted") {
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        }
+    } catch {
+        Write-Host "WARNING: Unable to set PSGallery as Trusted. Module install may prompt for confirmation." -ForegroundColor Yellow
+    }
+}
+
+# ----------------------------
+# Helper: Ensure module installed
+# ----------------------------
+function Ensure-Module {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ModuleName
+    )
+
+    $exists = Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue
+    if (-not $exists) {
+        Write-Host "Installing module: $ModuleName (CurrentUser)..." -ForegroundColor Cyan
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+# ----------------------------
+# Helper: menu selection
+# ----------------------------
+function Select-FromMenu {
+    param(
+        [Parameter(Mandatory=$true)][string]$Title,
+        [Parameter(Mandatory=$true)][array]$Items,
+        [Parameter(Mandatory=$true)][scriptblock]$LabelSelector,
+        [int]$ShowFirst = 10
+    )
+
+    if (-not $Items -or $Items.Count -eq 0) {
+        throw "No items available for selection: $Title"
+    }
+
+    Write-Host "`n$Title" -ForegroundColor Cyan
+    Write-Host ("-" * $Title.Length) -ForegroundColor Cyan
+
+    $displayCount = [Math]::Min($ShowFirst, $Items.Count)
+    for ($i = 0; $i -lt $displayCount; $i++) {
+        $label = & $LabelSelector $Items[$i]
+        Write-Host ("[{0}] {1}" -f ($i+1), $label) -ForegroundColor Yellow
+    }
+
+    if ($Items.Count -gt $displayCount) {
+        Write-Host ("... and {0} more. You can still select by number up to {1}." -f ($Items.Count - $displayCount), $Items.Count) -ForegroundColor DarkGray
+    }
+
+    while ($true) {
+        $choice = Read-Host "Enter selection number (1-$($Items.Count))"
+        $num = 0
+        if ([int]::TryParse($choice, [ref]$num) -and $num -ge 1 -and $num -le $Items.Count) {
+            return $Items[$num - 1]
+        }
+        Write-Host "Invalid selection. Try again." -ForegroundColor Red
+    }
+}
+
+# ----------------------------
+# Initialize + install modules
+# ----------------------------
+Initialize-PSGalleryPreReqs
+Set-PSGalleryTrusted
+
+# Your requested install commands (wrapped safely so it doesn't reinstall every time)
+# (We still check before install via Ensure-Module below)
+try {
+    # These lines are here per your request, but the script installs only if missing
+    # Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+    # Install-Module Az.Accounts -Scope CurrentUser -Force
+    # Install-Module Az.Resources -Scope CurrentUser -Force
+    # Install-Module Az.DesktopVirtualization -Scope CurrentUser -Force
+
+    Ensure-Module -ModuleName "Az.Accounts"
+    Ensure-Module -ModuleName "Az.Resources"
+    Ensure-Module -ModuleName "Az.DesktopVirtualization"
+}
+catch {
+    Write-Host "ERROR: Failed to install/import required Az modules. Details: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "If you are in a restricted environment, you may need Software Center/Company Portal installation instead." -ForegroundColor Yellow
+    return
+}
+
+# ----------------------------
+# Authenticate (with DeviceCode fallback for AVD/remote sessions)
+# ----------------------------
+Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+try {
+    Connect-AzAccount -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Host "Interactive browser login failed in this session (common on AVD/RDP/PS remoting)." -ForegroundColor Yellow
+    Write-Host "Falling back to Device Code authentication..." -ForegroundColor Yellow
+    Connect-AzAccount -DeviceCode -ErrorAction Stop | Out-Null
+}
+
+# ----------------------------
+# Pick Subscription
+# ----------------------------
+$subs = Get-AzSubscription | Sort-Object Name
+$selectedSub = Select-FromMenu `
+    -Title "Select an Azure Subscription" `
+    -Items $subs `
+    -LabelSelector { param($s) "{0}  ({1})" -f $s.Name, $s.Id } `
+    -ShowFirst $MaxSubscriptionMenuItems
+
+Write-Host "`nSelected Subscription: $($selectedSub.Name)" -ForegroundColor Green
+Set-AzContext -SubscriptionId $selectedSub.Id -ErrorAction Stop | Out-Null
+
+# ----------------------------
+# Pick Resource Group
+# ----------------------------
+$rgs = Get-AzResourceGroup | Sort-Object ResourceGroupName
+$selectedRG = Select-FromMenu `
+    -Title "Select a Resource Group (in subscription: $($selectedSub.Name))" `
+    -Items $rgs `
+    -LabelSelector { param($rg) $rg.ResourceGroupName } `
+    -ShowFirst $MaxRGMenuItems
+
+$rgName = $selectedRG.ResourceGroupName
+Write-Host "`nSelected Resource Group: $rgName" -ForegroundColor Green
+
+# ----------------------------
+# Discover Host Pools in RG
+# ----------------------------
+Write-Host "`nDiscovering AVD Host Pools in RG '$rgName'..." -ForegroundColor Cyan
+$hostPools = Get-AzWvdHostPool -ResourceGroupName $rgName -ErrorAction Stop | Sort-Object Name
+
+if (-not $hostPools -or $hostPools.Count -eq 0) {
+    Write-Host "No AVD Host Pools found in resource group '$rgName'." -ForegroundColor Yellow
+    return
+}
+
+Write-Host ("Found {0} host pool(s)." -f $hostPools.Count) -ForegroundColor Green
+
+# ----------------------------
+# Process each Host Pool
+# ----------------------------
+$allDetails = New-Object System.Collections.Generic.List[object]
+$allSummary = New-Object System.Collections.Generic.List[object]
+
+foreach ($hp in $hostPools) {
+    Write-Host "`n------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host ("Host Pool: {0}" -f $hp.Name) -ForegroundColor Cyan
+
+    try {
+        $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $rgName -HostPoolName $hp.Name -ErrorAction Stop
+    }
+    catch {
+        Write-Host "Failed to get session hosts for host pool '$($hp.Name)': $($_.Exception.Message)" -ForegroundColor Red
+        continue
+    }
+
+    $details = $sessionHosts | ForEach-Object {
+        $assigned = $null
+        if ($_.PSObject.Properties.Name -contains "AssignedUser") { $assigned = $_.AssignedUser }
+
+        [pscustomobject]@{
+            Subscription     = $selectedSub.Name
+            ResourceGroup    = $rgName
+            HostPoolName     = $hp.Name
+            HostPoolType     = $hp.HostPoolType
+            SessionHostName  = $_.Name
+            VMName           = ($_.Name -split "/")[-1]
+            Status           = $_.Status
+            AllowNewSession  = $_.AllowNewSession
+            AssignedUser     = $assigned
+            IsAssigned       = -not [string]::IsNullOrWhiteSpace($assigned)
+        }
+    }
+
+    foreach ($d in $details) { $allDetails.Add($d) }
+
+    $total     = $details.Count
+    $assignedC = ($details | Where-Object { $_.IsAssigned }).Count
+    $emptyC    = ($details | Where-Object { -not $_.IsAssigned }).Count
+
+    $summaryObj = [pscustomobject]@{
+        Subscription          = $selectedSub.Name
+        ResourceGroup         = $rgName
+        HostPoolName          = $hp.Name
+        HostPoolType          = $hp.HostPoolType
+        TotalSessionHosts     = $total
+        AssignedCount         = $assignedC
+        UnassignedEmptyCount  = $emptyC
+    }
+    $allSummary.Add($summaryObj)
+
+    Write-Host ("Type: {0}" -f $hp.HostPoolType) -ForegroundColor Yellow
+    Write-Host ("Total Session Hosts : {0}" -f $total) -ForegroundColor Cyan
+    Write-Host ("Assigned            : {0}" -f $assignedC) -ForegroundColor Green
+    Write-Host ("Unassigned (Empty)  : {0}" -f $emptyC) -ForegroundColor Magenta
+
+    if ($emptyC -gt 0) {
+        Write-Host "`nUnassigned session hosts in this pool:" -ForegroundColor Cyan
+        $details |
+            Where-Object { -not $_.IsAssigned } |
+            Sort-Object VMName |
+            Select-Object VMName, Status, AllowNewSession |
+            Format-Table -AutoSize
+    }
+}
+
+# ----------------------------
+# Overall totals
+# ----------------------------
+Write-Host "`n============================================================" -ForegroundColor DarkGray
+Write-Host "OVERALL TOTALS (All Host Pools in selected RG)" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor DarkGray
+
+$overallTotal      = $allDetails.Count
+$overallAssigned   = ($allDetails | Where-Object { $_.IsAssigned }).Count
+$overallUnassigned = ($allDetails | Where-Object { -not $_.IsAssigned }).Count
+
+Write-Host ("Total Session Hosts : {0}" -f $overallTotal) -ForegroundColor Cyan
+Write-Host ("Assigned            : {0}" -f $overallAssigned) -ForegroundColor Green
+Write-Host ("Unassigned (Empty)  : {0}" -f $overallUnassigned) -ForegroundColor Magenta
+
+Write-Host "`nSummary by Host Pool:" -ForegroundColor Cyan
+$allSummary | Sort-Object HostPoolName | Format-Table HostPoolName, HostPoolType, TotalSessionHosts, AssignedCount, UnassignedEmptyCount -AutoSize
+
+# ----------------------------
+# Optional CSV Export
+# ----------------------------
+if ($ExportCsv) {
+    $folder = Split-Path $CsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+
+    $allDetails | Sort-Object HostPoolName, VMName | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nCSV exported: $CsvPath" -ForegroundColor Green
+}
+
+Write-Host "`nDone." -ForegroundColor Cyan
