@@ -1,0 +1,328 @@
+<#
+AVD HostPool Assignment Inventory (Multi-Subscription) - REDUCED OUTPUT (READ-ONLY)
+
+Output:
+- ONLY final summary grouped by subscription (boxed tables)
+- Subscription totals + Grand totals
+- No per-hostpool details printed during processing (reduces lines)
+
+This script is READ-ONLY: uses only Get-* commands.
+#>
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+$TargetSubscriptions = @(
+  "f9c819dc-4e16-4a04-8487-a734dcd880e1",  # [1]  Dearborn - Azure Prod - Infrastructure
+  "c59f3913-9612-4704-94f8-4a1d4f695b2f",  # [2]  HCSC Azure Alt-Prod – Infrastructure
+  "3db8f6c1-6208-4799-b3b9-a931bb78ff10",  # [3]  HCSC Azure AVD Exp 1 – Infrastructure
+  "236d25ee-6a67-4d1e-b8a2-d18340cab27a",  # [4]  HCSC Azure AVD Exp 2 – Infrastructure
+  "bf9eecc9-7f67-46e2-b3f8-268da59f1299",  # [5]  HCSC Azure CRIBL
+  "7160cf79-3964-41af-8168-05a588c5f99b",  # [6]  HCSC Azure Hub Prod
+  "750da1a4-85cc-489e-b629-e512e0989c16",  # [7]  HCSC Azure NC AVD 1 - Infrastructure
+  "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",  # [8]  HCSC Azure NC AVD 2 - Infrastructure
+  "9ff6edd3-6b39-4d33-8776-56703398260c",  # [9]  HCSC Azure PCF Prod - Infrastructure
+  "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f",  # [10] HCSC Azure Prod - Infrastructure
+  "df7de03e-1d71-4adf-8fd1-bd5791326a26",  # [11] HCSC Azure SC AVD 1 - Infrastructure
+  "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"   # [12] HCSC Azure SC AVD 2 - Infrastructure
+)
+
+$TenantId = ""  # optional; set if you want to reduce login prompts
+
+# Optional exports (OFF by default)
+$ExportSummaryCsv = $false
+$SummaryCsvPath   = "C:\Temp\AVD_HostPool_Summary.csv"
+
+$ExportDetailsCsv = $false
+$DetailsCsvPath   = "C:\Temp\AVD_SessionHost_Details.csv"
+
+# Visual formatting
+$Separator    = ("=" * 140)
+$SubSeparator = ("-" * 140)
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+function Initialize-PSGalleryPreReqs {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+    } catch {
+        Write-Host "WARNING: NuGet provider verification failed. Module install may fail." -ForegroundColor Yellow
+    }
+}
+
+function Set-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne "Trusted") {
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        }
+    } catch {
+        Write-Host "WARNING: Unable to set PSGallery to Trusted (may prompt during installs)." -ForegroundColor Yellow
+    }
+}
+
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Show-LinedTable {
+    param(
+        [Parameter(Mandatory=$true)][array]$Data,
+        [Parameter(Mandatory=$true)][string[]]$Columns
+    )
+
+    if (-not $Data -or $Data.Count -eq 0) {
+        Write-Host "No data to display." -ForegroundColor Yellow
+        return
+    }
+
+    $widths = @{}
+    foreach ($c in $Columns) {
+        $max = $c.Length
+        foreach ($row in $Data) {
+            $val = "" + $row.$c
+            if ($val.Length -gt $max) { $max = $val.Length }
+        }
+        $widths[$c] = [Math]::Min([Math]::Max($max, 6) + 2, 75)
+    }
+
+    $line = "+"
+    foreach ($c in $Columns) { $line += ("-" * $widths[$c]) + "+" }
+
+    Write-Host $line -ForegroundColor DarkGray
+    $header = "|"
+    foreach ($c in $Columns) { $header += (" " + $c).PadRight($widths[$c]) + "|" }
+    Write-Host $header -ForegroundColor Cyan
+    Write-Host $line -ForegroundColor DarkGray
+
+    foreach ($row in $Data) {
+        $r = "|"
+        foreach ($c in $Columns) {
+            $txt = "" + $row.$c
+            if ($txt.Length -gt ($widths[$c] - 1)) {
+                $txt = $txt.Substring(0, $widths[$c] - 4) + "..."
+            }
+            $r += (" " + $txt).PadRight($widths[$c]) + "|"
+        }
+        Write-Host $r
+        Write-Host $line -ForegroundColor DarkGray
+    }
+}
+
+function Get-ResourceGroupFromHostPool {
+    param([Parameter(Mandatory=$true)]$HostPool)
+
+    if ($HostPool.PSObject.Properties.Name -contains "ResourceGroupName" -and
+        -not [string]::IsNullOrWhiteSpace($HostPool.ResourceGroupName)) {
+        return $HostPool.ResourceGroupName
+    }
+    if ($HostPool.PSObject.Properties.Name -contains "Id" -and $HostPool.Id) {
+        if ($HostPool.Id -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    }
+    return ""
+}
+
+# ==========================================================
+# START
+# ==========================================================
+
+$scriptStart = Get-Date
+
+Initialize-PSGalleryPreReqs
+Set-PSGalleryTrusted
+
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+
+# Auth (fallback to device code for AVD/RDP)
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+catch {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+
+# Resolve subscriptions
+$allSubs = Get-AzSubscription
+$resolvedSubs = foreach ($id in $TargetSubscriptions) {
+    $match = $allSubs | Where-Object { $_.Id -eq $id }
+    if ($match) { $match }
+    else { Write-Host "WARNING: Subscription not found or not accessible: $id" -ForegroundColor Yellow }
+}
+
+if (-not $resolvedSubs -or $resolvedSubs.Count -eq 0) {
+    Write-Host "ERROR: No valid subscriptions resolved." -ForegroundColor Red
+    return
+}
+
+# Collect ONLY data (no noisy printing)
+$allDetails = New-Object System.Collections.Generic.List[object]
+$allSummary = New-Object System.Collections.Generic.List[object]
+
+$subIndex = 0
+foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
+    $subIndex++
+
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+
+    $hostPools = @()
+    try {
+        $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "WARNING: Unable to enumerate host pools in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    $hpIndex = 0
+    foreach ($hp in $hostPools) {
+        $hpIndex++
+        Write-Progress -Activity "Collecting AVD inventory" `
+            -Status ("Subscription [{0}/{1}] {2} | HostPool [{3}/{4}] {5}" -f $subIndex,$resolvedSubs.Count,$sub.Name,$hpIndex,$hostPools.Count,$hp.Name) `
+            -PercentComplete (($hpIndex / [Math]::Max($hostPools.Count,1)) * 100)
+
+        $rgName = Get-ResourceGroupFromHostPool -HostPool $hp
+        if ([string]::IsNullOrWhiteSpace($rgName)) { continue }
+
+        $sessionHosts = @()
+        try {
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $rgName -HostPoolName $hp.Name -ErrorAction Stop
+        } catch {
+            # still record a summary row with zeros if session hosts can't be read
+            $sessionHosts = @()
+        }
+
+        $details = $sessionHosts | ForEach-Object {
+            $assigned = $null
+            if ($_.PSObject.Properties.Name -contains "AssignedUser") { $assigned = $_.AssignedUser }
+
+            [pscustomobject]@{
+                Subscription         = $sub.Name
+                SubscriptionId       = $sub.Id
+                ResourceGroup        = $rgName
+                HostPoolName         = $hp.Name
+                HostPoolType         = $hp.HostPoolType
+                VMName               = ($_.Name -split "/")[-1]
+                Status               = $_.Status
+                AllowNewSession      = $_.AllowNewSession
+                AssignedUser         = $assigned
+                IsAssigned           = -not [string]::IsNullOrWhiteSpace($assigned)
+            }
+        }
+
+        foreach ($d in $details) { $allDetails.Add($d) }
+
+        $total     = $details.Count
+        $assignedC = ($details | Where-Object { $_.IsAssigned }).Count
+        $emptyC    = ($details | Where-Object { -not $_.IsAssigned }).Count
+
+        $allSummary.Add([pscustomobject]@{
+            Subscription         = $sub.Name
+            SubscriptionId       = $sub.Id
+            HostPoolName         = $hp.Name
+            ResourceGroup        = $rgName
+            HostPoolType         = $hp.HostPoolType
+            TotalSessionHosts    = $total
+            AssignedCount        = $assignedC
+            UnassignedEmptyCount = $emptyC
+        })
+    }
+}
+
+Write-Progress -Activity "Collecting AVD inventory" -Completed
+
+# ==========================================================
+# FINAL SUMMARY (Grouped by Subscription) - THE USEFUL OUTPUT
+# ==========================================================
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "FINAL SUMMARY (Grouped by Subscription)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+$final = $allSummary | Sort-Object Subscription, HostPoolName
+$groups = $final | Group-Object Subscription
+
+foreach ($g in $groups) {
+    $subObj = $resolvedSubs | Where-Object { $_.Name -eq $g.Name } | Select-Object -First 1
+    $subIdText = if ($subObj) { " ($($subObj.Id))" } else { "" }
+
+    Write-Host "`n$SubSeparator" -ForegroundColor DarkGray
+    Write-Host ("SUBSCRIPTION: {0}{1}" -f $g.Name, $subIdText) -ForegroundColor Yellow
+    Write-Host $SubSeparator -ForegroundColor DarkGray
+
+    Show-LinedTable -Data ($g.Group | Sort-Object HostPoolName) -Columns @(
+        "HostPoolName","ResourceGroup","HostPoolType","TotalSessionHosts","AssignedCount","UnassignedEmptyCount"
+    )
+
+    $subTotalHosts     = ($g.Group | Measure-Object TotalSessionHosts -Sum).Sum
+    $subAssigned       = ($g.Group | Measure-Object AssignedCount -Sum).Sum
+    $subUnassigned     = ($g.Group | Measure-Object UnassignedEmptyCount -Sum).Sum
+    $subHostPoolCount  = ($g.Group).Count
+
+    Write-Host "Subscription Totals:" -ForegroundColor Cyan
+    Show-LinedTable -Data @(
+        [pscustomobject]@{
+            HostPools         = $subHostPoolCount
+            TotalSessionHosts = $subTotalHosts
+            Assigned          = $subAssigned
+            UnassignedEmpty   = $subUnassigned
+        }
+    ) -Columns @("HostPools","TotalSessionHosts","Assigned","UnassignedEmpty")
+}
+
+# Grand totals
+$overallTotal      = $allDetails.Count
+$overallAssigned   = ($allDetails | Where-Object { $_.IsAssigned }).Count
+$overallUnassigned = ($allDetails | Where-Object { -not $_.IsAssigned }).Count
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "GRAND TOTALS (All selected subscriptions)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+Show-LinedTable -Data @(
+    [pscustomobject]@{
+        SubscriptionsInScope = $resolvedSubs.Count
+        TotalHostPools       = $allSummary.Count
+        TotalSessionHosts    = $overallTotal
+        Assigned             = $overallAssigned
+        UnassignedEmpty      = $overallUnassigned
+    }
+) -Columns @("SubscriptionsInScope","TotalHostPools","TotalSessionHosts","Assigned","UnassignedEmpty")
+
+# Optional exports
+if ($ExportSummaryCsv) {
+    $folder = Split-Path $SummaryCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $allSummary | Sort-Object Subscription, HostPoolName | Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nSummary CSV exported: $SummaryCsvPath" -ForegroundColor Green
+}
+
+if ($ExportDetailsCsv) {
+    $folder = Split-Path $DetailsCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $allDetails | Sort-Object Subscription, HostPoolName, VMName | Export-Csv -Path $DetailsCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Details CSV exported: $DetailsCsvPath" -ForegroundColor Green
+}
+
+$elapsed = New-TimeSpan -Start $scriptStart -End (Get-Date)
+Write-Host "`nCompleted in: $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
