@@ -1,0 +1,339 @@
+<#
+AVD Session Host Build + Power + Heartbeat Report (ALL SUBSCRIPTIONS) - READ-ONLY
+
+What it does (READ-ONLY):
+- Authenticates to Azure (interactive, falls back to device code)
+- Enumerates ALL accessible subscriptions for the signed-in account
+- For each subscription:
+  - Sets context
+  - Caches VM inventory (fast VM matching)
+  - Enumerates ALL AVD host pools in that subscription
+  - For each host pool:
+    - Derives host pool RG from host pool Id
+    - Enumerates ALL session hosts
+    - Resolves each session host to its VM
+    - Collects:
+        - VM timeCreated (build time)
+        - VM current power state
+        - AVD LastHeartBeat (best "last seen healthy")
+        - Status, AllowNewSession, AssignedUser, AgentVersion (if available)
+- Optional CSV export
+
+Notes:
+- "LastHeartBeat" is from the AVD agent and is often the most operationally accurate "last up" signal.
+- VM build time is from ARM "timeCreated" and is not necessarily the first boot time.
+
+#>
+
+# ===========================
+# CONFIG
+# ===========================
+
+# Optional: Set TenantId to avoid tenant/subscription selection prompts (recommended if you see prompts).
+# Example: "2e0cb644-c094-41d7-ab3d-43201da24438"
+$TenantId = ""
+
+# Optional filters (leave empty to include everything)
+$IncludeSubscriptionNameLike = ""   # e.g. "HCSC Azure" (substring match). "" = all subs
+$ExcludeSubscriptionNameLike = ""   # e.g. "Dev"        (substring match). "" = exclude none
+
+$IncludeOnlyHostPools = @()         # e.g. @("hp1","hp2"). Empty = all host pools
+
+# Performance / scope controls
+$MaxSessionHostsPerHostPool = 0     # 0 = all, else process only first N per host pool (testing)
+
+# Turn off any stale heartbeat warning output (as requested)
+$ShowStaleHeartbeatWarning = $false
+$StaleHeartbeatMinutes     = 30     # only used if warning enabled
+
+# Export
+$ExportCsv = $true
+$CsvPath   = "C:\Temp\AVD_AllSubscriptions_Build_Power_Heartbeat.csv"
+
+# ===========================
+# HELPERS
+# ===========================
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Write-Host "Installing module: $ModuleName (CurrentUser)..." -ForegroundColor Cyan
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Get-VMShortNameFromSessionHost {
+    param([Parameter(Mandatory=$true)][string]$SessionHostName)
+    # Example: ".../sessionHosts/vm-01.domain.com" -> vm-01
+    $last  = ($SessionHostName -split "/")[-1]
+    $short = ($last -split "\.")[0]
+    return $short
+}
+
+function Get-ResourceGroupFromId {
+    param([Parameter(Mandatory=$true)][string]$ResourceId)
+    if ($ResourceId -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    return $null
+}
+
+function Get-VmTimeCreated {
+    param(
+        [Parameter(Mandatory=$true)]$Vm,
+        [Parameter(Mandatory=$true)][string]$ResourceGroupName
+    )
+
+    # Some Az.Compute versions expose TimeCreated directly
+    if ($Vm.PSObject.Properties.Name -contains "TimeCreated" -and $Vm.TimeCreated) {
+        return $Vm.TimeCreated
+    }
+
+    # Fallback: query ARM resource properties
+    $res = Get-AzResource -ResourceGroupName $ResourceGroupName `
+                          -ResourceType "Microsoft.Compute/virtualMachines" `
+                          -Name $Vm.Name -ExpandProperties -ErrorAction SilentlyContinue
+    if ($res -and $res.Properties -and $res.Properties.timeCreated) {
+        return [datetime]$res.Properties.timeCreated
+    }
+    return $null
+}
+
+function Get-VmPowerState {
+    param(
+        [Parameter(Mandatory=$true)][string]$VmName,
+        [Parameter(Mandatory=$true)][string]$ResourceGroupName
+    )
+
+    $vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status -ErrorAction SilentlyContinue
+    if (-not $vmStatus) { return $null }
+
+    $ps = ($vmStatus.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1)
+    if ($ps) { return $ps.DisplayStatus }
+    return $null
+}
+
+# ===========================
+# MODULES
+# ===========================
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+Ensure-Module "Az.Compute"
+
+# ===========================
+# AUTH (READ-ONLY)
+# ===========================
+Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+catch {
+    Write-Host "Interactive login failed; using Device Code..." -ForegroundColor Yellow
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+
+# ===========================
+# GET ALL SUBSCRIPTIONS
+# ===========================
+Write-Host "Loading accessible subscriptions..." -ForegroundColor Cyan
+$subs = Get-AzSubscription | Sort-Object Name
+
+# Apply optional filters
+if (-not [string]::IsNullOrWhiteSpace($IncludeSubscriptionNameLike)) {
+    $subs = @($subs | Where-Object { $_.Name -like "*$IncludeSubscriptionNameLike*" })
+}
+if (-not [string]::IsNullOrWhiteSpace($ExcludeSubscriptionNameLike)) {
+    $subs = @($subs | Where-Object { $_.Name -notlike "*$ExcludeSubscriptionNameLike*" })
+}
+
+if (-not $subs -or @($subs).Count -eq 0) {
+    Write-Host "ERROR: No subscriptions available after filtering." -ForegroundColor Red
+    return
+}
+
+Write-Host ("Found {0} accessible subscription(s) in scope." -f @($subs).Count) -ForegroundColor Green
+
+# ===========================
+# COLLECT
+# ===========================
+$results = New-Object System.Collections.Generic.List[object]
+
+$subCounter = 0
+foreach ($sub in @($subs)) {
+    $subCounter++
+    Write-Host "`n==== Subscription [$subCounter/$(@($subs).Count)] $($sub.Name) ($($sub.Id)) ====" -ForegroundColor Cyan
+
+    # Set context for this subscription
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "WARNING: Unable to set context for '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    # Cache VMs once per subscription (fast VM matching)
+    Write-Host "Caching VM inventory..." -ForegroundColor DarkGray
+    $vmIndex = @{}
+    try {
+        $allVms = Get-AzVM -ErrorAction Stop
+        foreach ($v in @($allVms)) {
+            if ($v -and $v.Name) { $vmIndex[$v.Name] = $v }
+        }
+    } catch {
+        Write-Host "WARNING: Unable to cache VMs in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        # Continue anyway; VM resolution will fail but heartbeat/report still prints host details
+        $vmIndex = @{}
+    }
+
+    # Enumerate host pools in this subscription
+    $hostPools = @()
+    try {
+        $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "WARNING: Unable to enumerate host pools in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    if ($IncludeOnlyHostPools.Count -gt 0) {
+        $hostPools = @($hostPools | Where-Object { $IncludeOnlyHostPools -contains $_.Name })
+    }
+
+    if (-not $hostPools -or @($hostPools).Count -eq 0) {
+        Write-Host "No host pools found in '$($sub.Name)' (after filtering)." -ForegroundColor DarkYellow
+        continue
+    }
+
+    Write-Host ("Host pools found: {0}" -f @($hostPools).Count) -ForegroundColor Green
+
+    $hpCounter = 0
+    foreach ($hp in @($hostPools)) {
+        $hpCounter++
+
+        $hpRg = $null
+        if ($hp.Id) { $hpRg = Get-ResourceGroupFromId -ResourceId $hp.Id }
+        if ([string]::IsNullOrWhiteSpace($hpRg)) {
+            Write-Host "WARNING: Could not derive RG for host pool '$($hp.Name)'. Skipping." -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Progress -Activity "Processing Host Pools" `
+            -Status ("Subscription: {0} | HostPool [{1}/{2}] {3}" -f $sub.Name, $hpCounter, @($hostPools).Count, $hp.Name) `
+            -PercentComplete (($hpCounter / [Math]::Max(@($hostPools).Count,1)) * 100)
+
+        # Session hosts
+        $sessionHosts = @()
+        try {
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $hpRg -HostPoolName $hp.Name -ErrorAction Stop
+        } catch {
+            Write-Host "WARNING: Unable to get session hosts for '$($hp.Name)' in RG '$hpRg': $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        if ($MaxSessionHostsPerHostPool -gt 0) {
+            $sessionHosts = @($sessionHosts | Select-Object -First $MaxSessionHostsPerHostPool)
+        }
+
+        $shCounter = 0
+        foreach ($sh in @($sessionHosts)) {
+            $shCounter++
+            Write-Progress -Activity "Processing Session Hosts" `
+                -Status ("{0} | {1} | SessionHost [{2}/{3}]" -f $sub.Name, $hp.Name, $shCounter, @($sessionHosts).Count) `
+                -PercentComplete (($shCounter / [Math]::Max(@($sessionHosts).Count,1)) * 100)
+
+            $vmNameShort = Get-VMShortNameFromSessionHost -SessionHostName $sh.Name
+
+            # Resolve VM from cache
+            $vm = $vmIndex[$vmNameShort]
+            $vmFound = ($null -ne $vm)
+
+            $vmRg = $null
+            if ($vmFound -and $vm.Id) { $vmRg = Get-ResourceGroupFromId -ResourceId $vm.Id }
+
+            $vmTimeCreated = $null
+            $powerState    = $null
+
+            if ($vmFound -and $vmRg) {
+                $vmTimeCreated = Get-VmTimeCreated -Vm $vm -ResourceGroupName $vmRg
+                $powerState    = Get-VmPowerState -VmName $vm.Name -ResourceGroupName $vmRg
+            }
+
+            # Heartbeat from AVD session host object
+            $hbUtc = $null
+            if ($sh.PSObject.Properties.Name -contains "LastHeartBeat") { $hbUtc = $sh.LastHeartBeat }
+
+            # AgentVersion if present
+            $agentVersion = $null
+            if ($sh.PSObject.Properties.Name -contains "AgentVersion") { $agentVersion = $sh.AgentVersion }
+
+            $results.Add([pscustomobject]@{
+                Subscription              = $sub.Name
+                SubscriptionId            = $sub.Id
+                HostPoolName              = $hp.Name
+                HostPoolRG                = $hpRg
+                SessionHostResource       = $sh.Name
+
+                VMName                    = $vmNameShort
+                VmFound                   = $vmFound
+                VMResourceGroup           = $vmRg
+
+                VmTimeCreatedUTC          = $vmTimeCreated
+                VmTimeCreatedLocal        = if ($vmTimeCreated) { $vmTimeCreated.ToLocalTime() } else { $null }
+
+                CurrentPowerState         = $powerState
+
+                LastAgentHeartbeatUTC     = $hbUtc
+                LastAgentHeartbeatLocal   = if ($hbUtc) { $hbUtc.ToLocalTime() } else { $null }
+
+                SessionHostStatus         = $sh.Status
+                AllowNewSession           = $sh.AllowNewSession
+                AssignedUser              = $sh.AssignedUser
+                AgentVersion              = $agentVersion
+            })
+        }
+    }
+}
+
+Write-Progress -Activity "Processing Host Pools" -Completed
+Write-Progress -Activity "Processing Session Hosts" -Completed
+
+# ===========================
+# OUTPUT
+# ===========================
+Write-Host "`n==== AVD BUILD + POWER + HEARTBEAT REPORT (ALL SUBSCRIPTIONS) ====" -ForegroundColor Green
+
+$results |
+    Sort-Object Subscription, HostPoolName, VMName |
+    Select-Object Subscription, HostPoolName, VMName, VMResourceGroup, VmFound,
+                  VmTimeCreatedLocal, CurrentPowerState, LastAgentHeartbeatLocal,
+                  SessionHostStatus, AllowNewSession, AssignedUser |
+    Format-Table -AutoSize
+
+# Optional stale heartbeat warning (OFF by default)
+if ($ShowStaleHeartbeatWarning) {
+    $stale = @($results | Where-Object {
+        $_.LastAgentHeartbeatLocal -and ((New-TimeSpan -Start $_.LastAgentHeartbeatLocal -End (Get-Date)).TotalMinutes -gt $StaleHeartbeatMinutes)
+    })
+    if ($stale.Count -gt 0) {
+        Write-Host "`nWARNING: Hosts with heartbeat older than $StaleHeartbeatMinutes minutes:" -ForegroundColor Yellow
+        $stale | Select-Object Subscription, HostPoolName, VMName, LastAgentHeartbeatLocal, CurrentPowerState, SessionHostStatus |
+            Format-Table -AutoSize
+    }
+}
+
+# Export CSV
+if ($ExportCsv) {
+    $folder = Split-Path $CsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $results | Sort-Object Subscription, HostPoolName, VMName | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nCSV exported: $CsvPath" -ForegroundColor Cyan
+}
+
+Write-Host "`nDone (READ-ONLY)." -ForegroundColor Cyan
