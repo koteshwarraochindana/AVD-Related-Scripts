@@ -1,0 +1,398 @@
+<#
+READ-ONLY: AVD Assigned Session Hosts Mapping by User List (All Subscriptions)
+
+What it does (READ-ONLY):
+- Reads a list of user email IDs from an input file (CSV or TXT)
+- Authenticates to Azure (interactive, falls back to device code)
+- Enumerates ALL accessible subscriptions
+- For each subscription:
+  - Sets context (does not modify resources)
+  - Enumerates ALL AVD host pools
+  - Enumerates ALL session hosts
+  - Filters to session hosts whose AssignedUser matches your input list
+  - Resolves VM short name from session host FQDN
+  - Looks up VM power state (optional; read-only)
+- Exports results to a separate CSV file
+- Exports a NotFound CSV of input emails with no assignment found
+
+SAFE / READ-ONLY:
+- Uses only Get-* cmdlets (and Set-AzContext to change local session context)
+- No Set/Update/Remove/New Az cmdlets for resources
+#>
+
+# ===========================
+# CONFIG
+# ===========================
+$TenantId = ""  # Optional. Set to avoid tenant selection prompts.
+
+# ----- Input: choose CSV or TXT -----
+$InputCsvPath = "C:\Temp\UserEmails.csv"   # CSV with header column: Email (default)
+$InputTxtPath = ""                         # OR: TXT with one email per line
+
+# If your CSV uses a different header, set it here (e.g. "UPN" or "UserPrincipalName")
+$CsvEmailColumnName = "Email"
+
+# ----- Output -----
+$OutputCsvPath    = "C:\Temp\AVD_AssignedSessionHosts_ByUser.csv"
+$NotFoundCsvPath  = "C:\Temp\AVD_AssignedSessionHosts_NotFound.csv"
+
+# Optional subscription filters
+$IncludeSubscriptionNameLike = ""   # substring match, "" = all subs
+$ExcludeSubscriptionNameLike = ""   # substring match, "" = none excluded
+
+# Optional host pool filter
+$IncludeOnlyHostPools = @()         # e.g. @("hp1","hp2"), empty = all
+
+# Performance control (0 = all session hosts per hostpool)
+$MaxSessionHostsPerHostPool = 0
+
+# Matching behavior
+$CaseInsensitiveMatch = $true
+
+# ===========================
+# HELPERS
+# ===========================
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Write-Host "Installing module: $ModuleName (CurrentUser)..." -ForegroundColor Cyan
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Get-VMShortNameFromSessionHost {
+    param([Parameter(Mandatory=$true)][string]$SessionHostName)
+    # Example: ".../sessionHosts/vm-01.domain.com" -> vm-01
+    $last  = ($SessionHostName -split "/")[-1]
+    $short = ($last -split "\.")[0]
+    return $short
+}
+
+function Get-SessionHostFqdnFromName {
+    param([Parameter(Mandatory=$true)][string]$SessionHostName)
+    return ($SessionHostName -split "/")[-1]
+}
+
+function Get-ResourceGroupFromId {
+    param([Parameter(Mandatory=$true)][string]$ResourceId)
+    if ($ResourceId -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    return $null
+}
+
+function Get-VmPowerState {
+    param(
+        [Parameter(Mandatory=$true)][string]$VmName,
+        [Parameter(Mandatory=$true)][string]$ResourceGroupName
+    )
+    $vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status -ErrorAction SilentlyContinue
+    if (-not $vmStatus) { return $null }
+
+    $ps = ($vmStatus.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1)
+    if ($ps) { return $ps.DisplayStatus }
+    return $null
+}
+
+function Load-UserEmails {
+    param(
+        [string]$CsvPath,
+        [string]$TxtPath,
+        [string]$EmailColumnName
+    )
+
+    $emails = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($CsvPath) -and (Test-Path $CsvPath)) {
+        $csv = Import-Csv $CsvPath
+
+        # Validate column exists
+        $firstRow = $csv | Select-Object -First 1
+        if (-not $firstRow) { throw "CSV file is empty: $CsvPath" }
+
+        $colExists = $firstRow.PSObject.Properties.Name -contains $EmailColumnName
+        if (-not $colExists) {
+            $available = ($firstRow.PSObject.Properties.Name -join ", ")
+            throw "CSV must contain a column named '$EmailColumnName'. Available columns: $available"
+        }
+
+        $emails = $csv | ForEach-Object { $_.$EmailColumnName }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($TxtPath) -and (Test-Path $TxtPath)) {
+        $emails = Get-Content $TxtPath
+    }
+    else {
+        throw "No valid input file found. Provide a valid CSV path or TXT path."
+    }
+
+    # Normalize/clean
+    $emails = $emails |
+        Where-Object { $_ -and $_.ToString().Trim() } |
+        ForEach-Object { $_.ToString().Trim() } |
+        Where-Object { $_ -match "@" } |
+        Sort-Object -Unique
+
+    if (-not $emails -or $emails.Count -eq 0) {
+        throw "No valid email IDs found in the input file."
+    }
+
+    return $emails
+}
+
+function Ensure-Folder {
+    param([Parameter(Mandatory=$true)][string]$FilePath)
+    $folder = Split-Path $FilePath -Parent
+    if (-not (Test-Path $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    }
+}
+
+# ===========================
+# MODULES
+# ===========================
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+Ensure-Module "Az.Compute"
+
+# ===========================
+# LOAD INPUT
+# ===========================
+Write-Host "Loading input user list..." -ForegroundColor Cyan
+$userEmails = Load-UserEmails -CsvPath $InputCsvPath -TxtPath $InputTxtPath -EmailColumnName $CsvEmailColumnName
+Write-Host ("Loaded {0} unique email(s) from input." -f $userEmails.Count) -ForegroundColor Green
+
+# Build fast lookup set
+if ($CaseInsensitiveMatch) {
+    $emailSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+} else {
+    $emailSet = New-Object 'System.Collections.Generic.HashSet[string]'
+}
+$userEmails | ForEach-Object { [void]$emailSet.Add($_) }
+
+# ===========================
+# AUTH (READ-ONLY)
+# ===========================
+Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+catch {
+    Write-Host "Interactive login failed; using Device Code..." -ForegroundColor Yellow
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+
+# ===========================
+# GET ALL SUBSCRIPTIONS
+# ===========================
+Write-Host "Loading accessible subscriptions..." -ForegroundColor Cyan
+$subs = Get-AzSubscription | Sort-Object Name
+
+if (-not [string]::IsNullOrWhiteSpace($IncludeSubscriptionNameLike)) {
+    $subs = @($subs | Where-Object { $_.Name -like "*$IncludeSubscriptionNameLike*" })
+}
+if (-not [string]::IsNullOrWhiteSpace($ExcludeSubscriptionNameLike)) {
+    $subs = @($subs | Where-Object { $_.Name -notlike "*$ExcludeSubscriptionNameLike*" })
+}
+
+if (-not $subs -or @($subs).Count -eq 0) {
+    throw "No subscriptions available after filtering."
+}
+Write-Host ("Found {0} accessible subscription(s) in scope." -f @($subs).Count) -ForegroundColor Green
+
+# ===========================
+# COLLECT MATCHES (READ-ONLY)
+# ===========================
+$matches = New-Object System.Collections.Generic.List[object]
+
+$subCounter = 0
+foreach ($sub in @($subs)) {
+    $subCounter++
+    Write-Host "`n==== Subscription [$subCounter/$(@($subs).Count)] $($sub.Name) ====" -ForegroundColor Cyan
+
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "WARNING: Unable to set context for '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    # Cache VM inventory for quick lookup
+    Write-Host "Caching VM inventory..." -ForegroundColor DarkGray
+    $vmIndex = @{}
+    try {
+        $allVms = Get-AzVM -ErrorAction Stop
+        foreach ($v in @($allVms)) { if ($v -and $v.Name) { $vmIndex[$v.Name] = $v } }
+    } catch {
+        Write-Host "WARNING: Unable to cache VMs in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        $vmIndex = @{}
+    }
+
+    # Host pools
+    $hostPools = @()
+    try {
+        $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "WARNING: Unable to enumerate host pools in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    if ($IncludeOnlyHostPools.Count -gt 0) {
+        $hostPools = @($hostPools | Where-Object { $IncludeOnlyHostPools -contains $_.Name })
+    }
+
+    if (-not $hostPools -or @($hostPools).Count -eq 0) {
+        Write-Host "No host pools found in '$($sub.Name)' (after filtering)." -ForegroundColor DarkYellow
+        continue
+    }
+
+    $hpCounter = 0
+    foreach ($hp in @($hostPools)) {
+        $hpCounter++
+
+        $hpRg = if ($hp.Id) { Get-ResourceGroupFromId -ResourceId $hp.Id } else { $null }
+        if ([string]::IsNullOrWhiteSpace($hpRg)) {
+            Write-Host "WARNING: Could not derive RG for host pool '$($hp.Name)'. Skipping." -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Progress -Activity "Processing Host Pools" `
+            -Status ("Subscription: {0} | HostPool [{1}/{2}] {3}" -f $sub.Name, $hpCounter, @($hostPools).Count, $hp.Name) `
+            -PercentComplete (($hpCounter / [Math]::Max(@($hostPools).Count,1)) * 100)
+
+        # Session hosts
+        $sessionHosts = @()
+        try {
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $hpRg -HostPoolName $hp.Name -ErrorAction Stop
+        } catch {
+            Write-Host "WARNING: Unable to get session hosts for '$($hp.Name)' in RG '$hpRg': $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        if ($MaxSessionHostsPerHostPool -gt 0) {
+            $sessionHosts = @($sessionHosts | Select-Object -First $MaxSessionHostsPerHostPool)
+        }
+
+        foreach ($sh in @($sessionHosts)) {
+
+            # AssignedUser match check
+            $assigned = $null
+            if ($sh.PSObject.Properties.Name -contains "AssignedUser") { $assigned = $sh.AssignedUser }
+            if ([string]::IsNullOrWhiteSpace($assigned)) { continue }
+
+            $assignedNorm = $assigned.Trim()
+            if (-not $emailSet.Contains($assignedNorm)) { continue }
+
+            # Resolve VM and power state
+            $vmNameShort = Get-VMShortNameFromSessionHost -SessionHostName $sh.Name
+            $vm = $vmIndex[$vmNameShort]
+            $vmFound = ($null -ne $vm)
+
+            $vmRg = $null
+            if ($vmFound -and $vm.Id) { $vmRg = Get-ResourceGroupFromId -ResourceId $vm.Id }
+
+            $powerState = $null
+            if ($vmFound -and $vmRg) {
+                $powerState = Get-VmPowerState -VmName $vm.Name -ResourceGroupName $vmRg
+            }
+
+            # Heartbeat & agent version (if present)
+            $hbUtc = $null
+            if ($sh.PSObject.Properties.Name -contains "LastHeartBeat") { $hbUtc = $sh.LastHeartBeat }
+
+            $agentVersion = $null
+            if ($sh.PSObject.Properties.Name -contains "AgentVersion") { $agentVersion = $sh.AgentVersion }
+
+            $matches.Add([pscustomobject]@{
+                InputEmail              = $assignedNorm
+                MatchedAssignedUser     = $assignedNorm
+                Subscription            = $sub.Name
+                SubscriptionId          = $sub.Id
+                HostPoolName            = $hp.Name
+                HostPoolRG              = $hpRg
+                SessionHostFQDN         = Get-SessionHostFqdnFromName -SessionHostName $sh.Name
+                SessionHostResource     = $sh.Name
+                VMName                  = $vmNameShort
+                VmFound                 = $vmFound
+                VMResourceGroup         = $vmRg
+                CurrentPowerState       = $powerState
+                LastAgentHeartbeatUTC   = $hbUtc
+                LastAgentHeartbeatLocal = if ($hbUtc) { $hbUtc.ToLocalTime() } else { $null }
+                SessionHostStatus       = $sh.Status
+                AllowNewSession         = $sh.AllowNewSession
+                AgentVersion            = $agentVersion
+            })
+        }
+    }
+}
+
+Write-Progress -Activity "Processing Host Pools" -Completed
+
+# ===========================
+# EXPORT OUTPUT FILES
+# ===========================
+Write-Host "`n==== EXPORT RESULTS ====" -ForegroundColor Green
+
+Ensure-Folder -FilePath $OutputCsvPath
+Ensure-Folder -FilePath $NotFoundCsvPath
+
+if ($matches.Count -eq 0) {
+    Write-Host "No assigned session hosts found for the input email list." -ForegroundColor Yellow
+
+    # Export headers-only CSV by exporting one empty template object
+    $template = [pscustomobject]@{
+        InputEmail              = $null
+        MatchedAssignedUser     = $null
+        Subscription            = $null
+        SubscriptionId          = $null
+        HostPoolName            = $null
+        HostPoolRG              = $null
+        SessionHostFQDN         = $null
+        SessionHostResource     = $null
+        VMName                  = $null
+        VmFound                 = $null
+        VMResourceGroup         = $null
+        CurrentPowerState       = $null
+        LastAgentHeartbeatUTC   = $null
+        LastAgentHeartbeatLocal = $null
+        SessionHostStatus       = $null
+        AllowNewSession         = $null
+        AgentVersion            = $null
+    }
+
+    @($template) | Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Empty output CSV (headers only) exported: $OutputCsvPath" -ForegroundColor Cyan
+}
+else {
+    $matches |
+        Sort-Object InputEmail, Subscription, HostPoolName, VMName |
+        Export-Csv -Path $OutputCsvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host ("Exported {0} match row(s) to: {1}" -f $matches.Count, $OutputCsvPath) -ForegroundColor Cyan
+
+    Write-Host "`nPreview (first 20 rows):" -ForegroundColor DarkGray
+    $matches |
+        Sort-Object InputEmail, Subscription, HostPoolName, VMName |
+        Select-Object -First 20 InputEmail, HostPoolName, SessionHostFQDN, VMName, CurrentPowerState, SessionHostStatus |
+        Format-Table -AutoSize
+}
+
+# NotFound CSV
+$foundEmails = @($matches | Select-Object -ExpandProperty InputEmail -Unique)
+$notFound = $userEmails | Where-Object { $foundEmails -notcontains $_ }
+
+$notFound |
+    ForEach-Object { [pscustomobject]@{ Email = $_ } } |
+    Export-Csv -Path $NotFoundCsvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host ("NotFound CSV exported: {0} (Count: {1})" -f $NotFoundCsvPath, @($notFound).Count) -ForegroundColor Cyan
+
+Write-Host "`nDone (READ-ONLY)." -ForegroundColor Cyan
