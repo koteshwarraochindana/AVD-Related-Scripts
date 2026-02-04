@@ -18,24 +18,66 @@ $Password = "P@ssw0rd!"
 
 Write-Host "===== Starting Application Installation ====="
 
+# Check if UNC path exists before proceeding
+if (-Not (Test-Path $InstallerPath)) {
+    Write-Host "Installer file not found at $InstallerPath"
+    return
+}
+
+# If credentials are required (using mapped drive), connect to file share with credentials
 if ($UseCredentials) {
     Write-Host "Connecting to file share with credentials..."
 
+    # Convert password to SecureString and create PSCredential object
     $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
     $Cred = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
 
-    New-PSDrive -Name "TempShare" -PSProvider FileSystem -Root (Split-Path $InstallerPath) -Credential $Cred -ErrorAction Stop
+    # Attempt to create a new PSDrive
+    try {
+        New-PSDrive -Name "TempShare" -PSProvider FileSystem -Root (Split-Path $InstallerPath) -Credential $Cred -ErrorAction Stop
+    } catch {
+        Write-Host "Error connecting to the network share: $_"
+        return
+    }
 
+    # Map installer path
     $MappedInstaller = "TempShare:\" + (Split-Path $InstallerPath -Leaf)
 
-    Write-Host "Running installer from mapped UNC path..."
-    Start-Process -FilePath $MappedInstaller -ArgumentList $SilentArgs -Wait -NoNewWindow
+    # Check if mapped installer path exists
+    if (-Not (Test-Path $MappedInstaller)) {
+        Write-Host "Mapped installer file not found at $MappedInstaller"
+        return
+    }
 
+    Write-Host "Running installer from mapped UNC path..."
+
+    # Run installer using mapped path
+    try {
+        Start-Process -FilePath $MappedInstaller -ArgumentList $SilentArgs -Wait -NoNewWindow
+    } catch {
+        Write-Host "Error running the installer from mapped path: $_"
+        return
+    }
+
+    # Clean up the mapped drive after installation
     Remove-PSDrive -Name "TempShare" -Force
-}
-else {
+
+} else {
     Write-Host "Running installer directly from UNC path..."
-    Start-Process -FilePath $InstallerPath -ArgumentList $SilentArgs -Wait -NoNewWindow
+
+    # Check if UNC path exists
+    if (-Not (Test-Path $InstallerPath)) {
+        Write-Host "Installer file not found at $InstallerPath"
+        return
+    }
+
+    # Run installer directly from UNC path
+    try {
+        Start-Process -FilePath $InstallerPath -ArgumentList $SilentArgs -Wait -NoNewWindow
+    } catch {
+        Write-Host "Error running the installer from UNC path: $_"
+        return
+    }
 }
 
 Write-Host "===== Installation Completed ====="
