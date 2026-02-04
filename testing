@@ -1,0 +1,52 @@
+# ===== VARIABLES =====
+$DriveLetter = "Z:"
+$NetworkPath = "\\YOURFILESERVER\Applications"   # <-- CHANGE THIS
+$LocalFolder = "C:\windows11-avd-ams"
+$AppFolderName = "Apache_TortoiseSVN_1.9.6_x64(R1)"
+$MsiName = "TortoiseSVN-1.9.6.27867-x64-svn-1.9.6.msi"
+
+# Optional: credentials for file share
+$Username = "DOMAIN\svc_account"    # <-- CHANGE OR REMOVE if not needed
+$Password = "P@ssw0rd!"             # <-- CHANGE
+
+Write-Host "===== Starting TortoiseSVN Installation ====="
+
+# Convert password
+$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+$Cred = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
+
+# ===== MAP NETWORK DRIVE =====
+Write-Host "Mapping network drive..."
+New-PSDrive -Name "Z" -PSProvider FileSystem -Root $NetworkPath -Credential $Cred -ErrorAction Stop
+Write-Host "Drive mapped successfully."
+
+# ===== CREATE LOCAL FOLDER =====
+if (!(Test-Path $LocalFolder)) {
+    Write-Host "Creating local folder $LocalFolder"
+    New-Item -ItemType Directory -Path $LocalFolder | Out-Null
+}
+
+# ===== COPY INSTALLER =====
+Write-Host "Copying installer locally..."
+Copy-Item -Path "$DriveLetter\$AppFolderName" -Destination "$LocalFolder" -Recurse -Force
+
+# ===== INSTALL APPLICATION =====
+$MsiPath = "$LocalFolder\$AppFolderName\$MsiName"
+
+if (Test-Path $MsiPath) {
+    Write-Host "Installing TortoiseSVN silently..."
+    Start-Process msiexec.exe -ArgumentList "/i `"$MsiPath`" /qn /norestart" -Wait
+    Write-Host "Installation completed."
+} else {
+    Write-Host "MSI not found! Installation aborted."
+}
+
+# ===== CLEANUP =====
+Write-Host "Cleaning up installer files..."
+Remove-Item "$LocalFolder\$AppFolderName" -Recurse -Force -ErrorAction SilentlyContinue
+
+# ===== UNMAP DRIVE =====
+Write-Host "Removing mapped drive..."
+Remove-PSDrive -Name "Z" -Force
+
+Write-Host "===== Script Finished ====="
