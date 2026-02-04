@@ -1,0 +1,448 @@
+<#
+AVD Assignment Groups per HostPool Inventory (Multi-Subscription) - PREVIEW + CSV EXPORT (READ-ONLY)
+
+What it does:
+- AVD user access is granted via Azure RBAC role assignments on Application Groups (Desktop/RemoteApp),
+  not directly on Host Pools.
+- For each subscription -> for each host pool:
+  - Finds Application Groups mapped to that Host Pool
+  - Reads RBAC role assignments on each App Group
+  - Filters principals to Azure AD Groups (ObjectType = Group)
+  - Optional role filter (default: Desktop Virtualization User)
+- Outputs:
+  - Output Preview (top rows)
+  - Final summary grouped by subscription (boxed tables)
+  - Subscription totals + grand totals
+  - Optional CSV exports (Summary + Details)
+
+READ-ONLY: uses only Get-* commands.
+#>
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+$TargetSubscriptions = @(
+  "f9c819dc-4e16-4a04-8487-a734dcd880e1",
+  "c59f3913-9612-4704-94f8-4a1d4f695b2f",
+  "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+  "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+  "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+  "7160cf79-3964-41af-8168-05a588c5f99b",
+  "750da1a4-85cc-489e-b629-e512e0989c16",
+  "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+  "9ff6edd3-6b39-4d33-8776-56703398260c",
+  "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f",
+  "df7de03e-1d71-4adf-8fd1-bd5791326a26",
+  "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
+)
+
+$TenantId = ""  # optional; set to reduce login prompts
+
+# Role filter (recommended): typically access is granted via this role on the App Group
+# If you want ALL roles assigned to groups on the App Group, set $RoleNameFilter = @() or $null
+$RoleNameFilter = @("Desktop Virtualization User")
+
+# Principal filter: default Groups only.
+# Set $IncludeNonGroupPrincipals = $true to include Users/Service Principals too.
+$IncludeNonGroupPrincipals = $false
+
+# Output Preview (console)
+$PreviewSummaryRows = 15
+$PreviewDetailsRows = 20
+$ShowDetailsPreview = $true
+
+# Optional: include group names in summary output (can get long)
+$IncludeGroupNamesInSummary = $false
+$MaxGroupNamesToShow        = 10
+
+# CSV exports
+$ExportSummaryCsv = $true
+$SummaryCsvPath   = "C:\Temp\AVD_HostPool_AssignmentGroup_Summary.csv"
+
+$ExportDetailsCsv = $true
+$DetailsCsvPath   = "C:\Temp\AVD_HostPool_AssignmentGroup_Details.csv"
+
+# Visual formatting
+$Separator    = ("=" * 140)
+$SubSeparator = ("-" * 140)
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+function Initialize-PSGalleryPreReqs {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+    } catch {
+        Write-Host "WARNING: NuGet provider verification failed. Module install may fail." -ForegroundColor Yellow
+    }
+}
+
+function Set-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne "Trusted") {
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        }
+    } catch {
+        Write-Host "WARNING: Unable to set PSGallery to Trusted (may prompt during installs)." -ForegroundColor Yellow
+    }
+}
+
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Ensure-FolderExists {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $folder = Split-Path $Path -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+}
+
+function Get-ResourceGroupFromId {
+    param([Parameter(Mandatory=$true)][string]$ArmId)
+    if ($ArmId -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    return ""
+}
+
+function Show-LinedTable {
+    param(
+        [Parameter(Mandatory=$true)][array]$Data,
+        [Parameter(Mandatory=$true)][string[]]$Columns
+    )
+
+    if (-not $Data -or $Data.Count -eq 0) {
+        Write-Host "No data to display." -ForegroundColor Yellow
+        return
+    }
+
+    $widths = @{}
+    foreach ($c in $Columns) {
+        $max = $c.Length
+        foreach ($row in $Data) {
+            $val = "" + $row.$c
+            if ($val.Length -gt $max) { $max = $val.Length }
+        }
+        $widths[$c] = [Math]::Min([Math]::Max($max, 6) + 2, 75)
+    }
+
+    $line = "+"
+    foreach ($c in $Columns) { $line += ("-" * $widths[$c]) + "+" }
+
+    Write-Host $line -ForegroundColor DarkGray
+    $header = "|"
+    foreach ($c in $Columns) { $header += (" " + $c).PadRight($widths[$c]) + "|" }
+    Write-Host $header -ForegroundColor Cyan
+    Write-Host $line -ForegroundColor DarkGray
+
+    foreach ($row in $Data) {
+        $r = "|"
+        foreach ($c in $Columns) {
+            $txt = "" + $row.$c
+            if ($txt.Length -gt ($widths[$c] - 1)) {
+                $txt = $txt.Substring(0, $widths[$c] - 4) + "..."
+            }
+            $r += (" " + $txt).PadRight($widths[$c]) + "|"
+        }
+        Write-Host $r
+        Write-Host $line -ForegroundColor DarkGray
+    }
+}
+
+# ==========================================================
+# START
+# ==========================================================
+
+$scriptStart = Get-Date
+
+Initialize-PSGalleryPreReqs
+Set-PSGalleryTrusted
+
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+
+# Auth
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+catch {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+
+# Resolve subscriptions
+$allSubs = Get-AzSubscription
+$resolvedSubs = foreach ($id in $TargetSubscriptions) {
+    $match = $allSubs | Where-Object { $_.Id -eq $id }
+    if ($match) { $match }
+    else { Write-Host "WARNING: Subscription not found or not accessible: $id" -ForegroundColor Yellow }
+}
+
+if (-not $resolvedSubs -or $resolvedSubs.Count -eq 0) {
+    Write-Host "ERROR: No valid subscriptions resolved." -ForegroundColor Red
+    return
+}
+
+# Collect data
+$allDetails = New-Object System.Collections.Generic.List[object]
+$allSummary = New-Object System.Collections.Generic.List[object]
+
+$subIndex = 0
+foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
+    $subIndex++
+
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+
+    # Cache all Application Groups once per subscription (faster)
+    $allAppGroups = @()
+    try {
+        $allAppGroups = Get-AzWvdApplicationGroup -ErrorAction Stop
+    } catch {
+        Write-Host "WARNING: Unable to enumerate Application Groups in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    # HostPools
+    $hostPools = @()
+    try {
+        $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "WARNING: Unable to enumerate host pools in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    $hpIndex = 0
+    foreach ($hp in $hostPools) {
+        $hpIndex++
+        Write-Progress -Activity "Collecting AVD assignment groups" `
+            -Status ("Subscription [{0}/{1}] {2} | HostPool [{3}/{4}] {5}" -f $subIndex,$resolvedSubs.Count,$sub.Name,$hpIndex,$hostPools.Count,$hp.Name) `
+            -PercentComplete (($hpIndex / [Math]::Max($hostPools.Count,1)) * 100)
+
+        $hpId   = $hp.Id
+        $rgName = if ($hp.PSObject.Properties.Name -contains "ResourceGroupName" -and -not [string]::IsNullOrWhiteSpace($hp.ResourceGroupName)) {
+            $hp.ResourceGroupName
+        } else {
+            Get-ResourceGroupFromId -ArmId $hpId
+        }
+
+        # App Groups mapped to this HostPool
+        $hpAppGroups = @($allAppGroups | Where-Object { $_.HostPoolArmPath -eq $hpId })
+
+        # Gather RBAC assignments on each App Group
+        $principalAssignments = New-Object System.Collections.Generic.List[object]
+
+        foreach ($ag in $hpAppGroups) {
+            $agScope = $ag.Id
+            $ras = @()
+
+            try {
+                $ras = Get-AzRoleAssignment -Scope $agScope -ErrorAction Stop
+            } catch {
+                $ras = @()
+            }
+
+            # Filter principals
+            if (-not $IncludeNonGroupPrincipals) {
+                $ras = $ras | Where-Object { $_.ObjectType -eq "Group" }
+            }
+
+            # Filter role names (optional)
+            if ($RoleNameFilter -and $RoleNameFilter.Count -gt 0) {
+                $ras = $ras | Where-Object { $RoleNameFilter -contains $_.RoleDefinitionName }
+            }
+
+            foreach ($ra in $ras) {
+                $principalAssignments.Add([pscustomobject]@{
+                    Subscription     = $sub.Name
+                    SubscriptionId   = $sub.Id
+                    ResourceGroup    = $rgName
+                    HostPoolName     = $hp.Name
+                    HostPoolType     = $hp.HostPoolType
+                    AppGroupName     = $ag.Name
+                    AppGroupType     = $ag.ApplicationGroupType
+                    RoleName         = $ra.RoleDefinitionName
+                    PrincipalType    = $ra.ObjectType
+                    PrincipalName    = $ra.DisplayName
+                    PrincipalObjectId= $ra.ObjectId
+                    AppGroupScope    = $agScope
+                })
+            }
+        }
+
+        foreach ($d in $principalAssignments) { $allDetails.Add($d) }
+
+        # Summary per HostPool
+        $totalAssignments = $principalAssignments.Count
+
+        # If only groups are included: unique group count is based on PrincipalObjectId
+        # If non-group principals included: unique principal count is still useful
+        $uniquePrincipals = @($principalAssignments | Group-Object PrincipalObjectId)
+        $uniquePrincipalCount = $uniquePrincipals.Count
+
+        $uniquePrincipalNames = @($uniquePrincipals | ForEach-Object { $_.Group[0].PrincipalName }) | Sort-Object
+
+        $nameText = ""
+        if ($IncludeGroupNamesInSummary) {
+            $shown = $uniquePrincipalNames | Select-Object -First $MaxGroupNamesToShow
+            $nameText = ($shown -join "; ")
+            if ($uniquePrincipalNames.Count -gt $MaxGroupNamesToShow) {
+                $nameText += " ; +$($uniquePrincipalNames.Count - $MaxGroupNamesToShow) more"
+            }
+        }
+
+        $desktopAgCount   = ($hpAppGroups | Where-Object { $_.ApplicationGroupType -eq "Desktop" }).Count
+        $remoteAppAgCount = ($hpAppGroups | Where-Object { $_.ApplicationGroupType -eq "RemoteApp" }).Count
+
+        $allSummary.Add([pscustomobject]@{
+            Subscription           = $sub.Name
+            SubscriptionId         = $sub.Id
+            ResourceGroup          = $rgName
+            HostPoolName           = $hp.Name
+            HostPoolType           = $hp.HostPoolType
+            AppGroupCount          = $hpAppGroups.Count
+            DesktopAppGroups       = $desktopAgCount
+            RemoteAppAppGroups     = $remoteAppAgCount
+            TotalAssignments       = $totalAssignments
+            UniquePrincipalCount   = $uniquePrincipalCount
+            UniquePrincipalNames   = $nameText
+        })
+    }
+}
+
+Write-Progress -Activity "Collecting AVD assignment groups" -Completed
+
+# ==========================================================
+# OUTPUT PREVIEW
+# ==========================================================
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "OUTPUT PREVIEW (Top rows)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+$summaryPreview = $allSummary | Sort-Object Subscription, HostPoolName | Select-Object -First $PreviewSummaryRows
+if ($summaryPreview.Count -gt 0) {
+    $cols = @("Subscription","HostPoolName","ResourceGroup","HostPoolType","AppGroupCount","TotalAssignments","UniquePrincipalCount")
+    if ($IncludeGroupNamesInSummary) { $cols += "UniquePrincipalNames" }
+    Show-LinedTable -Data $summaryPreview -Columns $cols
+} else {
+    Write-Host "No summary rows produced." -ForegroundColor Yellow
+}
+
+if ($ShowDetailsPreview) {
+    Write-Host "`nDETAILS PREVIEW (Top rows)" -ForegroundColor Cyan
+    $detailsPreview = $allDetails | Sort-Object Subscription, HostPoolName, AppGroupName, PrincipalName | Select-Object -First $PreviewDetailsRows
+    if ($detailsPreview.Count -gt 0) {
+        Show-LinedTable -Data $detailsPreview -Columns @(
+            "Subscription","HostPoolName","AppGroupName","AppGroupType","RoleName","PrincipalType","PrincipalName","PrincipalObjectId"
+        )
+    } else {
+        Write-Host "No detail rows produced (no assignments found or insufficient permissions)." -ForegroundColor Yellow
+    }
+}
+
+# ==========================================================
+# FINAL SUMMARY (Grouped by Subscription)
+# ==========================================================
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "FINAL SUMMARY (Assignments per Host Pool, grouped by Subscription)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+$final  = $allSummary | Sort-Object Subscription, HostPoolName
+$groups = $final | Group-Object Subscription
+
+foreach ($g in $groups) {
+    $subObj = $resolvedSubs | Where-Object { $_.Name -eq $g.Name } | Select-Object -First 1
+    $subIdText = if ($subObj) { " ($($subObj.Id))" } else { "" }
+
+    Write-Host "`n$SubSeparator" -ForegroundColor DarkGray
+    Write-Host ("SUBSCRIPTION: {0}{1}" -f $g.Name, $subIdText) -ForegroundColor Yellow
+    Write-Host $SubSeparator -ForegroundColor DarkGray
+
+    $cols = @("HostPoolName","ResourceGroup","HostPoolType","AppGroupCount","TotalAssignments","UniquePrincipalCount")
+    if ($IncludeGroupNamesInSummary) { $cols += "UniquePrincipalNames" }
+
+    Show-LinedTable -Data ($g.Group | Sort-Object HostPoolName) -Columns $cols
+
+    $subHostPoolCount    = ($g.Group).Count
+    $subAppGroupsTotal   = ($g.Group | Measure-Object AppGroupCount -Sum).Sum
+    $subAssignmentsTotal = ($g.Group | Measure-Object TotalAssignments -Sum).Sum
+
+    # Unique principals per subscription (dedupe across all host pools)
+    $subUniquePrincipals = @(
+        $allDetails |
+        Where-Object { $_.Subscription -eq $g.Name } |
+        Group-Object PrincipalObjectId
+    ).Count
+
+    Write-Host "Subscription Totals:" -ForegroundColor Cyan
+    Show-LinedTable -Data @(
+        [pscustomobject]@{
+            HostPools             = $subHostPoolCount
+            AppGroups             = $subAppGroupsTotal
+            TotalAssignments      = $subAssignmentsTotal
+            UniquePrincipalsInSub = $subUniquePrincipals
+        }
+    ) -Columns @("HostPools","AppGroups","TotalAssignments","UniquePrincipalsInSub")
+}
+
+# ==========================================================
+# GRAND TOTALS
+# ==========================================================
+
+$overallHostPools       = $allSummary.Count
+$overallAppGroups       = ($allSummary | Measure-Object AppGroupCount -Sum).Sum
+$overallAssignments     = $allDetails.Count
+$overallUniquePrincipals= @($allDetails | Group-Object PrincipalObjectId).Count
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "GRAND TOTALS (All selected subscriptions)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+Show-LinedTable -Data @(
+    [pscustomobject]@{
+        SubscriptionsInScope   = $resolvedSubs.Count
+        TotalHostPools         = $overallHostPools
+        TotalAppGroups         = $overallAppGroups
+        TotalAssignments       = $overallAssignments
+        UniquePrincipalsOverall= $overallUniquePrincipals
+    }
+) -Columns @("SubscriptionsInScope","TotalHostPools","TotalAppGroups","TotalAssignments","UniquePrincipalsOverall")
+
+# ==========================================================
+# CSV EXPORT
+# ==========================================================
+
+if ($ExportSummaryCsv) {
+    Ensure-FolderExists -Path $SummaryCsvPath
+    $allSummary | Sort-Object Subscription, HostPoolName |
+        Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nSummary CSV exported: $SummaryCsvPath" -ForegroundColor Green
+}
+
+if ($ExportDetailsCsv) {
+    Ensure-FolderExists -Path $DetailsCsvPath
+    $allDetails | Sort-Object Subscription, HostPoolName, AppGroupName, PrincipalName |
+        Export-Csv -Path $DetailsCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Details CSV exported: $DetailsCsvPath" -ForegroundColor Green
+}
+
+$elapsed = New-TimeSpan -Start $scriptStart -End (Get-Date)
+Write-Host "`nCompleted in: $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
