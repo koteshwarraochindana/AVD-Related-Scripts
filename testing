@@ -3,7 +3,7 @@
 # =========================================================
 
 # 👉 CHANGE THIS — UNC path to the installer file
-$InstallerPath = "\\YOURFILESERVER\Applications\YourAppFolder\YourAppSetup.exe"
+$InstallerPath = "\\smb.waunas23f.hscsint.net\shared data\VTT Team\Applications\npp.exe"
 
 # 👉 CHANGE THIS — Silent install switch for your app
 $SilentArgs = "/S"
@@ -19,7 +19,7 @@ $Password = "P@ssw0rd!"
 Write-Host "===== Starting Application Installation ====="
 
 # Check if UNC path exists before proceeding
-if (-Not (Test-Path $InstallerPath)) {
+if (-Not (Test-Path -LiteralPath $InstallerPath)) {
     Write-Host "Installer file not found at $InstallerPath"
     return
 }
@@ -44,7 +44,7 @@ if ($UseCredentials) {
     $MappedInstaller = "TempShare:\" + (Split-Path $InstallerPath -Leaf)
 
     # Check if mapped installer path exists
-    if (-Not (Test-Path $MappedInstaller)) {
+    if (-Not (Test-Path -LiteralPath $MappedInstaller)) {
         Write-Host "Mapped installer file not found at $MappedInstaller"
         return
     }
@@ -64,12 +64,6 @@ if ($UseCredentials) {
 
 } else {
     Write-Host "Running installer directly from UNC path..."
-
-    # Check if UNC path exists
-    if (-Not (Test-Path $InstallerPath)) {
-        Write-Host "Installer file not found at $InstallerPath"
-        return
-    }
 
     # Run installer directly from UNC path
     try {
