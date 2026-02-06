@@ -1,0 +1,692 @@
+<#
+AVD HostPool Assignment Inventory (Multi-Subscription) - REDUCED OUTPUT (READ-ONLY)
+
+Outputs (console):
+- FINAL summary grouped by subscription (boxed tables)
+- Subscription totals + Grand totals
+- Duplicate assignment report:
+    * Users with >1 assigned VM anywhere
+    * Users assigned across multiple host pools
+- Optional stale heartbeat table (older than N days)
+
+Captured per session host (ALL hosts in $allDetails / details export):
+- AssignedUser / IsAssigned
+- LastHeartBeat + HeartbeatAgeDays + IsHeartbeatStale
+- Connection History enrichment (if enabled + logs available):
+    * HasEverConnected (within lookback window)
+    * FirstConnection / LastConnection
+    * ConnectionCount
+
+READ-ONLY for Azure resources: uses only Get-* against Azure AVD resources.
+Local-only actions: Install-Module/Import-Module/Export-Csv (and optional query against Log Analytics).
+#>
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+$TargetSubscriptions = @(
+  "f9c819dc-4e16-4a04-8487-a734dcd880e1",
+  "c59f3913-9612-4704-94f8-4a1d4f695b2f",
+  "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+  "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+  "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+  "7160cf79-3964-41af-8168-05a588c5f99b",
+  "750da1a4-85cc-489e-b629-e512e0989c16",
+  "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+  "9ff6edd3-6b39-4d33-8776-56703398260c",
+  "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f",
+  "df7de03e-1d71-4adf-8fd1-bd5791326a26",
+  "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
+)
+
+$TenantId = ""  # optional; reduces login prompts if set
+
+# Optional exports (OFF by default)
+$ExportSummaryCsv = $true
+$SummaryCsvPath   = "C:\Temp\AVD_HostPool_Summary.csv"
+
+$ExportDetailsCsv = $true
+$DetailsCsvPath   = "C:\Temp\AVD_SessionHost_Details.csv"
+
+# Heartbeat stale threshold (used ONLY for flagging and optional stale report/export)
+$StaleHeartbeatDays = 15
+
+# Optional export: stale heartbeat rows as separate CSV (OFF by default)
+$ExportStaleHeartbeatCsv = $true
+$StaleHeartbeatCsvPath   = "C:\Temp\AVD_StaleHeartbeat_15Days.csv"
+
+# Duplicate assignment exports (OFF by default)
+$ExportDuplicateCrossHostPoolCsv = $true
+$DuplicateCrossHostPoolCsvPath   = "C:\Temp\AVD_Duplicate_Assignments_CrossHostPool.csv"
+
+# Duplicate output controls
+$ShowDuplicateDetailsTable = $true
+$MaxDuplicateDetailRows    = 20
+
+# User normalization (safe default = $false)
+# If AssignedUser is sometimes "DOMAIN\user" and sometimes "user@domain.com",
+# turning this ON will normalize DOMAIN\user -> user (ONLY). Keep OFF to avoid merging across domains.
+$NormalizeDomainBackslashUser = $false
+
+# -------------------------------
+# Connection history (Log Analytics) - READ ONLY
+# -------------------------------
+$EnableConnectionHistory  = $false   # set TRUE to enrich "HasEverConnected"
+$LogAnalyticsWorkspaceIds = @(
+  ""  # put workspace "CustomerId" GUID(s) here
+)
+$ConnectionLookbackDays   = 180      # must be within LA retention
+$CountSuccessOnly         = $true    # if $true, counts only Success connections (WVDConnections ResultType=Success)
+$ShowConnectionInfoBanner = $true
+
+# Visual formatting
+$Separator    = ("=" * 140)
+$SubSeparator = ("-" * 140)
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+function Initialize-PSGalleryPreReqs {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+    } catch {
+        Write-Host "WARNING: NuGet provider verification failed. Module install may fail." -ForegroundColor Yellow
+    }
+}
+
+function Set-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne "Trusted") {
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        }
+    } catch {
+        Write-Host "WARNING: Unable to set PSGallery to Trusted (may prompt during installs)." -ForegroundColor Yellow
+    }
+}
+
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Show-LinedTable {
+    param(
+        [Parameter(Mandatory=$true)][array]$Data,
+        [Parameter(Mandatory=$true)][string[]]$Columns
+    )
+
+    if (-not $Data -or $Data.Count -eq 0) {
+        Write-Host "No data to display." -ForegroundColor Yellow
+        return
+    }
+
+    $widths = @{}
+    foreach ($c in $Columns) {
+        $max = $c.Length
+        foreach ($row in $Data) {
+            $val = "" + $row.$c
+            if ($val.Length -gt $max) { $max = $val.Length }
+        }
+        $widths[$c] = [Math]::Min([Math]::Max($max, 6) + 2, 75)
+    }
+
+    $line = "+"
+    foreach ($c in $Columns) { $line += ("-" * $widths[$c]) + "+" }
+
+    Write-Host $line -ForegroundColor DarkGray
+    $header = "|"
+    foreach ($c in $Columns) { $header += (" " + $c).PadRight($widths[$c]) + "|" }
+    Write-Host $header -ForegroundColor Cyan
+    Write-Host $line -ForegroundColor DarkGray
+
+    foreach ($row in $Data) {
+        $r = "|"
+        foreach ($c in $Columns) {
+            $txt = "" + $row.$c
+            if ($txt.Length -gt ($widths[$c] - 1)) {
+                $txt = $txt.Substring(0, $widths[$c] - 4) + "..."
+            }
+            $r += (" " + $txt).PadRight($widths[$c]) + "|"
+        }
+        Write-Host $r
+        Write-Host $line -ForegroundColor DarkGray
+    }
+}
+
+function Get-ResourceGroupFromHostPool {
+    param([Parameter(Mandatory=$true)]$HostPool)
+
+    if ($HostPool.PSObject.Properties.Name -contains "ResourceGroupName" -and
+        -not [string]::IsNullOrWhiteSpace($HostPool.ResourceGroupName)) {
+        return $HostPool.ResourceGroupName
+    }
+    if ($HostPool.PSObject.Properties.Name -contains "Id" -and $HostPool.Id) {
+        if ($HostPool.Id -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    }
+    return ""
+}
+
+function Normalize-UserKey {
+    param([Parameter(Mandatory=$true)][string]$User)
+
+    $u = $User.Trim()
+    if ($NormalizeDomainBackslashUser -and $u -match "\\") {
+        $u = ($u -split "\\")[-1]
+    }
+    return $u.ToLowerInvariant()
+}
+
+function Get-LastHeartbeatFromSessionHost {
+    param([Parameter(Mandatory=$true)]$SessionHost)
+
+    foreach ($p in @("LastHeartBeat", "LastHeartBeatTime", "LastHeartbeat", "LastHeartbeatTime")) {
+        if ($SessionHost.PSObject.Properties.Name -contains $p) {
+            $v = $SessionHost.$p
+            if ($null -ne $v -and -not [string]::IsNullOrWhiteSpace("$v")) { return $v }
+        }
+    }
+    return $null
+}
+
+function Convert-ToDateTimeOrNull {
+    param([Parameter(Mandatory=$false)]$Value)
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace("$Value")) { return $null }
+    try { return [datetime]$Value } catch { return $null }
+}
+
+function Normalize-HostKey {
+    # Make session host names comparable across sources:
+    # - VMName from AVD session host resource is usually just "vmname"
+    # - Log Analytics might store "vmname.domain.tld" or "vmname"
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    $h = $HostName.Trim().ToLowerInvariant()
+    if ($h -match "\.") { $h = ($h -split "\.")[0] }
+    return $h
+}
+
+function Get-AVDConnectionSummaryFromLogAnalytics_WVDConnections {
+    <#
+      Returns dictionary:
+        Key = "<userkey>|<hostkey>"
+        Value = FirstSeen / LastSeen / Connections
+      Requires WVDConnections table (AVD Insights).
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$WorkspaceId,
+        [Parameter(Mandatory=$true)][int]$LookbackDays,
+        [Parameter(Mandatory=$true)][bool]$SuccessOnly
+    )
+
+    $successFilter = if ($SuccessOnly) { '| where tostring(ResultType) =~ "Success"' } else { '' }
+
+$kql = @"
+WVDConnections
+| where TimeGenerated >= ago(${LookbackDays}d)
+$successFilter
+| project TimeGenerated,
+          UserName=tostring(UserName),
+          SessionHostName=tostring(SessionHostName)
+| where isnotempty(UserName) and isnotempty(SessionHostName)
+| summarize FirstSeen=min(TimeGenerated), LastSeen=max(TimeGenerated), Connections=count()
+          by UserName, SessionHostName
+"@
+
+    $res = Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkspaceId -Query $kql -ErrorAction Stop
+
+    $dict = @{}
+    foreach ($r in ($res.Results | ForEach-Object { $_ })) {
+        $userKey = Normalize-UserKey -User $r.UserName
+        $hostKey = Normalize-HostKey -HostName $r.SessionHostName
+        $k = "$userKey|$hostKey"
+
+        $dict[$k] = [pscustomobject]@{
+            FirstSeen   = Convert-ToDateTimeOrNull $r.FirstSeen
+            LastSeen    = Convert-ToDateTimeOrNull $r.LastSeen
+            Connections = [int]$r.Connections
+        }
+    }
+    return $dict
+}
+
+# ==========================================================
+# START
+# ==========================================================
+
+$scriptStart = Get-Date
+$now = Get-Date
+$staleCutoff = $now.AddDays(-$StaleHeartbeatDays)
+
+Initialize-PSGalleryPreReqs
+Set-PSGalleryTrusted
+
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+
+# Auth (fallback to device code)
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+catch {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
+}
+
+# Resolve subscriptions
+$allSubs = Get-AzSubscription
+$resolvedSubs = foreach ($id in $TargetSubscriptions) {
+    $match = $allSubs | Where-Object { $_.Id -eq $id }
+    if ($match) { $match }
+    else { Write-Host "WARNING: Subscription not found or not accessible: $id" -ForegroundColor Yellow }
+}
+
+if (-not $resolvedSubs -or $resolvedSubs.Count -eq 0) {
+    Write-Host "ERROR: No valid subscriptions resolved." -ForegroundColor Red
+    return
+}
+
+# Collect data
+$allDetails = New-Object System.Collections.Generic.List[object]
+$allSummary = New-Object System.Collections.Generic.List[object]
+
+$subIndex = 0
+foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
+    $subIndex++
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+
+    $hostPools = @()
+    try {
+        $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "WARNING: Unable to enumerate host pools in '$($sub.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+
+    $hpIndex = 0
+    foreach ($hp in $hostPools) {
+        $hpIndex++
+        Write-Progress -Activity "Collecting AVD inventory" `
+            -Status ("Subscription [{0}/{1}] {2} | HostPool [{3}/{4}] {5}" -f $subIndex,$resolvedSubs.Count,$sub.Name,$hpIndex,$hostPools.Count,$hp.Name) `
+            -PercentComplete (($hpIndex / [Math]::Max($hostPools.Count,1)) * 100)
+
+        $rgName = Get-ResourceGroupFromHostPool -HostPool $hp
+        if ([string]::IsNullOrWhiteSpace($rgName)) { continue }
+
+        $sessionHosts = @()
+        try {
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $rgName -HostPoolName $hp.Name -ErrorAction Stop
+        } catch {
+            $sessionHosts = @()
+        }
+
+        $details = $sessionHosts | ForEach-Object {
+            $assigned = $null
+            if ($_.PSObject.Properties.Name -contains "AssignedUser") { $assigned = $_.AssignedUser }
+
+            $hbRaw = Get-LastHeartbeatFromSessionHost -SessionHost $_
+            $hb = Convert-ToDateTimeOrNull -Value $hbRaw
+
+            $ageDays = $null
+            if ($hb) { $ageDays = [math]::Round((($now - $hb).TotalDays), 2) }
+
+            $isStale = $false
+            if ($hb -and $hb -lt $staleCutoff) { $isStale = $true }
+
+            [pscustomobject]@{
+                Subscription         = $sub.Name
+                SubscriptionId       = $sub.Id
+                ResourceGroup        = $rgName
+                HostPoolName         = $hp.Name
+                HostPoolType         = $hp.HostPoolType
+                VMName               = ($_.Name -split "/")[-1]
+                Status               = $_.Status
+                AllowNewSession      = $_.AllowNewSession
+                AssignedUser         = $assigned
+                IsAssigned           = -not [string]::IsNullOrWhiteSpace($assigned)
+
+                LastHeartBeat        = $hb
+                HeartbeatAgeDays     = $ageDays
+                IsHeartbeatStale     = $isStale
+
+                # Connection history placeholders (enriched after collection if enabled)
+                HasEverConnected     = $false
+                FirstConnection      = $null
+                LastConnection       = $null
+                ConnectionCount      = 0
+                ConnectionLookbackDays = $ConnectionLookbackDays
+            }
+        }
+
+        foreach ($d in $details) { $allDetails.Add($d) }
+
+        $total     = $details.Count
+        $assignedC = ($details | Where-Object { $_.IsAssigned }).Count
+        $emptyC    = ($details | Where-Object { -not $_.IsAssigned }).Count
+
+        $allSummary.Add([pscustomobject]@{
+            Subscription         = $sub.Name
+            SubscriptionId       = $sub.Id
+            HostPoolName         = $hp.Name
+            ResourceGroup        = $rgName
+            HostPoolType         = $hp.HostPoolType
+            TotalSessionHosts    = $total
+            AssignedCount        = $assignedC
+            UnassignedEmptyCount = $emptyC
+        })
+    }
+}
+
+Write-Progress -Activity "Collecting AVD inventory" -Completed
+
+# ==========================================================
+# ENRICH: Has user ever connected to assigned session host? (Log Analytics)
+# ==========================================================
+
+$validWorkspaces = @($LogAnalyticsWorkspaceIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+if ($EnableConnectionHistory -and $validWorkspaces.Count -gt 0) {
+    try {
+        Ensure-Module "Az.OperationalInsights"
+
+        if ($ShowConnectionInfoBanner) {
+            Write-Host "`n$Separator" -ForegroundColor DarkGray
+            Write-Host "CONNECTION HISTORY ENRICHMENT (Log Analytics) - LOOKBACK: $ConnectionLookbackDays days" -ForegroundColor Cyan
+            Write-Host $Separator -ForegroundColor DarkGray
+            Write-Host "NOTE: 'HasEverConnected' is within Log Analytics retention/lookback window only." -ForegroundColor DarkGray
+        }
+
+        # Pull connection summaries once per workspace and merge
+        $globalConn = @{}
+
+        foreach ($ws in $validWorkspaces) {
+            Write-Host "Querying workspace: $ws ..." -ForegroundColor DarkGray
+            $d = Get-AVDConnectionSummaryFromLogAnalytics_WVDConnections -WorkspaceId $ws -LookbackDays $ConnectionLookbackDays -SuccessOnly $CountSuccessOnly
+
+            foreach ($k in $d.Keys) {
+                if ($globalConn.ContainsKey($k)) {
+                    $existing = $globalConn[$k]
+                    $incoming = $d[$k]
+
+                    $first = @($existing.FirstSeen, $incoming.FirstSeen) | Where-Object { $_ } | Sort-Object | Select-Object -First 1
+                    $last  = @($existing.LastSeen,  $incoming.LastSeen)  | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+                    $cnt   = ($existing.Connections + $incoming.Connections)
+
+                    $globalConn[$k] = [pscustomobject]@{ FirstSeen=$first; LastSeen=$last; Connections=$cnt }
+                } else {
+                    $globalConn[$k] = $d[$k]
+                }
+            }
+        }
+
+        # Enrich assigned rows only
+        foreach ($row in $allDetails) {
+            if (-not $row.IsAssigned -or [string]::IsNullOrWhiteSpace($row.AssignedUser)) { continue }
+
+            $userKey = Normalize-UserKey -User $row.AssignedUser
+            $hostKey = Normalize-HostKey -HostName $row.VMName
+            $key = "$userKey|$hostKey"
+
+            if ($globalConn.ContainsKey($key)) {
+                $hit = $globalConn[$key]
+                $row.HasEverConnected = $true
+                $row.FirstConnection  = $hit.FirstSeen
+                $row.LastConnection   = $hit.LastSeen
+                $row.ConnectionCount  = $hit.Connections
+            }
+        }
+
+        Write-Host "Connection history enrichment completed." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "WARNING: Connection history enrichment failed." -ForegroundColor Yellow
+        Write-Host "Reason: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "Most common causes:" -ForegroundColor Yellow
+        Write-Host " - Workspace ID incorrect or not accessible" -ForegroundColor Yellow
+        Write-Host " - WVDConnections table not present (your logs may be in AzureDiagnostics instead)" -ForegroundColor Yellow
+        Write-Host " - Insufficient permissions to query workspace" -ForegroundColor Yellow
+    }
+}
+elseif ($EnableConnectionHistory -and $validWorkspaces.Count -eq 0) {
+    Write-Host "`nNOTE: Connection history enabled but no workspace IDs provided. Add workspace CustomerId GUID(s) to `$LogAnalyticsWorkspaceIds." -ForegroundColor Yellow
+}
+
+# ==========================================================
+# FINAL SUMMARY (Grouped by Subscription)
+# ==========================================================
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "FINAL SUMMARY (Grouped by Subscription)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+$final = $allSummary | Sort-Object Subscription, HostPoolName
+$groups = $final | Group-Object Subscription
+
+foreach ($g in $groups) {
+    $subObj = $resolvedSubs | Where-Object { $_.Name -eq $g.Name } | Select-Object -First 1
+    $subIdText = if ($subObj) { " ($($subObj.Id))" } else { "" }
+
+    Write-Host "`n$SubSeparator" -ForegroundColor DarkGray
+    Write-Host ("SUBSCRIPTION: {0}{1}" -f $g.Name, $subIdText) -ForegroundColor Yellow
+    Write-Host $SubSeparator -ForegroundColor DarkGray
+
+    Show-LinedTable -Data ($g.Group | Sort-Object HostPoolName) -Columns @(
+        "HostPoolName","ResourceGroup","HostPoolType","TotalSessionHosts","AssignedCount","UnassignedEmptyCount"
+    )
+
+    $subTotalHosts     = ($g.Group | Measure-Object TotalSessionHosts -Sum).Sum
+    $subAssigned       = ($g.Group | Measure-Object AssignedCount -Sum).Sum
+    $subUnassigned     = ($g.Group | Measure-Object UnassignedEmptyCount -Sum).Sum
+    $subHostPoolCount  = ($g.Group).Count
+
+    Write-Host "Subscription Totals:" -ForegroundColor Cyan
+    Show-LinedTable -Data @(
+        [pscustomobject]@{
+            HostPools         = $subHostPoolCount
+            TotalSessionHosts = $subTotalHosts
+            Assigned          = $subAssigned
+            UnassignedEmpty   = $subUnassigned
+        }
+    ) -Columns @("HostPools","TotalSessionHosts","Assigned","UnassignedEmpty")
+}
+
+# Grand totals
+$overallTotal      = $allDetails.Count
+$overallAssigned   = ($allDetails | Where-Object { $_.IsAssigned }).Count
+$overallUnassigned = ($allDetails | Where-Object { -not $_.IsAssigned }).Count
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "GRAND TOTALS (All selected subscriptions)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+Show-LinedTable -Data @(
+    [pscustomobject]@{
+        SubscriptionsInScope = $resolvedSubs.Count
+        TotalHostPools       = $allSummary.Count
+        TotalSessionHosts    = $overallTotal
+        Assigned             = $overallAssigned
+        UnassignedEmpty      = $overallUnassigned
+    }
+) -Columns @("SubscriptionsInScope","TotalHostPools","TotalSessionHosts","Assigned","UnassignedEmpty")
+
+# ==========================================================
+# DUPLICATE ASSIGNMENTS (Users with multiple assigned VMs)
+# ==========================================================
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "DUPLICATE ASSIGNMENTS (Users with multiple assigned VMs)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+$assignedOnly = $allDetails | Where-Object { $_.IsAssigned -and -not [string]::IsNullOrWhiteSpace($_.AssignedUser) }
+
+if (-not $assignedOnly -or $assignedOnly.Count -eq 0) {
+    Write-Host "No assigned session hosts found (AssignedUser empty for all rows)." -ForegroundColor Yellow
+}
+else {
+    $assignedWithKey = $assignedOnly | Select-Object *,
+        @{Name="AssignedUserKey"; Expression={ Normalize-UserKey -User $_.AssignedUser }}
+
+    $userGroups = $assignedWithKey | Group-Object AssignedUserKey
+    $multiVmUsers = $userGroups | Where-Object { $_.Count -gt 1 }
+
+    $crossHostPoolUsers = $multiVmUsers | Where-Object {
+        (($_.Group | Select-Object -ExpandProperty HostPoolName -Unique).Count -gt 1)
+    }
+
+    function New-UserDupSummaryRow {
+        param([Parameter(Mandatory=$true)]$grp)
+
+        $g = $grp.Group
+        $displayUser = ($g | Select-Object -ExpandProperty AssignedUser -First 1)
+
+        [pscustomobject]@{
+            AssignedUser   = $displayUser
+            AssignedVMs    = $grp.Count
+            HostPools      = ($g | Select-Object -ExpandProperty HostPoolName -Unique).Count
+            Subscriptions  = ($g | Select-Object -ExpandProperty Subscription -Unique).Count
+            ResourceGroups = ($g | Select-Object -ExpandProperty ResourceGroup -Unique).Count
+        }
+    }
+
+    Write-Host "`nUsers with MORE THAN ONE assigned VM (any host pool):" -ForegroundColor Yellow
+    if (-not $multiVmUsers -or $multiVmUsers.Count -eq 0) {
+        Write-Host "None found." -ForegroundColor Green
+    }
+    else {
+        $summaryAny = $multiVmUsers |
+            ForEach-Object { New-UserDupSummaryRow -grp $_ } |
+            Sort-Object `
+                @{Expression='AssignedVMs';Descending=$true},
+                @{Expression='HostPools';Descending=$true},
+                @{Expression='AssignedUser';Descending=$false}
+
+        Show-LinedTable -Data $summaryAny -Columns @(
+            "AssignedUser","AssignedVMs","HostPools","Subscriptions","ResourceGroups"
+        )
+    }
+
+    Write-Host "`nUsers assigned across MULTIPLE HOST POOLS:" -ForegroundColor Yellow
+    if (-not $crossHostPoolUsers -or $crossHostPoolUsers.Count -eq 0) {
+        Write-Host "None found." -ForegroundColor Green
+    }
+    else {
+        $summaryCross = $crossHostPoolUsers |
+            ForEach-Object { New-UserDupSummaryRow -grp $_ } |
+            Sort-Object `
+                @{Expression='HostPools';Descending=$true},
+                @{Expression='AssignedVMs';Descending=$true},
+                @{Expression='AssignedUser';Descending=$false}
+
+        Show-LinedTable -Data $summaryCross -Columns @(
+            "AssignedUser","AssignedVMs","HostPools","Subscriptions","ResourceGroups"
+        )
+
+        $detailCross = foreach ($ug in $crossHostPoolUsers) {
+            foreach ($row in ($ug.Group | Sort-Object Subscription, HostPoolName, VMName)) {
+                [pscustomobject]@{
+                    AssignedUser       = $row.AssignedUser
+                    Subscription       = $row.Subscription
+                    HostPoolName       = $row.HostPoolName
+                    ResourceGroup      = $row.ResourceGroup
+                    VMName             = $row.VMName
+                    Status             = $row.Status
+                    AllowNewSession    = $row.AllowNewSession
+                    LastHeartBeat      = $row.LastHeartBeat
+                    HeartbeatAgeDays   = $row.HeartbeatAgeDays
+                    HasEverConnected   = $row.HasEverConnected
+                    LastConnection     = $row.LastConnection
+                    ConnectionCount    = $row.ConnectionCount
+                }
+            }
+        }
+
+        if ($ShowDuplicateDetailsTable) {
+            Write-Host "`nDETAILS (Cross-hostpool users -> exact assigned VMs):" -ForegroundColor Cyan
+
+            $toShow = if ($detailCross.Count -gt $MaxDuplicateDetailRows) {
+                $detailCross | Select-Object -First $MaxDuplicateDetailRows
+            } else {
+                $detailCross
+            }
+
+            Show-LinedTable -Data $toShow -Columns @(
+                "AssignedUser","Subscription","HostPoolName","ResourceGroup","VMName","Status","AllowNewSession","LastHeartBeat","HasEverConnected","LastConnection","ConnectionCount"
+            )
+        }
+
+        if ($ExportDuplicateCrossHostPoolCsv) {
+            $folder = Split-Path $DuplicateCrossHostPoolCsvPath -Parent
+            if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+            $detailCross | Export-Csv -Path $DuplicateCrossHostPoolCsvPath -NoTypeInformation -Encoding UTF8
+            Write-Host "Duplicate assignment CSV exported: $DuplicateCrossHostPoolCsvPath" -ForegroundColor Green
+        }
+    }
+}
+
+# ==========================================================
+# OPTIONAL: Stale heartbeat report/export
+# ==========================================================
+
+$staleRows = $allDetails | Where-Object { $_.IsHeartbeatStale -eq $true } |
+    Sort-Object @{Expression="LastHeartBeat";Descending=$false}
+
+Write-Host "`n$Separator" -ForegroundColor DarkGray
+Write-Host "STALE HEARTBEATS (LastHeartBeat older than $StaleHeartbeatDays days)" -ForegroundColor Cyan
+Write-Host $Separator -ForegroundColor DarkGray
+
+if (-not $staleRows -or $staleRows.Count -eq 0) {
+    Write-Host "None found." -ForegroundColor Green
+} else {
+    Show-LinedTable -Data ($staleRows | Select-Object -First 200) -Columns @(
+        "Subscription","HostPoolName","VMName","Status","AllowNewSession","AssignedUser","LastHeartBeat","HeartbeatAgeDays"
+    )
+    if ($staleRows.Count -gt 200) {
+        Write-Host "NOTE: Showing first 200 rows of $($staleRows.Count)." -ForegroundColor Yellow
+    }
+}
+
+if ($ExportStaleHeartbeatCsv) {
+    $folder = Split-Path $StaleHeartbeatCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $staleRows | Export-Csv -Path $StaleHeartbeatCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Stale Heartbeat CSV exported: $StaleHeartbeatCsvPath" -ForegroundColor Green
+}
+
+# ==========================================================
+# OPTIONAL EXPORTS (CSV)
+# ==========================================================
+
+if ($ExportSummaryCsv) {
+    $folder = Split-Path $SummaryCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $allSummary | Sort-Object Subscription, HostPoolName | Export-Csv -Path $SummaryCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nSummary CSV exported: $SummaryCsvPath" -ForegroundColor Green
+}
+
+if ($ExportDetailsCsv) {
+    $folder = Split-Path $DetailsCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $allDetails | Sort-Object Subscription, HostPoolName, VMName | Export-Csv -Path $DetailsCsvPath -NoTypeInformation -Encoding UTF8
+    Write-Host "Details CSV exported: $DetailsCsvPath" -ForegroundColor Green
+}
+
+$elapsed = New-TimeSpan -Start $scriptStart -End (Get-Date)
+Write-Host "`nCompleted in: $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
