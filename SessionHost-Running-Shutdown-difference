@@ -1,0 +1,373 @@
+<#
+Hardened AVD Mismatch Finder (Streaming, Confirmed) - READ ONLY
+
+Emits a line ONLY when all are true and confirmed on recheck:
+  - Azure VM PowerState == running
+  - AVD SessionHost.Status == Shutdown
+  - TotalSessions == 0
+  - LastHeartBeat age >= MinHeartbeatAgeMinutes
+
+Real-time progress; immediate console output on each confirmed mismatch;
+optional CSV append. ResourceId-based VM mapping (safe). Name fallback is
+OFF by default; when enabled, requires a single exact match only.
+
+Requires:
+- Az.Accounts
+- Az.Resources
+- Az.DesktopVirtualization
+- Az.Compute
+#>
+
+param(
+    [string[]]$TargetSubscriptions = @(
+        "f9c819dc-4e16-4a04-8487-a734dcd880e1",
+        "c59f3913-9612-4704-94f8-4a1d4f695b2f",
+        "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+        "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+        "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+        "7160cf79-3964-41af-8168-05a588c5f99b",
+        "750da1a4-85cc-489e-b629-e512e0989c16",
+        "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+        "9ff6edd3-6b39-4d33-8776-56703398260c",
+        "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f",
+        "df7de03e-1d71-4adf-8fb4-df512ccd5d3e"
+    ),
+    [string]$TenantId = "",
+    [switch]$ExportCsv = $true,
+    [string]$CsvPath = "C:\Temp\AVD_RunningVM_ShutdownHost_Mismatches.csv",
+    [int]$RecheckDelaySeconds = 5,          # wait before re-reading to avoid transient blips
+    [int]$MinHeartbeatAgeMinutes = 10,      # heartbeat must be older than this to flag
+    [switch]$AllowNameFallback = $false,    # OFF by default (safer)
+    [switch]$VerboseStreaming
+)
+
+# ---------------------------
+# Helpers
+# ---------------------------
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Normalize-HostKey {
+    param([Parameter(Mandatory=$true)][string]$HostName)
+    $h = $HostName.Trim().ToLowerInvariant()
+    if ($h -match "\.") { $h = ($h -split "\.")[0] }
+    return $h
+}
+
+function Get-ResourceGroupFromHostPool {
+    param([Parameter(Mandatory=$true)]$HostPool)
+    if ($HostPool.PSObject.Properties.Name -contains "ResourceGroupName" -and $HostPool.ResourceGroupName) { return $HostPool.ResourceGroupName }
+    if ($HostPool.Id -and $HostPool.Id -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    return ""
+}
+
+function Get-LastHeartbeatFromSessionHost {
+    param([Parameter(Mandatory=$true)]$SessionHost)
+    foreach ($p in "LastHeartBeat","LastHeartbeat","LastHeartBeatTime","LastHeartbeatTime") {
+        if ($SessionHost.PSObject.Properties.Name -contains $p -and $SessionHost.$p) {
+            return $SessionHost.$p
+        }
+    }
+    return $null
+}
+
+function Get-VmStatusByResourceId {
+    param([Parameter(Mandatory=$true)][string]$ResourceId)
+    $nullObj = [pscustomobject]@{Found=$false; VmName=''; ResourceGroup=''; Location=''; PowerState=''}
+    if ([string]::IsNullOrWhiteSpace($ResourceId)) { return $nullObj }
+
+    if ($ResourceId -match "/resourceGroups/([^/]+)/providers/Microsoft\.Compute/virtualMachines/([^/]+)$") {
+        $rg=$matches[1]; $vmn=$matches[2]
+        try {
+            $vm = Get-AzVM -ResourceGroupName $rg -Name $vmn -Status -ErrorAction Stop
+            $ps = ($vm.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1)
+            return [pscustomobject]@{
+                Found      = $true
+                VmName     = $vm.Name
+                ResourceGroup = $vm.ResourceGroupName
+                Location   = $vm.Location
+                PowerState = ($ps.Code -replace "PowerState/","")
+            }
+        } catch { return $nullObj }
+    }
+
+    return $nullObj
+}
+
+function Initialize-Csv {
+    param(
+        [switch]$ExportCsv,
+        [Parameter(Mandatory=$true)][string]$CsvPath,
+        [Parameter(Mandatory=$true)][string[]]$Columns
+    )
+    if (-not $ExportCsv) { return }
+    $folder = Split-Path $CsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    if (-not (Test-Path $CsvPath)) {
+        ($Columns -join ",") | Out-File -FilePath $CsvPath -Encoding utf8
+    }
+}
+
+function Append-Csv {
+    param(
+        [switch]$ExportCsv,
+        [Parameter(Mandatory=$true)][string]$CsvPath,
+        [Parameter(Mandatory=$true)][hashtable]$Row,
+        [Parameter(Mandatory=$true)][string[]]$Columns
+    )
+    if (-not $ExportCsv) { return }
+    $values = foreach ($c in $Columns) {
+        $v = if ($Row.ContainsKey($c)) { [string]$Row[$c] } else { "" }
+        '"' + ($v -replace '"','""') + '"'
+    }
+    ($values -join ",") | Out-File -FilePath $CsvPath -Append -Encoding utf8
+}
+
+function Get-AvdUserSessionsMap {
+    param([Parameter(Mandatory=$true)][string]$ResourceGroupName,
+          [Parameter(Mandatory=$true)][string]$HostPoolName)
+    $map = @{}
+    try {
+        $sessions = Get-AzWvdUserSession -ResourceGroupName $ResourceGroupName -HostPoolName $HostPoolName -ErrorAction SilentlyContinue
+        foreach ($us in ($sessions | Where-Object { $_ })) {
+            $shKey = ($us.Name -split "/")[0]
+            if (-not $map.ContainsKey($shKey)) { $map[$shKey] = 0 }
+            $map[$shKey]++
+        }
+    } catch {}
+    return $map
+}
+
+function Get-SessionHostByName {
+    param([Parameter(Mandatory=$true)][string]$ResourceGroupName,
+          [Parameter(Mandatory=$true)][string]$HostPoolName,
+          [Parameter(Mandatory=$true)][string]$SessionHostShortName)
+    # Some Az modules don't support -Name; fallback to filter
+    try {
+        $all = Get-AzWvdSessionHost -ResourceGroupName $ResourceGroupName -HostPoolName $HostPoolName -ErrorAction Stop
+        return ($all | Where-Object { ($_.Name -split "/")[-1] -ieq $SessionHostShortName } | Select-Object -First 1)
+    } catch {
+        return $null
+    }
+}
+
+# Pretty dotted separators
+$Dots = "." * 90
+function Write-HostPoolHeader {
+    param([string]$Subscription,[string]$HostPool,[string]$ResourceGroup)
+    Write-Host ""
+    Write-Host $Dots -ForegroundColor DarkGray
+    Write-Host ("HOST POOL: {0}  |  Subscription: {1}  |  RG: {2}" -f $HostPool, $Subscription, $ResourceGroup) -ForegroundColor Cyan
+    Write-Host $Dots -ForegroundColor DarkGray
+}
+function Write-HostPoolFooter {
+    param([int]$Confirmed,[string]$HostPool)
+    $msg = if ($Confirmed -gt 0) {
+        ("{0} confirmed mismatch(s) in host pool '{1}'" -f $Confirmed, $HostPool)
+    } else {
+        ("No confirmed mismatches in host pool '{0}'" -f $HostPool)
+    }
+    Write-Host $msg -ForegroundColor Yellow
+    Write-Host $Dots -ForegroundColor DarkGray
+}
+
+# ---------------------------
+# Start
+# ---------------------------
+$ErrorActionPreference = "Stop"
+
+Ensure-Module Az.Accounts
+Ensure-Module Az.Resources
+Ensure-Module Az.DesktopVirtualization
+Ensure-Module Az.Compute
+
+try {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) { Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null }
+    else { Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null }
+} catch {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) { Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null }
+    else { Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null }
+}
+
+# Resolve subscriptions
+$allSubs = Get-AzSubscription
+$resolvedSubs = foreach ($id in $TargetSubscriptions) {
+    $m = $allSubs | Where-Object { $_.Id -eq $id }
+    if ($m) { $m } else { Write-Warning "Subscription not accessible: $id" }
+}
+if (-not $resolvedSubs -or $resolvedSubs.Count -eq 0) { Write-Error "No valid subscriptions resolved."; return }
+
+# CSV header
+$cols = @(
+    "Timestamp","Subscription","HostPoolName","SessionHostName",
+    "PowerState","HealthState","TotalSessions","LastHeartBeat",
+    "VM_Name","VM_ResourceGroup","VM_Location",
+    "MatchMethod","RecheckConfirmed"
+)
+Initialize-Csv -ExportCsv:$ExportCsv -CsvPath $CsvPath -Columns $cols
+
+[int]$grandTotalConfirmed = 0
+$progSub = 1; $progHp = 2
+
+$subIdx = 0
+foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
+    $subIdx++
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+
+    Write-Progress -Id $progSub -Activity "AVD mismatch scan (hardened)" `
+        -Status "[$subIdx/$($resolvedSubs.Count)] $($sub.Name) | Confirmed mismatches so far: $grandTotalConfirmed" `
+        -PercentComplete (($subIdx / [Math]::Max($resolvedSubs.Count,1))*100)
+
+    $hostPools = @()
+    try { $hostPools = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name } catch { continue }
+
+    $hpIdx = 0
+    foreach ($hp in $hostPools) {
+        $hpIdx++
+        Write-Progress -Id $progHp -ParentId $progSub -Activity "Scanning host pool" `
+            -Status "[$hpIdx/$($hostPools.Count)] $($hp.Name) | Confirmed: $grandTotalConfirmed" `
+            -PercentComplete (($hpIdx / [Math]::Max($hostPools.Count,1))*100)
+
+        $rgName = Get-ResourceGroupFromHostPool -HostPool $hp
+        if ([string]::IsNullOrWhiteSpace($rgName)) { continue }
+
+        # Dotted section header for this host pool
+        Write-HostPoolHeader -Subscription $sub.Name -HostPool $hp.Name -ResourceGroup $rgName
+        [int]$poolConfirmed = 0
+
+        # Build user sessions map once per host pool
+        $sessionsByHost = Get-AvdUserSessionsMap -ResourceGroupName $rgName -HostPoolName $hp.Name
+
+        # Pull session hosts
+        $sessionHosts = @()
+        try { $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $rgName -HostPoolName $hp.Name -ErrorAction Stop } catch { $sessionHosts=@() }
+
+        foreach ($sh in $sessionHosts) {
+            $shNameFull = ($sh.Name -split "/")[-1]
+            if ($VerboseStreaming) {
+                Write-Host ("[scan] {0} | {1} | {2}" -f $sub.Name, $hp.Name, $shNameFull) -ForegroundColor DarkGray
+            }
+
+            $health1 = $sh.Status
+            if ($health1 -ine "Shutdown") { continue }
+
+            # Heartbeat gate
+            $hb1 = $null
+            try {
+                $hbRaw = Get-LastHeartbeatFromSessionHost -SessionHost $sh
+                if ($hbRaw) { $hb1 = [datetime]$hbRaw }
+            } catch {}
+            $hbAgeMin1 = if ($hb1) { [math]::Round(((Get-Date) - $hb1).TotalMinutes,1) } else { [double]::PositiveInfinity }
+            if ($hbAgeMin1 -lt $MinHeartbeatAgeMinutes) { continue }
+
+            # Sessions gate
+            $totalSessions1 = if ($sessionsByHost.ContainsKey($shNameFull)) { $sessionsByHost[$shNameFull] } else { 0 }
+            if ($totalSessions1 -ne 0) { continue }
+
+            # VM mapping via ResourceId (preferred)
+            $resourceId = if ($sh.PSObject.Properties.Name -contains "ResourceId") { $sh.ResourceId } else { "" }
+            $vm1 = $null
+            $matchMethod = "ResourceId"
+
+            if ($resourceId) {
+                $vm1 = Get-VmStatusByResourceId -ResourceId $resourceId
+                if (-not $vm1.Found) { continue }
+            }
+            elseif ($AllowNameFallback) {
+                $short = Normalize-HostKey $shNameFull
+                $cand = @( Get-AzVM -Status -ErrorAction SilentlyContinue | Where-Object { $_.Name -ieq $short } )
+                if ($cand.Count -ne 1) { continue }
+                $vm1 = [pscustomobject]@{
+                    Found=$true
+                    VmName=$cand[0].Name
+                    ResourceGroup=$cand[0].ResourceGroupName
+                    Location=$cand[0].Location
+                    PowerState=($cand[0].PowerState -replace "PowerState/","")
+                }
+                $matchMethod = "NameFallback"
+            }
+            else { continue }
+
+            if ($vm1.PowerState -ine "running") { continue }
+
+            # --- Double-check after delay ---
+            Start-Sleep -Seconds $RecheckDelaySeconds
+
+            # refresh sessions
+            $sessionsByHost2 = Get-AvdUserSessionsMap -ResourceGroupName $rgName -HostPoolName $hp.Name
+            $totalSessions2 = if ($sessionsByHost2.ContainsKey($shNameFull)) { $sessionsByHost2[$shNameFull] } else { 0 }
+
+            # re-read host (fallback to filter, since -Name isn't consistent across Az module versions)
+            $sh2 = Get-SessionHostByName -ResourceGroupName $rgName -HostPoolName $hp.Name -SessionHostShortName $shNameFull
+            $health2 = if ($sh2) { $sh2.Status } else { $health1 }
+
+            # re-read heartbeat
+            $hb2 = $null
+            if ($sh2) {
+                try {
+                    $hbRaw2 = Get-LastHeartbeatFromSessionHost -SessionHost $sh2
+                    if ($hbRaw2) { $hb2 = [datetime]$hbRaw2 }
+                } catch {}
+            }
+            $hbAgeMin2 = if ($hb2) { [math]::Round(((Get-Date) - $hb2).TotalMinutes,1) } else { [double]::PositiveInfinity }
+
+            # re-read VM
+            $vm2 = $vm1
+            if ($matchMethod -eq "ResourceId" -and $resourceId) {
+                $vm2 = Get-VmStatusByResourceId -ResourceId $resourceId
+            }
+
+            # Final confirmation
+            $confirmed = ($vm2.Found -and
+                          $vm2.PowerState -ieq "running" -and
+                          $health2 -ieq "Shutdown" -and
+                          $totalSessions2 -eq 0 -and
+                          $hbAgeMin2 -ge $MinHeartbeatAgeMinutes)
+
+            if (-not $confirmed) { continue }
+
+            $poolConfirmed++
+            $grandTotalConfirmed++
+
+            # Live, pretty output for each confirmed mismatch
+            Write-Host ("[MISMATCH] {0} | {1} | {2}" -f $sub.Name, $hp.Name, $shNameFull) -ForegroundColor Yellow
+            Write-Host ("           VM: {0}  (RG: {1}, Loc: {2})" -f $vm2.VmName, $vm2.ResourceGroup, $vm2.Location) -ForegroundColor Yellow
+            Write-Host ("           Evidence -> Power=running, Health=Shutdown, Sessions=0, LastHB>={0}m" -f $MinHeartbeatAgeMinutes) -ForegroundColor Yellow
+
+            # Append CSV
+            Append-Csv -ExportCsv:$ExportCsv -CsvPath $CsvPath -Columns $cols -Row @{
+                Timestamp        = (Get-Date).ToString("s")
+                Subscription     = $sub.Name
+                HostPoolName     = $hp.Name
+                SessionHostName  = $shNameFull
+                PowerState       = $vm2.PowerState
+                HealthState      = $health2
+                TotalSessions    = $totalSessions2
+                LastHeartBeat    = $hb2
+                VM_Name          = $vm2.VmName
+                VM_ResourceGroup = $vm2.ResourceGroup
+                VM_Location      = $vm2.Location
+                MatchMethod      = $matchMethod
+                RecheckConfirmed = $true
+            }
+        }
+
+        # Dotted pool footer summary
+        Write-HostPoolFooter -Confirmed $poolConfirmed -HostPool $hp.Name
+    }
+}
+
+Write-Progress -Id $progHp  -Completed
+Write-Progress -Id $progSub -Completed
+
+if ($grandTotalConfirmed -eq 0) {
+    Write-Host "No confirmed mismatches found after applying heartbeat/session gates." -ForegroundColor Green
+} else {
+    Write-Host ("Completed. Confirmed mismatches: {0}" -f $grandTotalConfirmed) -ForegroundColor Green
+    if ($ExportCsv) { Write-Host ("CSV saved: {0}" -f $CsvPath) -ForegroundColor Green }
+}
