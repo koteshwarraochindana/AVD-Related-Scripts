@@ -21,3 +21,17 @@ foreach ($url in $avdUrls) {
         Write-Host "$url : Error testing" -ForegroundColor Yellow
     }
 }
+
+----------------------------
+
+$urls = @(
+"rdweb.wvd.microsoft.com",
+"rdbroker.wvd.microsoft.com",
+"rdgateway.wvd.microsoft.com",
+"login.microsoftonline.com",
+"servicebus.windows.net"
+)
+
+foreach ($url in $urls) {
+    Test-NetConnection $url -Port 443
+}
