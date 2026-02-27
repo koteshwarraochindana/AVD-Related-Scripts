@@ -1,0 +1,70 @@
+# ===========================
+# DATA COLLECTION & ACTION
+# ===========================
+$inputCsv = "C:\Temp\VM_List.csv" 
+$vmList = Import-Csv -Path $inputCsv
+
+Write-Host "--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
+
+# Get all VMs once for speed
+$allVmsInSub = Get-AzVM 
+
+$results = foreach ($row in $vmList) {
+    $vmName = $row.VMName
+    $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
+    
+    # Visual Dotted Header for each VM
+    Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
+    Write-Host "VM: $vmName" -ForegroundColor Cyan
+
+    if (-not $foundVm) {
+        Write-Host "VM - $vmName - [NOT FOUND]" -ForegroundColor Red
+        [PSCustomObject]@{ VMName = $vmName; ActionTaken = "Skipped (Not Found)" }
+        continue
+    }
+
+    $rg = $foundVm.ResourceGroupName
+    $actionStatus = "Success"
+
+    try {
+        # Capture IDs before VM is gone
+        $osDiskId = $foundVm.StorageProfile.OsDisk.ManagedDisk.Id
+        $nicIds = $foundVm.NetworkProfile.NetworkInterfaces.Id
+
+        # 1. Delete VM
+        Remove-AzVM -ResourceGroupName $rg -Name $vmName -Force -ErrorAction Stop
+        Write-Host "VM - $vmName - [DELETED]" -ForegroundColor Yellow
+
+        # 2. Delete NICs
+        foreach ($nicId in $nicIds) {
+            $nicName = $nicId.Split('/')[-1]
+            Remove-AzResource -ResourceId $nicId -Force -ErrorAction SilentlyContinue
+            Write-Host "NIC - $nicName - [DELETED]" -ForegroundColor Yellow
+        }
+
+        # 3. Delete OS Disk
+        $diskName = $osDiskId.Split('/')[-1]
+        Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue
+        Write-Host "Disk - $diskName - [DELETED]" -ForegroundColor Yellow
+
+        $actionStatus = "VM, NIC, and Disk Deleted"
+    } catch {
+        Write-Host "Error processing $vmName : $($_.Exception.Message)" -ForegroundColor Red
+        $actionStatus = "Error: $($_.Exception.Message)"
+    }
+
+    [PSCustomObject]@{
+        VMName        = $vmName
+        ResourceGroup = $rg
+        ActionTaken   = $actionStatus
+    }
+}
+
+Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
+
+# ===========================
+# EXPORT
+# ===========================
+$outputPath = "C:\Temp\VM_Deletion_Report.csv"
+$results | Export-Csv -Path $outputPath -NoTypeInformation -Force
+Write-Host "`nProcess Complete. Summary exported to $outputPath" -ForegroundColor Green
