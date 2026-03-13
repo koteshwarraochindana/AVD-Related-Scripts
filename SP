@@ -1,0 +1,254 @@
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "     AVD SHORTPATH MASTER VERIFICATION SCRIPT                  " -ForegroundColor Cyan
+Write-Host "     Session Host: $env:COMPUTERNAME                           " -ForegroundColor Cyan
+Write-Host "     Date: $(Get-Date)                                         " -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+
+$pass = 0
+$fail = 0
+$warn = 0
+
+function Write-Pass($msg) { Write-Host "  ✅ $msg" -ForegroundColor Green;  $global:pass++ }
+function Write-Fail($msg) { Write-Host "  ❌ $msg" -ForegroundColor Red;    $global:fail++ }
+function Write-Warn($msg) { Write-Host "  ⚠️  $msg" -ForegroundColor Yellow; $global:warn++ }
+
+# ================================================================
+# CHECK 1 — GPO Port Confirmation
+# ================================================================
+Write-Host "`n[CHECK 1] GPO Port Configuration" -ForegroundColor Yellow
+
+$gpoPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+$gpo = Get-ItemProperty -Path $gpoPath -ErrorAction SilentlyContinue
+
+if ($gpo) {
+    if ($gpo.fUseUdpPortRedirector -eq 1) {
+        Write-Pass "fUseUdpPortRedirector = 1 (Public Shortpath enabled via GPO)"
+    } else {
+        Write-Fail "fUseUdpPortRedirector not set in GPO path"
+    }
+
+    if ($gpo.UdpRedirectorPort) {
+        Write-Pass "UDP Port Base = $($gpo.UdpRedirectorPort)"
+    } else {
+        Write-Warn "UdpRedirectorPort not found in GPO — using default"
+    }
+
+    if ($gpo.UdpPortRange) {
+        Write-Pass "Port Pool Size = $($gpo.UdpPortRange)"
+        $global:portStart = $gpo.UdpRedirectorPort
+        $global:portEnd   = $gpo.UdpRedirectorPort + $gpo.UdpPortRange
+        Write-Host "  ℹ️  Expected port range: $($global:portStart) - $($global:portEnd)" -ForegroundColor Cyan
+    } else {
+        Write-Warn "UdpPortRange not found — cannot calculate full range"
+    }
+} else {
+    Write-Fail "No GPO policy path found — Shortpath may not be GPO-managed"
+}
+
+# Also check WinStations for manual/registry config
+$wsPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+$ws = Get-ItemProperty -Path $wsPath -ErrorAction SilentlyContinue
+
+Write-Host "`n  Registry (WinStations) values:" -ForegroundColor Gray
+Write-Host "  ICEEnabled            : $($ws.ICEEnabled)"
+Write-Host "  fUseUdpPortRedirector : $($ws.fUseUdpPortRedirector)"
+Write-Host "  UdpPortNumber         : $($ws.UdpPortNumber)"
+Write-Host "  ICEActivateThreshold  : $($ws.ICEActivateThreshold)"
+
+if ($ws.ICEActivateThreshold -lt 150) {
+    Write-Warn "ICEActivateThreshold = $($ws.ICEActivateThreshold)ms — may be too low for Asia users (RTT ~180-220ms)!"
+    Write-Host "  ℹ️  Recommend increasing to 300ms for Asia users" -ForegroundColor Cyan
+} else {
+    Write-Pass "ICEActivateThreshold = $($ws.ICEActivateThreshold)ms — sufficient for Asia latency"
+}
+
+# ================================================================
+# CHECK 2 — Windows Firewall Rules for UDP 38300-39300
+# ================================================================
+Write-Host "`n[CHECK 2] Windows Firewall Rules" -ForegroundColor Yellow
+
+# Firewall profile status
+Get-NetFirewallProfile | ForEach-Object {
+    $status  = if ($_.Enabled) { "Active" } else { "Inactive" }
+    $inbound = if ($_.DefaultInboundAction -eq "Block") { "Block (needs explicit rules!)" } else { "Allow" }
+    Write-Host "  Profile: $($_.Name) | Status: $status | Default Inbound: $inbound" -ForegroundColor Gray
+}
+
+# Check for broad UDP allow rules
+$broadUDP = Get-NetFirewallRule -Direction Inbound -Action Allow -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $pf = $_ | Get-NetFirewallPortFilter
+        if ($pf.Protocol -eq "UDP" -and ($pf.LocalPort -eq "Any" -or $pf.LocalPort -match "38[3-9]|393")) {
+            [PSCustomObject]@{
+                Name    = $_.DisplayName
+                Enabled = $_.Enabled
+                Port    = $pf.LocalPort
+            }
+        }
+    } | Where-Object { $_ }
+
+if ($broadUDP) {
+    Write-Pass "Firewall rules covering UDP Shortpath range found:"
+    $broadUDP | ForEach-Object {
+        Write-Host "  → Rule: $($_.Name) | Enabled: $($_.Enabled) | Port: $($_.Port)" -ForegroundColor Gray
+    }
+} else {
+    Write-Fail "No firewall rules found for UDP 38300-39300 range!"
+    Write-Host "  ℹ️  Add rule: New-NetFirewallRule -DisplayName 'AVD Shortpath' -Direction Inbound -Protocol UDP -LocalPort 38300-39300 -Action Allow" -ForegroundColor Cyan
+}
+
+# Check UDP 3478 (STUN)
+$stun3478 = Get-NetFirewallRule -Direction Inbound -Action Allow -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $pf = $_ | Get-NetFirewallPortFilter
+        if ($pf.Protocol -eq "UDP" -and ($pf.LocalPort -eq "3478" -or $pf.LocalPort -eq "Any")) {
+            $_.DisplayName
+        }
+    } | Where-Object { $_ }
+
+if ($stun3478) {
+    Write-Pass "UDP 3478 (STUN) covered by firewall rule"
+} else {
+    Write-Warn "No explicit rule for UDP 3478 (STUN) — check if broad rules cover it"
+}
+
+# ================================================================
+# CHECK 3 — Global Protect Status
+# ================================================================
+Write-Host "`n[CHECK 3] Global Protect Status on Session Host" -ForegroundColor Yellow
+
+$gpServices = Get-Service -Name "PanGPS", "PanGPA" -ErrorAction SilentlyContinue
+
+if ($gpServices) {
+    $gpServices | ForEach-Object {
+        if ($_.Status -eq "Running") {
+            Write-Warn "Global Protect service '$($_.Name)' is RUNNING on session host!"
+            Write-Host "  ℹ️  GP may be adding extra firewall rules — check GP policy for UDP 38300-39300" -ForegroundColor Cyan
+        } else {
+            Write-Pass "Global Protect service '$($_.Name)' is NOT running"
+        }
+    }
+
+    # Check if GP added any blocking rules
+    $gpFirewallRules = Get-NetFirewallRule -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Palo|GlobalProtect|PanGP" }
+
+    if ($gpFirewallRules) {
+        Write-Host "`n  Global Protect firewall rules found:" -ForegroundColor Gray
+        $gpFirewallRules | Select-Object DisplayName, Enabled, Direction, Action |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+        $gpBlocking = $gpFirewallRules | Where-Object { $_.Action -eq "Block" -and $_.Direction -eq "Inbound" }
+        if ($gpBlocking) {
+            Write-Fail "Global Protect has BLOCKING rules — may be blocking Shortpath UDP!"
+            $gpBlocking | ForEach-Object { Write-Host "  → BLOCKED: $($_.DisplayName)" -ForegroundColor Red }
+        } else {
+            Write-Pass "No Global Protect blocking rules found for inbound traffic"
+        }
+    }
+} else {
+    Write-Pass "Global Protect is NOT installed/running on this session host"
+}
+
+# ================================================================
+# CHECK 4 — STUN Server Reachability
+# ================================================================
+Write-Host "`n[CHECK 4] STUN Server Reachability" -ForegroundColor Yellow
+
+$stunHosts = @("stun.azure.com", "20.202.0.0")
+
+foreach ($stun in $stunHosts) {
+    try {
+        $tcp = Test-NetConnection -ComputerName $stun -Port 3478 -WarningAction SilentlyContinue -InformationLevel Quiet
+        if ($tcp) {
+            Write-Pass "STUN reachable: $stun port 3478"
+        } else {
+            Write-Fail "STUN NOT reachable: $stun port 3478 — Public Shortpath will fail!"
+        }
+    } catch {
+        Write-Warn "Could not test STUN host: $stun — $($_.Exception.Message)"
+    }
+}
+
+# ================================================================
+# CHECK 5 — Active UDP Listeners
+# ================================================================
+Write-Host "`n[CHECK 5] Active UDP Listeners" -ForegroundColor Yellow
+
+# Check 3390 (managed)
+$listen3390 = netstat -ano | Select-String ":3390"
+if ($listen3390) {
+    Write-Pass "UDP 3390 is listening (Managed Shortpath port active)"
+    $listen3390 | ForEach-Object { Write-Host "  → $_" -ForegroundColor Gray }
+} else {
+    Write-Warn "UDP 3390 not listening — Managed Shortpath not configured"
+}
+
+# Check 38300-39300 range (public)
+$listenShortpath = netstat -ano | Select-String ":38[3-9]|:393"
+if ($listenShortpath) {
+    Write-Pass "Shortpath public range ports are active:"
+    $listenShortpath | ForEach-Object { Write-Host "  → $_" -ForegroundColor Gray }
+} else {
+    Write-Warn "No active listeners on 38300-39300 yet (normal if no active sessions)"
+    Write-Host "  ℹ️  Ports appear dynamically when users connect" -ForegroundColor Cyan
+}
+
+# ================================================================
+# CHECK 6 — Event Log Verdict (Last 50 events)
+# ================================================================
+Write-Host "`n[CHECK 6] Recent Shortpath Event Log Analysis" -ForegroundColor Yellow
+
+try {
+    $events = Get-WinEvent -LogName "Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV/Operational" `
+        -MaxEvents 50 -ErrorAction Stop |
+        Where-Object { $_.Id -eq 135 }
+
+    if ($events) {
+        $udpSuccess  = ($events | Where-Object { $_.Message -match "UDP" -and $_.Message -notmatch "TCP" }).Count
+        $tcpReason1  = ($events | Where-Object { $_.Message -match "Reason Code: 1" }).Count
+        $tcpReason2  = ($events | Where-Object { $_.Message -match "Reason Code: 2" }).Count
+        $total       = $events.Count
+
+        Write-Host "  Last 50 Event ID 135 breakdown:" -ForegroundColor Gray
+        Write-Host "  ✅ UDP (Shortpath success) : $udpSuccess" -ForegroundColor Green
+        Write-Host "  ❌ TCP Reason Code 1 (No Client UDP) : $tcpReason1" -ForegroundColor Red
+        Write-Host "  ❌ TCP Reason Code 2 (Server Config) : $tcpReason2" -ForegroundColor Red
+        Write-Host "  Total events analyzed      : $total" -ForegroundColor Gray
+
+        if ($udpSuccess -gt 0)  { Write-Pass "Shortpath UDP connections ARE happening" }
+        if ($tcpReason1 -gt 0)  { Write-Fail "Some users have no UDP client support — check client version/GP on laptops" }
+        if ($tcpReason2 -gt 0)  { Write-Fail "Server config forcing TCP — check GP on session host and GPO conflicts" }
+
+        $successRate = if ($total -gt 0) { [math]::Round($udpSuccess / $total * 100, 1) } else { 0 }
+        Write-Host "`n  Shortpath success rate: $successRate%" -ForegroundColor $(if ($successRate -ge 70) { "Green" } elseif ($successRate -ge 30) { "Yellow" } else { "Red" })
+    } else {
+        Write-Warn "No Event ID 135 found in last 50 events"
+    }
+} catch {
+    Write-Fail "Could not read event log: $($_.Exception.Message)"
+}
+
+# ================================================================
+# FINAL VERDICT
+# ================================================================
+Write-Host "`n================================================================" -ForegroundColor Cyan
+Write-Host "  FINAL VERDICT" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  ✅ Passed  : $pass" -ForegroundColor Green
+Write-Host "  ❌ Failed  : $fail" -ForegroundColor Red
+Write-Host "  ⚠️  Warnings: $warn" -ForegroundColor Yellow
+Write-Host ""
+
+if ($fail -eq 0 -and $warn -eq 0) {
+    Write-Host "  RESULT: All checks passed! Shortpath is fully configured." -ForegroundColor Green
+} elseif ($fail -eq 0) {
+    Write-Host "  RESULT: No critical failures but warnings need attention." -ForegroundColor Yellow
+} else {
+    Write-Host "  RESULT: $fail critical issue(s) found — action required!" -ForegroundColor Red
+}
+
+Write-Host "`n  Remember: Even with Shortpath working, Asia users on US East 2" -ForegroundColor Gray
+Write-Host "  will still experience ~180-220ms latency due to geography." -ForegroundColor Gray
+Write-Host "  Long-term fix = Deploy Host Pools in Asia regions!" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
