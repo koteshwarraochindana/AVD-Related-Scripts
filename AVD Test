@@ -155,6 +155,63 @@ WVDConnections
 | summarize LongRunningSessions = count() by SessionHostName
 | order by LongRunningSessions desc
 
+--------------------------------------------------------------------------------------
+
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "   AVD SHORTPATH SOURCE INVESTIGATION   " -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+# 1. Check GPO
+Write-Host "`n[1] GPO Configuration" -ForegroundColor Yellow
+$gpo = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -ErrorAction SilentlyContinue
+if ($gpo.fUseUdpPortRedirector -or $gpo.ICEEnabled) {
+    Write-Host "✅ Shortpath configured via GPO" -ForegroundColor Green
+    Write-Host "   ICEEnabled: $($gpo.ICEEnabled)"
+    Write-Host "   fUseUdpPortRedirector: $($gpo.fUseUdpPortRedirector)"
+} else {
+    Write-Host "❌ NOT configured via GPO" -ForegroundColor Red
+}
+
+# 2. Check Intune
+Write-Host "`n[2] Intune/MDM Enrollment" -ForegroundColor Yellow
+$dsreg = dsregcmd /status 2>&1
+if ($dsreg -match "MDMUrl\s+:\s+https://") {
+    Write-Host "✅ Device is Intune enrolled" -ForegroundColor Green
+    ($dsreg | Select-String "MDMUrl|AzureAdJoined|MDMEnrolled") | 
+        ForEach-Object { Write-Host "   $_" }
+} else {
+    Write-Host "❌ Device is NOT Intune enrolled" -ForegroundColor Red
+}
+
+# 3. Check Manual Registry
+Write-Host "`n[3] Manual Registry Configuration" -ForegroundColor Yellow
+$manual = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" -ErrorAction SilentlyContinue
+if ($manual.fUseUdpPortRedirector -or $manual.ICEEnabled) {
+    Write-Host "✅ Shortpath values in WinStations (Manual/Script)" -ForegroundColor Green
+    Write-Host "   ICEEnabled: $($manual.ICEEnabled)"
+    Write-Host "   fUseUdpPortRedirector: $($manual.fUseUdpPortRedirector)"
+    Write-Host "   UdpPortNumber: $($manual.UdpPortNumber)"
+    Write-Host "   ICEActivateThreshold: $($manual.ICEActivateThreshold)"
+} else {
+    Write-Host "❌ NOT manually configured" -ForegroundColor Red
+}
+
+# 4. Check Firewall
+Write-Host "`n[4] Firewall Rules" -ForegroundColor Yellow
+$fwRules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "Shortpath|RDP|AVD" }
+if ($fwRules) {
+    Write-Host "✅ Firewall rules found:" -ForegroundColor Green
+    $fwRules | Select-Object DisplayName, Enabled, Direction, Action | Format-Table -AutoSize
+} else {
+    Write-Host "⚠️ No specific Shortpath firewall rules found" -ForegroundColor Yellow
+    Write-Host "   (May be using broader UDP allow rules)"
+}
+
+# 5. Final Verdict
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "   VERDICT                              " -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
 ------------------------------------------------------------
 
 
