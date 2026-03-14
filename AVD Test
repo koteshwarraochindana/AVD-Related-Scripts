@@ -212,6 +212,17 @@ Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "   VERDICT                              " -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
+-------------------------------------------------
+
+Event
+| where EventLog == "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+| where EventID == 1149
+| parse RenderedDescription with * "User: " User "\r\n" * "Source Network Address: " SourceIP "\r\n" * "Source Port: " * "\r\nClient Name: " ClientName "\r\n" *
+| project TimeGenerated, Computer, User, ClientName, SourceIP
+| order by TimeGenerated desc
+
+------------------------------------------------------------
+
 ------------------------------------------------------------
 
 
