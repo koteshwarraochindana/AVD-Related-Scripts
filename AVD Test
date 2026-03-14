@@ -222,9 +222,10 @@ Event
 | order by TimeGenerated desc
 
 ------------------------------------------------------------
-Event
-| where EventLog == "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
-| take 10
+Get-WinEvent -LogName "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational" |
+Where-Object { $_.Id -eq 1149 } |
+Select-Object -First 1 |
+Format-List *
 ------------------------------------------------------------
 
 
