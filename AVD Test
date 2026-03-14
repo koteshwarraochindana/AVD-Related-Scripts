@@ -223,17 +223,24 @@ Event
 
 ------------------------------------------------------------
 SigninLogs
-| where TimeGenerated > ago(7d)
+| where TimeGenerated > ago(30d)
+| where AppDisplayName contains "Windows Virtual Desktop"
+| where UserPrincipalName == "Koteshwar_Chindana@yourdomain.com"
+| extend DeviceName = tostring(DeviceDetail.displayName)
+| extend DeviceOS = tostring(DeviceDetail.operatingSystem)
+| extend JoinType = tostring(DeviceDetail.trustType)
+| project TimeGenerated, UserPrincipalName, DeviceName, DeviceOS, JoinType, IPAddress
+| order by TimeGenerated desc
+------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(30d)
 | where AppDisplayName contains "Windows Virtual Desktop"
 | extend DeviceName = tostring(DeviceDetail.displayName)
 | extend DeviceOS = tostring(DeviceDetail.operatingSystem)
-| extend DeviceId = tostring(DeviceDetail.deviceId)
 | extend JoinType = tostring(DeviceDetail.trustType)
-| extend IsCompliant = tostring(DeviceDetail.isCompliant)
-| project TimeGenerated, UserPrincipalName, DeviceName, 
-          DeviceOS, JoinType, IsCompliant, IPAddress
 | where isnotempty(DeviceName)
-| order by TimeGenerated desc
-------------------------------------------------------------
-
+| summarize LastSeen = max(TimeGenerated), 
+            Devices = make_set(DeviceName) by UserPrincipalName
+| order by LastSeen desc
+---------------------------------------------------------------------
 
