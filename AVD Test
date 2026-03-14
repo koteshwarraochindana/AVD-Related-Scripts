@@ -222,10 +222,18 @@ Event
 | order by TimeGenerated desc
 
 ------------------------------------------------------------
-Get-WinEvent -LogName "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational" |
-Where-Object { $_.Id -eq 1149 } |
-Select-Object -First 1 |
-Format-List *
+SigninLogs
+| where TimeGenerated > ago(7d)
+| where AppDisplayName contains "Windows Virtual Desktop"
+| extend DeviceName = tostring(DeviceDetail.displayName)
+| extend DeviceOS = tostring(DeviceDetail.operatingSystem)
+| extend DeviceId = tostring(DeviceDetail.deviceId)
+| extend JoinType = tostring(DeviceDetail.trustType)
+| extend IsCompliant = tostring(DeviceDetail.isCompliant)
+| project TimeGenerated, UserPrincipalName, DeviceName, 
+          DeviceOS, JoinType, IsCompliant, IPAddress
+| where isnotempty(DeviceName)
+| order by TimeGenerated desc
 ------------------------------------------------------------
 
 
