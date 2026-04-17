@@ -1,0 +1,53 @@
+# ===========================
+# MODULES & AUTH
+# ===========================
+# Ensure the AVD module is loaded
+if (-not (Get-Module -ListAvailable -Name "Az.DesktopVirtualization")) {
+    Install-Module -Name "Az.DesktopVirtualization" -Scope CurrentUser -Force
+}
+Import-Module "Az.DesktopVirtualization"
+
+# Authentication (Single Subscription)
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+try {
+    $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+} catch {
+    $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue
+}
+
+# ===========================
+# DATA COLLECTION
+# ===========================
+Write-Host "Fetching session host details from all host pools..." -ForegroundColor Gray
+
+$hostPools = Get-AzWvdHostPool
+$allSessionHosts = foreach ($hp in $hostPools) {
+    # Get hosts for the specific pool
+    $hosts = Get-AzWvdSessionHost -HostPoolName $hp.Name -ResourceGroupName $hp.ResourceGroupName
+    
+    foreach ($sh in $hosts) {
+        [PSCustomObject]@{
+            HostPoolName     = $hp.Name
+            SessionHostName  = $sh.Name.Split('/')[-1] # Clean name (remove path)
+            Status           = $sh.Status
+            AssignedUser     = $sh.AssignedUser
+            LastHeartbeat    = $sh.LastHeartBeat
+            UpdateState      = $sh.UpdateState
+            ResourceGroup    = $hp.ResourceGroupName
+            SubscriptionId   = $hp.Id.Split('/')[2]
+        }
+    }
+}
+
+# ===========================
+# EXPORT TO CSV
+# ===========================
+$csvPath = "C:\Temp\AVD_SessionHosts_FullReport.csv"
+
+if ($allSessionHosts) {
+    $allSessionHosts | Export-Csv -Path $csvPath -NoTypeInformation -Force
+    $allSessionHosts | Format-Table -AutoSize
+    Write-Host "Success! All session host details exported to $csvPath" -ForegroundColor Green
+} else {
+    Write-Host "No session hosts found in any host pool." -ForegroundColor Yellow
+}
