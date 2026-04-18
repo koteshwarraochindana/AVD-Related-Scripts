@@ -24,11 +24,10 @@ $allSessionHosts = foreach ($hp in $hostPools) {
     $hosts = Get-AzWvdSessionHost -HostPoolName $hp.Name -ResourceGroupName $hp.ResourceGroupName
 
     foreach ($sh in $hosts) {
-        $vmName        = $sh.ResourceId.Split('/')[-1]
-        $vmRg          = $sh.ResourceId.Split('/')[4]
+        $vmName         = $sh.ResourceId.Split('/')[-1]
+        $vmRg           = $sh.ResourceId.Split('/')[4]
         $subscriptionId = $hp.Id.Split('/')[2]
 
-        # --- Fetch the VM to get image reference ---
         $imagePublisher = $null
         $imageOffer     = $null
         $imageSku       = $null
@@ -37,7 +36,7 @@ $allSessionHosts = foreach ($hp in $hostPools) {
         $imageType      = $null
 
         try {
-            $vm = Get-AzVM -ResourceGroupName $vmRg -Name $vmName -ErrorAction Stop
+            $vm     = Get-AzVM -ResourceGroupName $vmRg -Name $vmName -ErrorAction Stop
             $imgRef = $vm.StorageProfile.ImageReference
 
             if ($imgRef.Id) {
@@ -45,16 +44,14 @@ $allSessionHosts = foreach ($hp in $hostPools) {
                 $imageType = "Custom/SIG"
                 $imageId   = $imgRef.Id
 
-                # If it's a SIG image, parse the version from the ID
-                # ID format: .../galleries/<gallery>/images/<def>/versions/<version>
                 if ($imgRef.Id -match '/versions/([^/]+)$') {
                     $imageVersion = $matches[1]
                 }
                 if ($imgRef.Id -match '/images/([^/]+)/versions') {
-                    $imageOffer = $matches[1]   # Image definition name
+                    $imageOffer = $matches[1]
                 }
                 if ($imgRef.Id -match '/galleries/([^/]+)/images') {
-                    $imagePublisher = $matches[1]  # Gallery name
+                    $imagePublisher = $matches[1]
                 }
 
             } else {
@@ -63,7 +60,13 @@ $allSessionHosts = foreach ($hp in $hostPools) {
                 $imagePublisher = $imgRef.Publisher
                 $imageOffer     = $imgRef.Offer
                 $imageSku       = $imgRef.Sku
-                $imageVersion   = $imgRef.ExactVersion ?? $imgRef.Version
+
+                # PS 5.1 compatible null coalescing
+                if ($imgRef.ExactVersion) {
+                    $imageVersion = $imgRef.ExactVersion
+                } else {
+                    $imageVersion = $imgRef.Version
+                }
             }
 
         } catch {
