@@ -1,100 +1,128 @@
-# 1. Start Connection
-Connect-AzAccount -WarningAction SilentlyContinue
+# ===========================
+# MODULES & AUTH
+# ===========================
+if (-not (Get-Module -ListAvailable -Name "Az.DesktopVirtualization")) {
+    Install-Module -Name "Az.DesktopVirtualization" -Scope CurrentUser -Force
+}
+Import-Module "Az.DesktopVirtualization"
 
-$ExportPath = "$home\Desktop\AVD-04.csv"
-$FullReport = @()
-$TotalHosts = 0; $TotalAssigned = 0; $TotalEmpty = 0
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+try {
+    $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+} catch {
+    $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue
+}
 
-# 2. Global Scan across all Subscriptions
-$Subs = Get-AzSubscription
-foreach ($Sub in $Subs) {
-    Write-Host "Scanning Subscription: $($Sub.Name)" -ForegroundColor Cyan
-    $Context = Set-AzContext -SubscriptionId $Sub.Id -Force -ErrorAction SilentlyContinue
-    if (-not $Context) { continue }
-    
-    $Workspaces = Get-AzWvdWorkspace -ErrorAction SilentlyContinue
-    foreach ($WS in $Workspaces) {
-        $WSRG = ($WS.Id -split '/')[4]
-        
-        $AppGroups = Get-AzWvdApplicationGroup -ResourceGroupName $WSRG -ErrorAction SilentlyContinue | Where-Object { $_.WorkspaceArmPath -eq $WS.Id }
-        
-        foreach ($AG in $AppGroups) {
-            $PoolName = ($AG.HostPoolArmPath -split '/')[-1]
-            $PoolRG = ($AG.Id -split '/')[4]
-            
-            $Pool = Get-AzWvdHostPool -ResourceGroupName $PoolRG -Name $PoolName -ErrorAction SilentlyContinue
-            if (-not $Pool) { continue }
+# ===========================
+# GET ALL SUBSCRIPTIONS
+# ===========================
+$subscriptions = Get-AzSubscription
+Write-Host "Found $($subscriptions.Count) subscription(s)." -ForegroundColor Cyan
 
-            # --- TARGETED FILTER: Only AD Groups assigned the User Role ---
-            $Assignments = Get-AzRoleAssignment -Scope $AG.Id -ErrorAction SilentlyContinue | Where-Object { 
-                $_.ObjectType -eq "Group" -and 
-                $_.RoleDefinitionName -eq "Desktop Virtualization User"
-            }
-            
-            $Entitlements = ($Assignments.DisplayName | Sort-Object -Unique | Where-Object { $_ }) -join "; "
-            if ([string]::IsNullOrWhiteSpace($Entitlements)) { $Entitlements = "No Groups Assigned" }
+# ===========================
+# DATA COLLECTION
+# ===========================
+$allSessionHosts = foreach ($sub in $subscriptions) {
 
-            $SessionHosts = Get-AzWvdSessionHost -ResourceGroupName $PoolRG -HostPoolName $Pool.Name -ErrorAction SilentlyContinue
-            
-            $CountTotal = ($SessionHosts | Measure-Object).Count
-            $CountAssigned = ($SessionHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_.AssignedUser) } | Measure-Object).Count
-            $CountEmpty = $CountTotal - $CountAssigned
-            $TotalHosts += $CountTotal; $TotalAssigned += $CountAssigned; $TotalEmpty += $CountEmpty
+    Write-Host "Switching to subscription: $($sub.Name) [$($sub.Id)]" -ForegroundColor Yellow
+    $null = Set-AzContext -SubscriptionId $sub.Id -WarningAction SilentlyContinue
 
-            $Location = $Pool.Location
-            $NetInfo = "No VMs Found"
-            
-            if ($CountTotal -gt 0) {
-                $FirstSH = $SessionHosts | Select-Object -First 1
-                if ($FirstSH.ResourceId) {
-                    $VMRG = ($FirstSH.ResourceId -split '/')[4]
-                    $VMName = ($FirstSH.ResourceId -split '/')[-1]
-                    
-                    $VM = Get-AzVM -ResourceGroupName $VMRG -Name $VMName -ErrorAction SilentlyContinue
-                    if ($VM) {
-                        $Location = $VM.Location
-                        $NIC = Get-AzNetworkInterface -ResourceId $VM.NetworkProfile.NetworkInterfaces.Id -ErrorAction SilentlyContinue
-                        if ($NIC) {
-                            $SubnetId = $NIC.IpConfigurations.Subnet.Id
-                            $SubnetName = ($SubnetId -split '/')[-1]
-                            $VNetName = ($SubnetId -split '/')[-3]
-                            $NetInfo = "$VNetName / $SubnetName"
-                        }
+    $hostPools = Get-AzWvdHostPool -ErrorAction SilentlyContinue
+
+    if (-not $hostPools) {
+        Write-Host "  No host pools found in $($sub.Name). Skipping." -ForegroundColor Gray
+        continue
+    }
+
+    foreach ($hp in $hostPools) {
+        Write-Host "  Processing host pool: $($hp.Name)" -ForegroundColor Gray
+
+        $hosts = Get-AzWvdSessionHost -HostPoolName $hp.Name -ResourceGroupName $hp.ResourceGroupName -ErrorAction SilentlyContinue
+
+        if (-not $hosts) {
+            Write-Host "    No session hosts found in $($hp.Name). Skipping." -ForegroundColor Gray
+            continue
+        }
+
+        foreach ($sh in $hosts) {
+            $vmName = $sh.ResourceId.Split('/')[-1]
+            $vmRg   = $sh.ResourceId.Split('/')[4]
+
+            $imagePublisher = $null
+            $imageOffer     = $null
+            $imageSku       = $null
+            $imageVersion   = $null
+            $imageId        = $null
+            $imageType      = $null
+
+            try {
+                $vm     = Get-AzVM -ResourceGroupName $vmRg -Name $vmName -ErrorAction Stop
+                $imgRef = $vm.StorageProfile.ImageReference
+
+                if ($imgRef.Id) {
+                    # Custom image or Shared Image Gallery (SIG)
+                    $imageType = "Custom/SIG"
+                    $imageId   = $imgRef.Id
+
+                    if ($imgRef.Id -match '/versions/([^/]+)$') {
+                        $imageVersion = $matches[1]
+                    }
+                    if ($imgRef.Id -match '/images/([^/]+)/versions') {
+                        $imageOffer = $matches[1]
+                    }
+                    if ($imgRef.Id -match '/galleries/([^/]+)/images') {
+                        $imagePublisher = $matches[1]
+                    }
+
+                } else {
+                    # Marketplace image
+                    $imageType      = "Marketplace"
+                    $imagePublisher = $imgRef.Publisher
+                    $imageOffer     = $imgRef.Offer
+                    $imageSku       = $imgRef.Sku
+
+                    if ($imgRef.ExactVersion) {
+                        $imageVersion = $imgRef.ExactVersion
+                    } else {
+                        $imageVersion = $imgRef.Version
                     }
                 }
+
+            } catch {
+                $imageType = "Error: $_"
             }
 
-            $FullReport += [PSCustomObject]@{
-                Subscription      = $Sub.Name
-                Workspace         = $WS.Name
-                HostPool          = $Pool.Name
-                HostPoolType      = $Pool.HostPoolType
-                Entitlements      = $Entitlements
-                Location          = $Location
-                "VNet Subnet"     = $NetInfo
-                "Total Hosts"     = $CountTotal
-                "Assigned VMs"    = $CountAssigned
-                "Empty Assignment"= $CountEmpty
+            [PSCustomObject]@{
+                SubscriptionName = $sub.Name
+                SubscriptionId   = $sub.Id
+                HostPoolName     = $hp.Name
+                SessionHostName  = $sh.Name.Split('/')[-1]
+                VMName           = $vmName
+                VMResourceGroup  = $vmRg
+                Status           = $sh.Status
+                AssignedUser     = $sh.AssignedUser
+                LastHeartbeat    = $sh.LastHeartBeat
+                UpdateState      = $sh.UpdateState
+                ImageType        = $imageType
+                ImagePublisher   = $imagePublisher
+                ImageOffer       = $imageOffer
+                ImageSku         = $imageSku
+                ImageVersion     = $imageVersion
+                ImageId          = $imageId
             }
         }
     }
 }
 
-# 3. Add Grand Total Row
-$FullReport += [PSCustomObject]@{
-    Subscription      = "--- GRAND TOTAL ---"
-    Workspace         = ""
-    HostPool          = ""
-    HostPoolType      = ""
-    Entitlements      = ""
-    Location          = ""
-    "VNet Subnet"     = ""
-    "Total Hosts"     = $TotalHosts
-    "Assigned VMs"    = $TotalAssigned
-    "Empty Assignment"= $TotalEmpty
-}
+# ===========================
+# EXPORT TO CSV
+# ===========================
+$csvPath = "C:\Temp\AVD_SessionHosts_ImageReport.csv"
 
-# 4. Export and Open
-$FullReport | Export-Csv -Path $ExportPath -NoTypeInformation
-Write-Host "`nReport saved to Desktop: $ExportPath" -ForegroundColor Green
-Invoke-Item $ExportPath
+if ($allSessionHosts) {
+    $allSessionHosts | Export-Csv -Path $csvPath -NoTypeInformation -Force
+    $allSessionHosts | Format-Table SubscriptionName, HostPoolName, VMName, ImageType, ImagePublisher, ImageOffer, ImageSku, ImageVersion -AutoSize
+    Write-Host "Success! Report exported to $csvPath" -ForegroundColor Green
+} else {
+    Write-Host "No session hosts found across any subscription." -ForegroundColor Yellow
+}
