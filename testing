@@ -1,6 +1,7 @@
 <#
 AVD Session Host Details with VM Image Info (Multi-Subscription) - READ-ONLY
 Bulk fetches VMs per subscription for speed - estimated 10-20 mins for 24,000 VMs
+Fix: Uses $sh.ResourceId.Split('/')[-1] for clean VM name (no domain suffix)
 Exports: C:\Temp\AVD_SessionHost_Details.csv
 #>
 
@@ -117,8 +118,6 @@ function Get-ImageDetailsFromRef {
 
 function Get-VMPowerState {
     param([Parameter(Mandatory=$true)]$VM)
-
-    # -Status populates Statuses array with ProvisioningState + PowerState
     try {
         $powerStatus = $VM.Statuses | Where-Object { $_.Code -like "PowerState/*" }
         if ($powerStatus) {
@@ -188,8 +187,7 @@ foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
 
     # ----------------------------------------------------------
     # BULK FETCH all VMs with -Status flag
-    # -Status adds PowerState and cuts payload size ~30%
-    # Key = vmname (lowercase) for fast hashtable lookup
+    # Key = vmname (lowercase) from ResourceId - no domain suffix
     # ----------------------------------------------------------
     Write-Host "  Bulk fetching all VMs (with power state)..." -ForegroundColor Gray
     $allVMsInSub = @{}
@@ -252,8 +250,11 @@ foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
         Write-Host "    $($hp.Name) -> $($sessionHosts.Count) host(s)" -ForegroundColor Gray
 
         foreach ($sh in $sessionHosts) {
-            $vmName = ($sh.Name -split "/")[-1]
-            $vmRg   = if ($sh.ResourceId) { $sh.ResourceId.Split('/')[4] } else { $rgName }
+
+            # KEY FIX: Use ResourceId for clean VM name (no domain suffix)
+            # ResourceId format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{vmname}
+            $vmName = $sh.ResourceId.Split('/')[-1]        # clean name e.g. "CAVWda58"
+            $vmRg   = $sh.ResourceId.Split('/')[4]         # resource group
 
             # Image + power state lookup from bulk cache (no API call per VM)
             $imageType      = $null
@@ -303,10 +304,11 @@ foreach ($sub in ($resolvedSubs | Sort-Object Name)) {
                 ResourceGroup    = $rgName
                 HostPoolName     = $hp.Name
                 HostPoolType     = $hp.HostPoolType
-                SessionHostName  = $vmName
+                SessionHostName  = $sh.Name.Split('/')[-1]  # full name with domain e.g. CAVWda58.domain.com
+                VMName           = $vmName                   # clean name e.g. CAVWda58
                 VMResourceGroup  = $vmRg
                 Status           = $sh.Status
-                PowerState       = $powerState       # bonus column from -Status flag
+                PowerState       = $powerState
                 AllowNewSession  = $sh.AllowNewSession
                 UpdateState      = $sh.UpdateState
                 AssignedUser     = $assigned
@@ -350,7 +352,7 @@ if ($allDetails.Count -gt 0) {
     $folder = Split-Path $DetailsCsvPath -Parent
     if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 
-    $allDetails | Sort-Object SubscriptionName, HostPoolName, SessionHostName |
+    $allDetails | Sort-Object SubscriptionName, HostPoolName, VMName |
         Export-Csv -Path $DetailsCsvPath -NoTypeInformation -Encoding UTF8 -Force
 
     Write-Host "`nDetails CSV exported: $DetailsCsvPath" -ForegroundColor Green
