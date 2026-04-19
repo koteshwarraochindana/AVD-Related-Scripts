@@ -1,77 +1,100 @@
-# =========================================================
-#      Install EXE Directly from File Share (No Mapping)
-# =========================================================
+# 1. Start Connection
+Connect-AzAccount -WarningAction SilentlyContinue
 
-# 👉 CHANGE THIS — UNC path to the installer file
-$InstallerPath = "\\smb.waunas23f.hscsint.net\shared data\VTT Team\Applications\npp.exe"
+$ExportPath = "$home\Desktop\AVD-04.csv"
+$FullReport = @()
+$TotalHosts = 0; $TotalAssigned = 0; $TotalEmpty = 0
 
-# 👉 CHANGE THIS — Silent install switch for your app
-$SilentArgs = "/S"
+# 2. Global Scan across all Subscriptions
+$Subs = Get-AzSubscription
+foreach ($Sub in $Subs) {
+    Write-Host "Scanning Subscription: $($Sub.Name)" -ForegroundColor Cyan
+    $Context = Set-AzContext -SubscriptionId $Sub.Id -Force -ErrorAction SilentlyContinue
+    if (-not $Context) { continue }
+    
+    $Workspaces = Get-AzWvdWorkspace -ErrorAction SilentlyContinue
+    foreach ($WS in $Workspaces) {
+        $WSRG = ($WS.Id -split '/')[4]
+        
+        $AppGroups = Get-AzWvdApplicationGroup -ResourceGroupName $WSRG -ErrorAction SilentlyContinue | Where-Object { $_.WorkspaceArmPath -eq $WS.Id }
+        
+        foreach ($AG in $AppGroups) {
+            $PoolName = ($AG.HostPoolArmPath -split '/')[-1]
+            $PoolRG = ($AG.Id -split '/')[4]
+            
+            $Pool = Get-AzWvdHostPool -ResourceGroupName $PoolRG -Name $PoolName -ErrorAction SilentlyContinue
+            if (-not $Pool) { continue }
 
-# ------------------- 🔐 OPTIONAL CREDENTIALS -------------------
-# Only needed if the VM computer account does NOT have access
-$UseCredentials = $true   # Change to $false if not needed
+            # --- TARGETED FILTER: Only AD Groups assigned the User Role ---
+            $Assignments = Get-AzRoleAssignment -Scope $AG.Id -ErrorAction SilentlyContinue | Where-Object { 
+                $_.ObjectType -eq "Group" -and 
+                $_.RoleDefinitionName -eq "Desktop Virtualization User"
+            }
+            
+            $Entitlements = ($Assignments.DisplayName | Sort-Object -Unique | Where-Object { $_ }) -join "; "
+            if ([string]::IsNullOrWhiteSpace($Entitlements)) { $Entitlements = "No Groups Assigned" }
 
-# 👉 CHANGE if credentials are required
-$Username = "DOMAIN\svc_account"
-$Password = "P@ssw0rd!"
+            $SessionHosts = Get-AzWvdSessionHost -ResourceGroupName $PoolRG -HostPoolName $Pool.Name -ErrorAction SilentlyContinue
+            
+            $CountTotal = ($SessionHosts | Measure-Object).Count
+            $CountAssigned = ($SessionHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_.AssignedUser) } | Measure-Object).Count
+            $CountEmpty = $CountTotal - $CountAssigned
+            $TotalHosts += $CountTotal; $TotalAssigned += $CountAssigned; $TotalEmpty += $CountEmpty
 
-Write-Host "===== Starting Application Installation ====="
+            $Location = $Pool.Location
+            $NetInfo = "No VMs Found"
+            
+            if ($CountTotal -gt 0) {
+                $FirstSH = $SessionHosts | Select-Object -First 1
+                if ($FirstSH.ResourceId) {
+                    $VMRG = ($FirstSH.ResourceId -split '/')[4]
+                    $VMName = ($FirstSH.ResourceId -split '/')[-1]
+                    
+                    $VM = Get-AzVM -ResourceGroupName $VMRG -Name $VMName -ErrorAction SilentlyContinue
+                    if ($VM) {
+                        $Location = $VM.Location
+                        $NIC = Get-AzNetworkInterface -ResourceId $VM.NetworkProfile.NetworkInterfaces.Id -ErrorAction SilentlyContinue
+                        if ($NIC) {
+                            $SubnetId = $NIC.IpConfigurations.Subnet.Id
+                            $SubnetName = ($SubnetId -split '/')[-1]
+                            $VNetName = ($SubnetId -split '/')[-3]
+                            $NetInfo = "$VNetName / $SubnetName"
+                        }
+                    }
+                }
+            }
 
-# Check if UNC path exists before proceeding
-if (-Not (Test-Path -LiteralPath $InstallerPath)) {
-    Write-Host "Installer file not found at $InstallerPath"
-    return
+            $FullReport += [PSCustomObject]@{
+                Subscription      = $Sub.Name
+                Workspace         = $WS.Name
+                HostPool          = $Pool.Name
+                HostPoolType      = $Pool.HostPoolType
+                Entitlements      = $Entitlements
+                Location          = $Location
+                "VNet Subnet"     = $NetInfo
+                "Total Hosts"     = $CountTotal
+                "Assigned VMs"    = $CountAssigned
+                "Empty Assignment"= $CountEmpty
+            }
+        }
+    }
 }
 
-# If credentials are required (using mapped drive), connect to file share with credentials
-if ($UseCredentials) {
-    Write-Host "Connecting to file share with credentials..."
-
-    # Convert password to SecureString and create PSCredential object
-    $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-    $Cred = New-Object System.Management.Automation.PSCredential ($Username, $SecurePassword)
-
-    # Attempt to create a new PSDrive
-    try {
-        New-PSDrive -Name "TempShare" -PSProvider FileSystem -Root (Split-Path $InstallerPath) -Credential $Cred -ErrorAction Stop
-    } catch {
-        Write-Host "Error connecting to the network share: $_"
-        return
-    }
-
-    # Map installer path
-    $MappedInstaller = "TempShare:\" + (Split-Path $InstallerPath -Leaf)
-
-    # Check if mapped installer path exists
-    if (-Not (Test-Path -LiteralPath $MappedInstaller)) {
-        Write-Host "Mapped installer file not found at $MappedInstaller"
-        return
-    }
-
-    Write-Host "Running installer from mapped UNC path..."
-
-    # Run installer using mapped path
-    try {
-        Start-Process -FilePath $MappedInstaller -ArgumentList $SilentArgs -Wait -NoNewWindow
-    } catch {
-        Write-Host "Error running the installer from mapped path: $_"
-        return
-    }
-
-    # Clean up the mapped drive after installation
-    Remove-PSDrive -Name "TempShare" -Force
-
-} else {
-    Write-Host "Running installer directly from UNC path..."
-
-    # Run installer directly from UNC path
-    try {
-        Start-Process -FilePath $InstallerPath -ArgumentList $SilentArgs -Wait -NoNewWindow
-    } catch {
-        Write-Host "Error running the installer from UNC path: $_"
-        return
-    }
+# 3. Add Grand Total Row
+$FullReport += [PSCustomObject]@{
+    Subscription      = "--- GRAND TOTAL ---"
+    Workspace         = ""
+    HostPool          = ""
+    HostPoolType      = ""
+    Entitlements      = ""
+    Location          = ""
+    "VNet Subnet"     = ""
+    "Total Hosts"     = $TotalHosts
+    "Assigned VMs"    = $TotalAssigned
+    "Empty Assignment"= $TotalEmpty
 }
 
-Write-Host "===== Installation Completed ====="
+# 4. Export and Open
+$FullReport | Export-Csv -Path $ExportPath -NoTypeInformation
+Write-Host "`nReport saved to Desktop: $ExportPath" -ForegroundColor Green
+Invoke-Item $ExportPath
