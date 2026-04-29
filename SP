@@ -1,107 +1,58 @@
-# ===========================
-# MODULES & AUTH
-# ===========================
-if (-not (Get-Module -ListAvailable -Name "Az.DesktopVirtualization")) {
-    Install-Module -Name "Az.DesktopVirtualization" -Scope CurrentUser -Force
+# --- CONFIGURATION AREA ---
+$subscriptionName = "Your Subscription Name or ID"  # Enter your Sub Name or ID
+$rgName           = "YourResourceGroupName"         # Enter your Resource Group Name
+$csvPath          = "C:\path\to\your\hostnames.csv" # Path to your input CSV
+$outputPath       = "C:\path\to\VM_Report.csv"      # Path for the results CSV
+# --------------------------
+
+# 1. AUTHENTICATION: Check if connected; if not, prompt for login
+$context = Get-AzContext
+if (!$context) {
+    Write-Host "No active Azure session. Please log in..." -ForegroundColor Yellow
+    Connect-AzAccount
 }
-Import-Module "Az.DesktopVirtualization"
 
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-try {
-    $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
-} catch {
-    $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue
+# 2. CONTEXT: Set the specific subscription
+Write-Host "Setting context to: $subscriptionName" -ForegroundColor Cyan
+Select-AzSubscription -Subscription $subscriptionName | Out-Null
+
+# 3. IMPORT: Load VM names from CSV (Header must be 'VMName')
+if (!(Test-Path $csvPath)) {
+    Write-Error "CSV file not found at $csvPath. Please check the path."
+    return
 }
+$vmsToProcess = Import-Csv -Path $csvPath
 
-# ===========================
-# DATA COLLECTION
-# ===========================
-Write-Host "Fetching session host + VM image details..." -ForegroundColor Gray
-
-$hostPools = Get-AzWvdHostPool
-
-$allSessionHosts = foreach ($hp in $hostPools) {
-    $hosts = Get-AzWvdSessionHost -HostPoolName $hp.Name -ResourceGroupName $hp.ResourceGroupName
-
-    foreach ($sh in $hosts) {
-        $vmName         = $sh.ResourceId.Split('/')[-1]
-        $vmRg           = $sh.ResourceId.Split('/')[4]
-        $subscriptionId = $hp.Id.Split('/')[2]
-
-        $imagePublisher = $null
-        $imageOffer     = $null
-        $imageSku       = $null
-        $imageVersion   = $null
-        $imageId        = $null
-        $imageType      = $null
-
-        try {
-            $vm     = Get-AzVM -ResourceGroupName $vmRg -Name $vmName -ErrorAction Stop
-            $imgRef = $vm.StorageProfile.ImageReference
-
-            if ($imgRef.Id) {
-                # Custom image or Shared Image Gallery (SIG)
-                $imageType = "Custom/SIG"
-                $imageId   = $imgRef.Id
-
-                if ($imgRef.Id -match '/versions/([^/]+)$') {
-                    $imageVersion = $matches[1]
-                }
-                if ($imgRef.Id -match '/images/([^/]+)/versions') {
-                    $imageOffer = $matches[1]
-                }
-                if ($imgRef.Id -match '/galleries/([^/]+)/images') {
-                    $imagePublisher = $matches[1]
-                }
-
-            } else {
-                # Marketplace image
-                $imageType      = "Marketplace"
-                $imagePublisher = $imgRef.Publisher
-                $imageOffer     = $imgRef.Offer
-                $imageSku       = $imgRef.Sku
-
-                # PS 5.1 compatible null coalescing
-                if ($imgRef.ExactVersion) {
-                    $imageVersion = $imgRef.ExactVersion
-                } else {
-                    $imageVersion = $imgRef.Version
-                }
-            }
-
-        } catch {
-            $imageType = "Error: $_"
-        }
-
+# 4. PROCESSING: Loop through each VM
+$results = foreach ($item in $vmsToProcess) {
+    $currentVM = $item.VMName
+    Write-Host "Processing: $currentVM..." -ForegroundColor White
+    
+    try {
+        # Get the VM object
+        $vm = Get-AzVM -ResourceGroupName $rgName -Name $currentVM -ErrorAction Stop
+        
+        # Get the OS Disk metadata (the creation date source)
+        $osDiskName = $vm.StorageProfile.OsDisk.Name
+        $disk = Get-AzDisk -ResourceGroupName $rgName -DiskName $osDiskName
+        
         [PSCustomObject]@{
-            HostPoolName     = $hp.Name
-            SessionHostName  = $sh.Name.Split('/')[-1]
-            VMName           = $vmName
-            VMResourceGroup  = $vmRg
-            Status           = $sh.Status
-            AssignedUser     = $sh.AssignedUser
-            LastHeartbeat    = $sh.LastHeartBeat
-            UpdateState      = $sh.UpdateState
-            SubscriptionId   = $subscriptionId
-            ImageType        = $imageType
-            ImagePublisher   = $imagePublisher
-            ImageOffer       = $imageOffer
-            ImageSku         = $imageSku
-            ImageVersion     = $imageVersion
-            ImageId          = $imageId
+            VMName        = $currentVM
+            ResourceGroup = $rgName
+            CreationDate  = $disk.TimeCreated
+            Status        = "Success"
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            VMName        = $currentVM
+            ResourceGroup = $rgName
+            CreationDate  = "N/A"
+            Status        = "Error: $($_.Exception.Message)"
         }
     }
 }
 
-# ===========================
-# EXPORT TO CSV
-# ===========================
-$csvPath = "C:\Temp\AVD_SessionHosts_ImageReport.csv"
-
-if ($allSessionHosts) {
-    $allSessionHosts | Export-Csv -Path $csvPath -NoTypeInformation -Force
-    $allSessionHosts | Format-Table HostPoolName, VMName, ImageType, ImagePublisher, ImageOffer, ImageSku, ImageVersion -AutoSize
-    Write-Host "Success! Report exported to $csvPath" -ForegroundColor Green
-} else {
-    Write-Host "No session hosts found." -ForegroundColor Yellow
-}
+# 5. EXPORT: Save to CSV
+$results | Export-Csv -Path $outputPath -NoTypeInformation
+Write-Host "`nFinished! Report generated at: $outputPath" -ForegroundColor Green
