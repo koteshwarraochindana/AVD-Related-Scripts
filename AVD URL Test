@@ -1,37 +1,22 @@
-# List of critical AVD service URLs
-$avdUrls = @(
-    "https://rdgateway.wvd.microsoft.com",
-    "https://rdbroker.wvd.microsoft.com",
-    "https://wvd.microsoft.com",
-    "https://servicebus.windows.net",
-    "https://wvdportalstorageblob.blob.core.windows.net"
-)
+$OutputFile = "$env:USERPROFILE\Desktop\ControlPanel_Programs.csv"
 
-Write-Host "Testing AVD URL Reachability..." -ForegroundColor Cyan
+$Programs = Get-ItemProperty `
+    HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, `
+    HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* `
+    -ErrorAction SilentlyContinue |
 
-foreach ($url in $avdUrls) {
-    try {
-        $result = Test-NetConnection -ComputerName ($url -replace 'https://','') -Port 443 -WarningAction SilentlyContinue
-        if ($result.TcpTestSucceeded) {
-            Write-Host "$url : Reachable" -ForegroundColor Green
-        } else {
-            Write-Host "$url : Blocked/Unreachable" -ForegroundColor Red
-        }
-    } catch {
-        Write-Host "$url : Error testing" -ForegroundColor Yellow
-    }
-}
+Where-Object {
+    $_.DisplayName -and $_.SystemComponent -ne 1
+} |
 
-----------------------------
+Select-Object `
+    DisplayName,
+    Publisher,
+    DisplayVersion,
+    InstallDate |
 
-$urls = @(
-"rdweb.wvd.microsoft.com",
-"rdbroker.wvd.microsoft.com",
-"rdgateway.wvd.microsoft.com",
-"login.microsoftonline.com",
-"servicebus.windows.net"
-)
+Sort-Object DisplayName -Unique
 
-foreach ($url in $urls) {
-    Test-NetConnection $url -Port 443
-}
+$Programs | Export-Csv $OutputFile -NoTypeInformation
+
+Write-Host "Export completed: $OutputFile"
