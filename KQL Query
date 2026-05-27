@@ -147,16 +147,15 @@ while ($true) {
         Write-Host "$($url) : $($r.TcpTestSucceeded)" -ForegroundColor Yellow
     }
 
-------------------------------------------
-
-WVDConnections 
-
-| where State == "Connected"
-| summarize LastLogin = max(TimeGenerated) by UserName, SessionHostName
-| order by LastLogin desc
-
     Start-Sleep 5
 }
+-----------------------------------------------------------------------
+
+WVDConnections 
+| where State in ("Connected", "Completed")
+| extend TimeCST = datetime_utc_to_local(TimeGenerated, 'America/Chicago')
+| summarize LastLoginCST = max(TimeCST) by UserName, SessionHostPoolName, State
+| order by LastLoginCST desc
 
 https://github.com/The-Virtual-Desktop-Team/Virtual-Desktop-Optimization-Tool
 
