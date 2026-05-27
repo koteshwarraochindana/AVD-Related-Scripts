@@ -146,6 +146,15 @@ while ($true) {
         $r = Test-NetConnection $url -Port 443
         Write-Host "$($url) : $($r.TcpTestSucceeded)" -ForegroundColor Yellow
     }
+
+------------------------------------------
+
+WVDConnections 
+
+| where State == "Connected"
+| summarize LastLogin = max(TimeGenerated) by UserName, SessionHostName
+| order by LastLogin desc
+
     Start-Sleep 5
 }
 
