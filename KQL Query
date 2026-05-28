@@ -159,3 +159,14 @@ WVDConnections
 
 https://github.com/The-Virtual-Desktop-Team/Virtual-Desktop-Optimization-Tool
 
+----------------------------------------
+
+WVDConnections
+| where State == "Connected"
+| where ConnectionType == "Initial"
+| extend TimeLocal = datetime_utc_to_local(TimeGenerated, 'America/Chicago')
+| summarize LastLogin = max(TimeLocal) 
+    by UserName, SessionHostPoolName
+| order by LastLogin desc
+
+
