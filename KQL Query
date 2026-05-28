@@ -1,177 +1,74 @@
-let daysAgo = 31d;
+# ============================================
+# AVD Last User Login Report
+# ============================================
 
-// Connection summary
-let connectionSummary = 
-    WVDConnections
-    | where TimeGenerated > ago(daysAgo)
-    | extend ConnectionType = case(
-        TransportType == "Reverse Connect" or TransportType == "TCP", "TCP",
-        TransportType == "Shortpath" or TransportType == "UDP", "UDP",
-        TransportType == "RDP", "RDP",
-        isnull(TransportType) or TransportType == "", "Unknown",
-        "Other"
-    )
-    | summarize NumberOfConnections = count(), 
-                ConnectionTypes = make_set(ConnectionType), 
-                SessionHosts = make_set(SessionHostName) 
-        by UserName, ClientIPAddress
-    | extend ip_location = parse_json(ip_location_from_ip_address(ClientIPAddress))
-    | extend Country = tostring(ip_location.country), 
-             City = tostring(ip_location.city);
+# Install module if needed
+# Install-Module Az.DesktopVirtualization -Scope CurrentUser -Force
 
-// Error summary
-let errorSummary = 
-    WVDErrors
-    | where TimeGenerated > ago(daysAgo)
-    | summarize ErrorCount = count(), 
-                ErrorCodes = make_set(CodeSymbolic) 
-        by UserName;
+# Connect to Azure
+Connect-AzAccount
 
-// Duration summary
-let durationSummary = 
-    WVDConnections
-    | where TimeGenerated > ago(daysAgo)
-    | where State == "Connected"
-    | project CorrelationId, UserName, ConnectionType, StartTime = TimeGenerated
-    | join kind=leftouter (
-        WVDConnections
-        | where State == "Completed"
-        | project EndTime = TimeGenerated, CorrelationId
-    ) on CorrelationId
-    | extend SessionDuration = EndTime - StartTime
-    | summarize TotalDuration = sum(SessionDuration) by UserName, ConnectionType
-    | extend DurationHours = round(TotalDuration / 1h, 2), 
-             DurationDays = round(DurationHours / 24, 2);
+# Set subscription
+$SubscriptionId = "YOUR-SUBSCRIPTION-ID"
+Set-AzContext -SubscriptionId $SubscriptionId
 
-// Final query that starts after all let blocks
-connectionSummary
-| join kind=leftouter errorSummary on UserName
-| join kind=leftouter durationSummary on UserName
-| project UserName, 
-          SessionHosts, 
-          NumberOfConnections, 
-          ClientIPAddress, 
-          ConnectionTypes, 
-          Country, 
-          State, 
-          City, 
-          ErrorCount, 
-          ErrorCodes, 
-          DurationHours, 
-          DurationDays
-| order by NumberOfConnections desc
+# Variables
+$ResourceGroup = "YOUR-RESOURCE-GROUP"
+$HostPoolName  = "YOUR-HOSTPOOL-NAME"
 
----------------------------------------------
+# Output CSV
+$OutputFile = "C:\Temp\AVD-LastLoginReport.csv"
 
-let connectionSummary =
-    WVDConnections
-    | where TimeGenerated > ago(31d)
-    | summarize NumberOfConnections = count() by UserName, ClientIPAddress;
+Write-Host "Collecting AVD user sessions..." -ForegroundColor Cyan
 
-connectionSummary
-| take 5
----------------------------------------
+# Get all sessions
+$Sessions = Get-AzWvdUserSession `
+    -ResourceGroupName $ResourceGroup `
+    -HostPoolName $HostPoolName
 
-let disk_free_space_percent =
-    Perf
-    | where TimeGenerated > ago(5m)
-    | where Computer contains "avd"
-    | where ObjectName == "LogicalDisk"
-    | where CounterName == "% Free Space"
-    | where InstanceName contains "C:"
-    | summarize Disc_Space_Percent = (100 - avg(CounterValue)) by Computer, InstanceName
-    | where strlen(InstanceName) == 2 and InstanceName contains ":"
-    | where Disc_Space_Percent > 90;
+# Keep latest session per user
+$LatestSessions = $Sessions |
+    Group-Object UserPrincipalName |
+    ForEach-Object {
 
-let disk_free_MB =
-    Perf
-    | where TimeGenerated > ago(5m)
-    | where ObjectName == "LogicalDisk"
-    | where CounterName == "Free Megabytes"
-    | summarize (TimeGenerated, Free_MB) = arg_max(TimeGenerated, CounterValue) by Computer, InstanceName
-    | where strlen(InstanceName) == 2 and InstanceName contains ":";
-
-disk_free_space_percent
-| join kind=inner (disk_free_MB) on Computer, InstanceName
-| project Computer, InstanceName, Disc_Space_Percent, Free_MB
-| order by Disc_Space_Percent desc
-
----------------------------------------------------------------
-
-// 1. Percentage of free space (% Free Space)
-let disk_free_space_percent =
-    Perf
-    | where TimeGenerated > ago(5m)
-    | where Computer startswith "pavw4"
-    | where ObjectName == "LogicalDisk"           // update if your workspace uses: "Logical Disk"
-    | where CounterName == "% Free Space"         // update if workspace uses: "Free Space %"
-    | where InstanceName contains "C"             // update if workspace uses "C:"
-    | summarize Disc_Space_Percent = (100 - avg(CounterValue))
-        by Computer, InstanceName
-    | where Disc_Space_Percent > 90;
-
-// 2. Free Megabytes (to show actual GB remaining)
-let disk_free_MB =
-    Perf
-    | where TimeGenerated > ago(5m)
-    | where Computer startswith "pavw4"
-    | where ObjectName == "LogicalDisk"           
-    | where CounterName == "Free Megabytes"
-    | summarize (TimeGenerated, Free_MB) = arg_max(TimeGenerated, CounterValue)
-        by Computer, InstanceName;
-
-// 3. Join both datasets
-disk_free_space_percent
-| join kind=inner disk_free_MB on Computer, InstanceName
-| project Computer,
-          Drive = InstanceName,
-          Disc_Space_Percent,
-          Free_MB,
-          Free_GB = round(Free_MB / 1024.0, 2)
-| order by Disc_Space_Percent desc
-
-----------------------------------------------------------------
-
-$urls = @(
-"global.wvd.microsoft.com",
-"rdweb.wvd.microsoft.com",
-"ncus.rdbroker.wvd.microsoft.com",
-"ncus.gcs.wvd.microsoft.com",
-"scus.rdbroker.wvd.microsoft.com",
-"scus.gcs.wvd.microsoft.com"
-)
-
-while ($true) {
-    foreach ($url in $urls) {
-        $r = Test-NetConnection $url -Port 443
-        Write-Host "$($url) : $($r.TcpTestSucceeded)" -ForegroundColor Yellow
+        $_.Group |
+        Sort-Object CreateTime -Descending |
+        Select-Object -First 1
     }
 
-    Start-Sleep 5
+# Prepare export
+$Export = foreach ($Session in $LatestSessions) {
+
+    # Extract session host name
+    $SessionHost = ($Session.Name -split "/")[1]
+
+    [PSCustomObject]@{
+
+        UserName = $Session.UserPrincipalName
+
+        HostPool = $HostPoolName
+
+        SessionHost = $SessionHost
+
+        SessionState = $Session.SessionState
+
+        LastLoginUTC = $Session.CreateTime
+
+        LastLoginLocal = (
+            $Session.CreateTime.ToLocalTime()
+        )
+    }
 }
------------------------------------------------------------------------
 
-WVDConnections 
-| where State in ("Connected", "Completed")
-| extend TimeCST = datetime_utc_to_local(TimeGenerated, 'America/Chicago')
-| summarize LastLoginCST = max(TimeCST) by UserName, SessionHostPoolName, State
-| order by LastLoginCST desc
+# Export CSV
+$Export |
+    Sort-Object LastLoginUTC -Descending |
+    Export-Csv `
+        -Path $OutputFile `
+        -NoTypeInformation `
+        -Encoding UTF8
 
-https://github.com/The-Virtual-Desktop-Team/Virtual-Desktop-Optimization-Tool
-
-----------------------------------------
-
-WVDConnections
-| where State == "Connected"
-| where ConnectionType == "Initial"
-| extend TimeLocal = datetime_utc_to_local(TimeGenerated, 'America/Chicago')
-| summarize LastLogin = max(TimeLocal) 
-    by UserName, SessionHostPoolName
-| order by LastLogin desc
---------------------------------------------
-WVDConnections
-| where State == "Connected"
-| where ConnectionType == "Initial"
-| summarize LastLogin=max(TimeGenerated) by UserName
-
-
+Write-Host ""
+Write-Host "Export completed successfully!" -ForegroundColor Green
+Write-Host "CSV saved to:" -ForegroundColor Yellow
+Write-Host $OutputFile
