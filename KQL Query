@@ -168,5 +168,20 @@ WVDConnections
 | summarize LastLogin = max(TimeLocal) 
     by UserName, SessionHostPoolName
 | order by LastLogin desc
+--------------------------------------------
+WVDConnections
+| where State == "Connected"
+| where isempty(ConnectionType) or ConnectionType == "Initial"
+| summarize LastLoginUTC = max(TimeGenerated)
+    by UserName, SessionHostPoolName
+| extend LastLoginLocal = datetime_utc_to_local(
+    LastLoginUTC,
+    'America/Chicago'
+)
+| project
+    UserName,
+    HostPool = SessionHostPoolName,
+    LastLoginLocal
+| order by LastLoginLocal desc
 
 
