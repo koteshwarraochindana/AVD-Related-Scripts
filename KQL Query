@@ -1,11 +1,9 @@
-SigninLogs
-
+union SigninLogs, AADNonInteractiveUserSignInLogs
 | where TimeGenerated > ago(30d)
 | where isnotempty(DeviceDetail.trustType)
 | extend DeviceId = tostring(DeviceDetail.deviceId),
          DeviceName = tostring(DeviceDetail.displayName),
          OS = tostring(DeviceDetail.operatingSystem),
          JoinType = tostring(DeviceDetail.trustType)
-
 | summarize SuccessfulSignIns = count() by DeviceId, DeviceName, OS, JoinType
 | order by DeviceName asc
