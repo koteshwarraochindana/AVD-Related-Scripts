@@ -1,74 +1,11 @@
-# ============================================
-# AVD Last User Login Report
-# ============================================
+SigninLogs
 
-# Install module if needed
-# Install-Module Az.DesktopVirtualization -Scope CurrentUser -Force
+| where TimeGenerated > ago(30d)
+| where isnotempty(DeviceDetail.trustType)
+| extend DeviceId = tostring(DeviceDetail.deviceId),
+         DeviceName = tostring(DeviceDetail.displayName),
+         OS = tostring(DeviceDetail.operatingSystem),
+         JoinType = tostring(DeviceDetail.trustType)
 
-# Connect to Azure
-Connect-AzAccount
-
-# Set subscription
-$SubscriptionId = "YOUR-SUBSCRIPTION-ID"
-Set-AzContext -SubscriptionId $SubscriptionId
-
-# Variables
-$ResourceGroup = "YOUR-RESOURCE-GROUP"
-$HostPoolName  = "YOUR-HOSTPOOL-NAME"
-
-# Output CSV
-$OutputFile = "C:\Temp\AVD-LastLoginReport.csv"
-
-Write-Host "Collecting AVD user sessions..." -ForegroundColor Cyan
-
-# Get all sessions
-$Sessions = Get-AzWvdUserSession `
-    -ResourceGroupName $ResourceGroup `
-    -HostPoolName $HostPoolName
-
-# Keep latest session per user
-$LatestSessions = $Sessions |
-    Group-Object UserPrincipalName |
-    ForEach-Object {
-
-        $_.Group |
-        Sort-Object CreateTime -Descending |
-        Select-Object -First 1
-    }
-
-# Prepare export
-$Export = foreach ($Session in $LatestSessions) {
-
-    # Extract session host name
-    $SessionHost = ($Session.Name -split "/")[1]
-
-    [PSCustomObject]@{
-
-        UserName = $Session.UserPrincipalName
-
-        HostPool = $HostPoolName
-
-        SessionHost = $SessionHost
-
-        SessionState = $Session.SessionState
-
-        LastLoginUTC = $Session.CreateTime
-
-        LastLoginLocal = (
-            $Session.CreateTime.ToLocalTime()
-        )
-    }
-}
-
-# Export CSV
-$Export |
-    Sort-Object LastLoginUTC -Descending |
-    Export-Csv `
-        -Path $OutputFile `
-        -NoTypeInformation `
-        -Encoding UTF8
-
-Write-Host ""
-Write-Host "Export completed successfully!" -ForegroundColor Green
-Write-Host "CSV saved to:" -ForegroundColor Yellow
-Write-Host $OutputFile
+| summarize SuccessfulSignIns = count() by DeviceId, DeviceName, OS, JoinType
+| order by DeviceName asc
