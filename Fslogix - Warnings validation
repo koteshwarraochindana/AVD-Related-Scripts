@@ -1,0 +1,79 @@
+# AVD FSLogix Only Errors & Warnings Audit Script
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host "   AVD FSLogix Audit: Warnings & Errors Only" -ForegroundColor Cyan
+Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Define Best Practice Recommendations
+$Recommendations = @{
+    "Enabled"                   = @{ Value = 1; Desc = "Enables FSLogix Profiles" }
+    "VHDLocations"              = @{ Value = "Configured"; Desc = "Storage Account network path (Azure Files)" }
+    "DeleteLocalProfileWhenVHDShouldApply" = @{ Value = 1; Desc = "Prevents temporary profile conflicts" }
+    "CleanupInvalidSessions"    = @{ Value = 1; Desc = "Cleans up stuck user sessions automatically" }
+    "RoamSearch"                = @{ Value = 1; Desc = "Ensures Outlook/Windows Search roams correctly" }
+    "KeepAliveInterval"         = @{ Value = 1; Desc = "Optimizes SMB network connection stability" }
+}
+
+$IssueCount = 0
+
+# 1. Check FSLogix Registry Settings
+$FSLogixPath = "HKLM:\SOFTWARE\FSLogix\Profiles"
+
+if (Test-Path $FSLogixPath) {
+    $CurrentSettings = Get-ItemProperty -Path $FSLogixPath -ErrorAction SilentlyContinue
+    
+    foreach ($Key in $Recommendations.Keys) {
+        $CurrentValue = $CurrentSettings.$Key
+        $TargetValue = $Recommendations[$Key].Value
+        $Description = $Recommendations[$Key].Desc
+        
+        if ($Key -eq "VHDLocations") {
+            if (-not $CurrentValue) {
+                Write-Host "[FAIL] VHDLocations is NOT configured! (Missing Azure Files path)" -ForegroundColor Red
+                $IssueCount++
+            }
+            continue
+        }
+
+        if ($CurrentValue -ne $TargetValue) {
+            $DisplayValue = if ($CurrentValue -eq $null) { "Not Configured" } else { $CurrentValue }
+            Write-Host "[WARN] FSLogix Key '$Key' is '$DisplayValue'." -ForegroundColor Yellow
+            Write-Host "       Recommendation: Set to $TargetValue ($Description)" -ForegroundColor DarkYellow
+            $IssueCount++
+        }
+    }
+} else {
+    Write-Host "[CRITICAL] FSLogix registry path not found. Is FSLogix installed on this host?" -ForegroundColor Red
+    $IssueCount++
+}
+
+# 2. Check Network/SMB Client KeepAlive (Crucial for Azure Files Error 53)
+$SMBPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
+if (Test-Path $SMBPath) {
+    $KeepAlive = (Get-ItemProperty -Path $SMBPath -ErrorAction SilentlyContinue).KeepAliveInterval
+    if ($KeepAlive -ne 1) {
+        $DisplayKeep = if ($KeepAlive -eq $null) { "Not Configured (Default)" } else { $KeepAlive }
+        Write-Host "[WARN] LanmanWorkstation 'KeepAliveInterval' is '$DisplayKeep'." -ForegroundColor Yellow
+        Write-Host "       Recommendation: Set to 1 (Prevents Azure Files path network timeouts)" -ForegroundColor DarkYellow
+        $IssueCount++
+    }
+}
+
+# 3. Check for Stuck/Orphaned Local Profiles
+$ProfileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+$StuckProfiles = Get-ChildItem -Path $ProfileListPath -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "*.bak" }
+
+if ($StuckProfiles) {
+    Write-Host "[FAIL] Found ($($StuckProfiles.Count)) orphaned .bak profiles in the registry!" -ForegroundColor Red
+    Write-Host "       This frequently causes 'Path not found' and temporary profile loops." -ForegroundColor DarkRed
+    $IssueCount++
+}
+
+Write-Host ""
+Write-Host "====================================================" -ForegroundColor Cyan
+if ($IssueCount -eq 0) {
+    Write-Host " Audit Complete: 0 issues found! Settings match best practices." -ForegroundColor Green
+} else {
+    Write-Host " Audit Complete: Found ($IssueCount) configuration discrepancies." -ForegroundColor Yellow
+}
+Write-Host "====================================================" -ForegroundColor Cyan
