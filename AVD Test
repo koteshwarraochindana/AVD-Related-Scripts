@@ -242,5 +242,15 @@ SigninLogs
 | summarize LastSeen = max(TimeGenerated), 
             Devices = make_set(DeviceName) by UserPrincipalName
 | order by LastSeen desc
+------------------------------------------------------------------
+
+WVDConnections
+| where TimeGenerated > ago(24h)
+| where State == "Connected"
+| extend Transport = case(UdpUse == 1, "UDP managed", UdpUse == 2, "UDP STUN", UdpUse == 4, "UDP TURN relay", "TCP fallback")
+| summarize Sessions = count() by Transport
+---------------------------------------------------
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV/Operational'; Id=135} | Select-Object -First 5 TimeCreated, Message
+-------------------------------------------------------------
 ---------------------------------------------------------------------
 
