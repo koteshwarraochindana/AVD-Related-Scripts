@@ -1,0 +1,85 @@
+#Un-Install
+
+# 1. Stop AVD-related services
+Write-Host "Stopping AVD Services..." -ForegroundColor Yellow
+$services = "RDAgentBootLoader", "RdAgent", "Remote Desktop Services Infrastructure Agent"
+foreach ($service in $services) {
+    if (Get-Service $service -ErrorAction SilentlyContinue) {
+        Stop-Service $service -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 2. Uninstall AVD Components via MSIExec
+Write-Host "Uninstalling AVD Agent and Bootloader..." -ForegroundColor Yellow
+$apps = Get-WmiObject -Class Win32_Product | Where-Object { 
+    $_.Name -like "*Remote Desktop Services Infrastructure Agent*" -or 
+    $_.Name -like "*Remote Desktop Agent Boot Loader*" -or
+    $_.Name -like "*Remote Desktop Services SxS Network Stack*"
+}
+
+foreach ($app in $apps) {
+    Write-Host "Removing: $($app.Name)"
+    msiexec.exe /x $($app.IdentifyingNumber) /qn /norestart
+}
+
+# 3. Clean up leftover Registry Keys
+Write-Host "Cleaning Registry..." -ForegroundColor Yellow
+$registryPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\RDInfraAgent",
+    "HKLM:\SOFTWARE\Microsoft\RDAgentBootLoader",
+    "HKLM:\SOFTWARE\Classes\Installer\Products\*" # Caution: Only if specific AVD GUIDs are known
+)
+
+foreach ($path in $registryPaths) {
+    if (Test-Path $path) {
+        Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 4. Clean up Installation Folders
+Write-Host "Deleting leftover files..." -ForegroundColor Yellow
+$folders = @("C:\Program Files\Microsoft RDInfra", "C:\ProgramData\Microsoft\RDInfra")
+foreach ($folder in $folders) {
+    if (Test-Path $folder) {
+        Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "Uninstall Complete. Please restart the VM before reinstalling the agents." -ForegroundColor Green
+------------------------------------------------------------------------------------------------------------------------------------
+
+#Install
+
+
+# --- CONFIGURATION ---
+$Token = "TOKEN_HERE"
+$SourceFolder = "\\dfw1mspif017\Public\Ally_AVD\Agents" 
+$LocalPath = "C:\Temp\AVDInstall"
+
+# File names from your discovery
+$SxSFile    = "SxSStack-1.0.2507.25770.msi"
+$AgentFile  = "Microsoft.RDInfra.RDAgent.Installer-x64-1.0.12684.400.msi"
+$LoaderFile = "Microsoft.RDInfra.RDAgentBootLoader.Installer-x64-1.0.11388.1600.msi"
+
+if (!(Test-Path $LocalPath)) { New-Item -ItemType Directory -Path $LocalPath -Force }
+
+# 1. COPY FROM SHARE
+Write-Host "Copying installers from $SourceFolder..." -ForegroundColor Cyan
+Copy-Item -Path "$SourceFolder\$SxSFile" -Destination $LocalPath -Force
+Copy-Item -Path "$SourceFolder\$AgentFile" -Destination $LocalPath -Force
+Copy-Item -Path "$SourceFolder\$LoaderFile" -Destination $LocalPath -Force
+
+# 2. INSTALL IN PRECISE ORDER
+Write-Host "Installing SxS Stack (Fixes Listener)..." -ForegroundColor Yellow
+Start-Process msiexec.exe -ArgumentList "/i `"$LocalPath\$SxSFile`" /qn /norestart" -Wait
+
+Write-Host "Installing Agent (Handles Registration)..." -ForegroundColor Yellow
+Start-Process msiexec.exe -ArgumentList "/i `"$LocalPath\$AgentFile`" /qn /norestart REGISTRATIONTOKEN=$Token" -Wait
+
+Write-Host "Installing Bootloader..." -ForegroundColor Yellow
+Start-Process msiexec.exe -ArgumentList "/i `"$LocalPath\$LoaderFile`" /qn /norestart" -Wait
+
+# 3. FINAL REBOOT
+Write-Host "INSTALL SUCCESSFUL. Final reboot to start the AVD stack..." -ForegroundColor Green
+Restart-Computer -Force
+------------------------------------------------------------------------------------------------------------------------------------------------
