@@ -1,256 +1,114 @@
-# ============================================================
-# AVD Workspace → HostPool → VM Assignment Report
-# Multi-Subscription Version
-# ============================================================
+# ==========================
+# Restart Azure VMs (CSV) - Parallel Execution (PowerShell 5)
+# ==========================
 
-# ----------------------------
-# LOGIN
-# ----------------------------
+$vmListFile = "C:\Temp\vm-list.csv"
+$maxJobs = 50
+$reportPath = "C:\Temp\vm-restart-report.csv"
+
+# Validate file
+if (-not (Test-Path $vmListFile)) {
+    throw "CSV file not found at $vmListFile"
+}
+
+# Import CSV
+$vmList = Import-Csv -Path $vmListFile
+
+# Connect to Azure
 Connect-AzAccount
 
-# ----------------------------
-# SUBSCRIPTIONS TO REPORT
-# ----------------------------
-$SubscriptionIds = @(
-    "a1b2c3d4-5678-90ab-cdef-111213141516",  # Subscription 1
-    "b2c3d4e5-6789-01bc-def2-222324252627"   # Subscription 2
-)
+# OPTIONAL
+# Select-AzSubscription -SubscriptionId "your-subscription-id"
 
-# ----------------------------
-# MAIN REPORT ARRAY
-# ----------------------------
-$finalReport = @()
+# Job script
+$scriptBlock = {
+    param($vmName, $rg)
 
-foreach ($SubscriptionId in $SubscriptionIds) {
+    try {
+        Import-Module Az.Compute -ErrorAction Stop
 
-    Write-Host "`nProcessing subscription: $SubscriptionId ..." -ForegroundColor Cyan
+        Restart-AzVM -Name $vmName -ResourceGroupName $rg -ErrorAction Stop
 
-    # Set the context to this subscription
-    Set-AzContext -SubscriptionId $SubscriptionId
-
-    # Safety check
-    if ((Get-AzContext).Subscription.Id -ne $SubscriptionId) {
-        Write-Warning "Failed to switch context to $SubscriptionId. Skipping..."
-        continue
+        [PSCustomObject]@{
+            VMName        = $vmName
+            ResourceGroup = $rg
+            Status        = "Success"
+            Message       = "Restarted successfully"
+        }
     }
-
-    # Get all Workspaces in this subscription
-    $workspaces = Get-AzWvdWorkspace
-
-    foreach ($ws in $workspaces) {
-
-        foreach ($agRef in $ws.ApplicationGroupReference) {
-
-            # Get Application Group
-            $ag = Get-AzWvdApplicationGroup -ResourceId $agRef
-
-            # Extract Host Pool info from ARM path
-            $hpIdParts = $ag.HostPoolArmPath -split "/"
-            $hpRG   = $hpIdParts[$hpIdParts.IndexOf("resourceGroups") + 1]
-            $hpName = $hpIdParts[-1]
-
-            # Get Host Pool
-            $hp = Get-AzWvdHostPool -ResourceGroupName $hpRG -Name $hpName
-
-            # Get Session Hosts
-            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $hpRG -HostPoolName $hpName
-
-            # Assignment counts (Personal desktops)
-            $assignedVMs   = $sessionHosts | Where-Object { $_.AssignedUser }
-            $unassignedVMs = $sessionHosts | Where-Object { -not $_.AssignedUser }
-
-            # Add to final report
-            $finalReport += [PSCustomObject]@{
-                SubscriptionId    = $SubscriptionId
-                WorkspaceName     = $ws.Name
-                WorkspaceRG       = $ws.ResourceGroupName
-                ApplicationGroup  = $ag.Name
-                HostPoolName      = $hpName
-                HostPoolType      = $hp.HostPoolType
-                TotalVMs          = $sessionHosts.Count
-                AssignedVMs       = $assignedVMs.Count
-                UnassignedVMs     = $unassignedVMs.Count
-            }
+    catch {
+        [PSCustomObject]@{
+            VMName        = $vmName
+            ResourceGroup = $rg
+            Status        = "Failed"
+            Message       = $_.Exception.Message
         }
     }
 }
 
-# ----------------------------
-# DISPLAY REPORT
-# ----------------------------
-$finalReport | Sort-Object SubscriptionId, WorkspaceName, HostPoolName | Format-Table -AutoSize
+$jobs = @()
+$results = @()
 
-# ----------------------------
-# OPTIONAL: EXPORT TO CSV
-# ----------------------------
-$csvFile = "AVD-MultiSubscription-Report.csv"
-$finalReport | Export-Csv $csvFile -NoTypeInformation
-Write-Host "`nReport exported to $csvFile" -ForegroundColor Green
+Write-Host "Starting restart for $($vmList.Count) VMs with max $maxJobs parallel jobs..."
 
+foreach ($vm in $vmList) {
 
---------------------------------------------------------------------
+    # Use correct column names
+    $vmName = $vm.VMName
+    $rg     = $vm.ResourceGroup
 
-# Install main Azure module
-Install-Module -Name Az -Force
+    # Safe validation (no IsNullOrWhiteSpace needed)
+    if (-not $vmName -or -not $rg) {
+        Write-Host "Skipping invalid row: $($vm | ConvertTo-Json -Compress)"
+        continue
+    }
 
-# Install AVD (Desktop Virtualization) module
-Install-Module -Name Az.DesktopVirtualization -Force
------------------------------------------------------------------------
-Get-Module -ListAvailable | Where-Object {$_.Name -like "Az*"}
-----------------------------------
-Register-PSRepository -Name PSGallery -SourceLocation https://www.powershellgallery.com/api/v2 -InstallationPolicy Trusted
+    while ($jobs.Count -ge $maxJobs) {
 
---------------------------------------------------------------------------------------------
+        $finished = Wait-Job -Job $jobs -Any -Timeout 5
 
+        if ($finished) {
+            $output = Receive-Job -Job $finished
 
-WVDConnections
-| where TimeGenerated > ago(1d)
-| extend SessionDurationHours = datetime_diff("hour", TimeGenerated, now())
-| where SessionDurationHours >= 8
-| where State in ("Active", "Disconnected")
-| project
-    TimeGenerated,
-    UserName,
-    SessionHostName,
-    State,
-    SessionDurationHours
-| order by SessionDurationHours desc
+            foreach ($o in $output) {
+                if ($o.Status -eq "Success") {
+                    Write-Host "SUCCESS: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
+                }
+                else {
+                    Write-Host "FAILED: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
+                }
 
-------------------------------------------------
+                $results += $o
+            }
 
-WVDConnections
-| extend EndTimeFixed = iff(isnull(EndTime), now(), EndTime)
-| extend SessionDurationHours = datetime_diff("hour", StartTime, EndTimeFixed)
-| where SessionDurationHours >= 8
-| where State in ("Active", "Disconnected")
-| project
-    UserName,
-    SessionHostName,
-    State,
-    StartTime,
-    EndTimeFixed,
-    SessionDurationHours
-| order by SessionDurationHours desc
+            Remove-Job -Job $finished -Force
+            $jobs = $jobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }
+        }
+    }
 
---------------------------------------------
-
-WVDSessions
-| where SessionState in ("Active", "Disconnected")
-| extend SessionDurationHours = datetime_diff("hour", StartTime, now())
-| where SessionDurationHours >= 8
-| project
-    UserPrincipalName,
-    SessionHostName,
-    SessionState,
-    StartTime,
-    SessionDurationHours
-| order by SessionDurationHours desc
-
--------------------------------------------------
-
-WVDConnections
-| extend SessionDurationHours = datetime_diff("hour", StartTime, now())
-| where SessionDurationHours >= 8
-| where State in ("Active", "Disconnected")
-| summarize LongRunningSessions = count() by SessionHostName
-| order by LongRunningSessions desc
-
---------------------------------------------------------------------------------------
-
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "   AVD SHORTPATH SOURCE INVESTIGATION   " -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-
-# 1. Check GPO
-Write-Host "`n[1] GPO Configuration" -ForegroundColor Yellow
-$gpo = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -ErrorAction SilentlyContinue
-if ($gpo.fUseUdpPortRedirector -or $gpo.ICEEnabled) {
-    Write-Host "✅ Shortpath configured via GPO" -ForegroundColor Green
-    Write-Host "   ICEEnabled: $($gpo.ICEEnabled)"
-    Write-Host "   fUseUdpPortRedirector: $($gpo.fUseUdpPortRedirector)"
-} else {
-    Write-Host "❌ NOT configured via GPO" -ForegroundColor Red
+    $jobs += Start-Job -ScriptBlock $scriptBlock -ArgumentList $vmName, $rg
 }
 
-# 2. Check Intune
-Write-Host "`n[2] Intune/MDM Enrollment" -ForegroundColor Yellow
-$dsreg = dsregcmd /status 2>&1
-if ($dsreg -match "MDMUrl\s+:\s+https://") {
-    Write-Host "✅ Device is Intune enrolled" -ForegroundColor Green
-    ($dsreg | Select-String "MDMUrl|AzureAdJoined|MDMEnrolled") | 
-        ForEach-Object { Write-Host "   $_" }
-} else {
-    Write-Host "❌ Device is NOT Intune enrolled" -ForegroundColor Red
+Write-Host "Waiting for remaining jobs to finish..."
+
+$jobs | Wait-Job | ForEach-Object {
+
+    $output = Receive-Job -Job $_
+
+    foreach ($o in $output) {
+        if ($o.Status -eq "Success") {
+            Write-Host "SUCCESS: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
+        }
+        else {
+            Write-Host "FAILED: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
+        }
+
+        $results += $o
+    }
+
+    Remove-Job -Job $_ -Force
 }
 
-# 3. Check Manual Registry
-Write-Host "`n[3] Manual Registry Configuration" -ForegroundColor Yellow
-$manual = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" -ErrorAction SilentlyContinue
-if ($manual.fUseUdpPortRedirector -or $manual.ICEEnabled) {
-    Write-Host "✅ Shortpath values in WinStations (Manual/Script)" -ForegroundColor Green
-    Write-Host "   ICEEnabled: $($manual.ICEEnabled)"
-    Write-Host "   fUseUdpPortRedirector: $($manual.fUseUdpPortRedirector)"
-    Write-Host "   UdpPortNumber: $($manual.UdpPortNumber)"
-    Write-Host "   ICEActivateThreshold: $($manual.ICEActivateThreshold)"
-} else {
-    Write-Host "❌ NOT manually configured" -ForegroundColor Red
-}
+$results | Export-Csv -Path $reportPath -NoTypeInformation
 
-# 4. Check Firewall
-Write-Host "`n[4] Firewall Rules" -ForegroundColor Yellow
-$fwRules = Get-NetFirewallRule | Where-Object { $_.DisplayName -match "Shortpath|RDP|AVD" }
-if ($fwRules) {
-    Write-Host "✅ Firewall rules found:" -ForegroundColor Green
-    $fwRules | Select-Object DisplayName, Enabled, Direction, Action | Format-Table -AutoSize
-} else {
-    Write-Host "⚠️ No specific Shortpath firewall rules found" -ForegroundColor Yellow
-    Write-Host "   (May be using broader UDP allow rules)"
-}
-
-# 5. Final Verdict
-Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "   VERDICT                              " -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-
--------------------------------------------------
-
-Event
-| where EventLog == "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
-| where EventID == 1149
-| parse RenderedDescription with * "User: " User "\r\n" * "Source Network Address: " SourceIP "\r\n" * "Source Port: " * "\r\nClient Name: " ClientName "\r\n" *
-| project TimeGenerated, Computer, User, ClientName, SourceIP
-| order by TimeGenerated desc
-
-------------------------------------------------------------
-SigninLogs
-| where TimeGenerated > ago(30d)
-| where AppDisplayName contains "Windows Virtual Desktop"
-| where UserPrincipalName == "Koteshwar_Chindana@yourdomain.com"
-| extend DeviceName = tostring(DeviceDetail.displayName)
-| extend DeviceOS = tostring(DeviceDetail.operatingSystem)
-| extend JoinType = tostring(DeviceDetail.trustType)
-| project TimeGenerated, UserPrincipalName, DeviceName, DeviceOS, JoinType, IPAddress
-| order by TimeGenerated desc
-------------------------------------------------------------
-SigninLogs
-| where TimeGenerated > ago(30d)
-| where AppDisplayName contains "Windows Virtual Desktop"
-| extend DeviceName = tostring(DeviceDetail.displayName)
-| extend DeviceOS = tostring(DeviceDetail.operatingSystem)
-| extend JoinType = tostring(DeviceDetail.trustType)
-| where isnotempty(DeviceName)
-| summarize LastSeen = max(TimeGenerated), 
-            Devices = make_set(DeviceName) by UserPrincipalName
-| order by LastSeen desc
-------------------------------------------------------------------
-
-WVDConnections
-| where TimeGenerated > ago(24h)
-| where State == "Connected"
-| extend Transport = case(UdpUse == 1, "UDP managed", UdpUse == 2, "UDP STUN", UdpUse == 4, "UDP TURN relay", "TCP fallback")
-| summarize Sessions = count() by Transport
----------------------------------------------------
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-RemoteDesktopServices-RdpCoreCDV/Operational'; Id=135} | Select-Object -First 5 TimeCreated, Message
--------------------------------------------------------------
----------------------------------------------------------------------
-
+Write-Host "Completed. Report saved to $reportPath"
