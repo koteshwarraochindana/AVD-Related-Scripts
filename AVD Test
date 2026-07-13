@@ -1,114 +1,104 @@
 # ==========================
-# Restart Azure VMs (CSV) - Parallel Execution (PowerShell 5)
+# Restart Azure VMs from CSV
+# PowerShell 5.1
+# Testing Environment
 # ==========================
 
 $vmListFile = "C:\Temp\vm-list.csv"
-$maxJobs = 50
 $reportPath = "C:\Temp\vm-restart-report.csv"
+$maxJobs = 20
 
-# Validate file
-if (-not (Test-Path $vmListFile)) {
-    throw "CSV file not found at $vmListFile"
+if (!(Test-Path $vmListFile)) {
+    throw "CSV not found: $vmListFile"
 }
 
-# Import CSV
-$vmList = Import-Csv -Path $vmListFile
+$vmList = Import-Csv $vmListFile
 
-# Connect to Azure
+Write-Host "Logging into Azure..."
 Connect-AzAccount
 
-# OPTIONAL
-# Select-AzSubscription -SubscriptionId "your-subscription-id"
+$subscription = (Get-AzContext).Subscription.Id
 
-# Job script
 $scriptBlock = {
-    param($vmName, $rg)
+
+    param($VMName,$RG,$SubscriptionId)
 
     try {
-        Import-Module Az.Compute -ErrorAction Stop
 
-        Restart-AzVM -Name $vmName -ResourceGroupName $rg -ErrorAction Stop
+        Import-Module Az.Accounts
+        Import-Module Az.Compute
+
+        # Login again inside each job
+        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+
+        Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+
+        Restart-AzVM `
+            -Name $VMName `
+            -ResourceGroupName $RG `
+            -NoWait `
+            -ErrorAction Stop
 
         [PSCustomObject]@{
-            VMName        = $vmName
-            ResourceGroup = $rg
-            Status        = "Success"
-            Message       = "Restarted successfully"
+            VMName = $VMName
+            ResourceGroup = $RG
+            Status = "Success"
+            Message = "Restart initiated"
         }
+
     }
     catch {
+
         [PSCustomObject]@{
-            VMName        = $vmName
-            ResourceGroup = $rg
-            Status        = "Failed"
-            Message       = $_.Exception.Message
+            VMName = $VMName
+            ResourceGroup = $RG
+            Status = "Failed"
+            Message = $_.Exception.Message
         }
+
     }
+
 }
 
 $jobs = @()
 $results = @()
 
-Write-Host "Starting restart for $($vmList.Count) VMs with max $maxJobs parallel jobs..."
+foreach($vm in $vmList){
 
-foreach ($vm in $vmList) {
+    while(($jobs | Where State -eq Running).Count -ge $maxJobs){
 
-    # Use correct column names
-    $vmName = $vm.VMName
-    $rg     = $vm.ResourceGroup
+        $finished = Wait-Job -Job $jobs -Any
 
-    # Safe validation (no IsNullOrWhiteSpace needed)
-    if (-not $vmName -or -not $rg) {
-        Write-Host "Skipping invalid row: $($vm | ConvertTo-Json -Compress)"
-        continue
+        $results += Receive-Job $finished
+
+        Remove-Job $finished
+
+        $jobs = $jobs | Where State -eq Running
+
     }
 
-    while ($jobs.Count -ge $maxJobs) {
+    Write-Host "Queueing $($vm.VMName)"
 
-        $finished = Wait-Job -Job $jobs -Any -Timeout 5
+    $jobs += Start-Job `
+        -ScriptBlock $scriptBlock `
+        -ArgumentList $vm.VMName,$vm.ResourceGroup,$subscription
 
-        if ($finished) {
-            $output = Receive-Job -Job $finished
-
-            foreach ($o in $output) {
-                if ($o.Status -eq "Success") {
-                    Write-Host "SUCCESS: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
-                }
-                else {
-                    Write-Host "FAILED: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
-                }
-
-                $results += $o
-            }
-
-            Remove-Job -Job $finished -Force
-            $jobs = $jobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }
-        }
-    }
-
-    $jobs += Start-Job -ScriptBlock $scriptBlock -ArgumentList $vmName, $rg
 }
 
-Write-Host "Waiting for remaining jobs to finish..."
+Wait-Job $jobs | Out-Null
 
-$jobs | Wait-Job | ForEach-Object {
+foreach($job in $jobs){
 
-    $output = Receive-Job -Job $_
+    $results += Receive-Job $job
 
-    foreach ($o in $output) {
-        if ($o.Status -eq "Success") {
-            Write-Host "SUCCESS: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
-        }
-        else {
-            Write-Host "FAILED: $($o.VMName) ($($o.ResourceGroup)) - $($o.Message)"
-        }
+    Remove-Job $job
 
-        $results += $o
-    }
-
-    Remove-Job -Job $_ -Force
 }
 
-$results | Export-Csv -Path $reportPath -NoTypeInformation
+$results | Export-Csv $reportPath -NoTypeInformation
 
-Write-Host "Completed. Report saved to $reportPath"
+Write-Host ""
+Write-Host "Completed"
+Write-Host "Success :" (($results | Where Status -eq Success).Count)
+Write-Host "Failed  :" (($results | Where Status -eq Failed).Count)
+Write-Host "Report  : $reportPath"
