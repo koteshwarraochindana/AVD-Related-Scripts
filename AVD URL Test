@@ -1,6 +1,6 @@
 # ==============================================================================
-# SCRIPT: Bulk Power-On & 30-Min Auto-Scale Restriction (Universal Syntax)
-# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, Subscription ID
+# SCRIPT: Bulk Power-On or Restart Session Hosts (No Tags Applied)
+# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, SubscriptionId
 # ==============================================================================
 
 # 1. Update this path to the location of your target CSV file
@@ -16,7 +16,7 @@ if (-not (Test-Path -Path $CSVPath)) {
 $TargetVMs = Import-Csv -Path $CSVPath
 
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " [START] Processing $($TargetVMs.Count) VMs across subscriptions" -ForegroundColor Cyan
+Write-Host " [START] Powering On / Restarting $($TargetVMs.Count) VMs" -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 
 # Track loop counters
@@ -27,9 +27,7 @@ $FailureCount = 0
 foreach ($Row in $TargetVMs) {
     $VMName = $Row.VMName
     $RGName = $Row.ResourceGroupName
-    
-    # Safely maps the column using the exact space 'Subscription ID' format from Excel
-    $SubId  = $Row.'Subscription ID'
+    $SubId  = $Row.SubscriptionId
     
     Write-Host "------------------------------------------------------------------" -ForegroundColor Gray
     Write-Host "Targeting Host: $VMName" -ForegroundColor Yellow
@@ -43,25 +41,23 @@ foreach ($Row in $TargetVMs) {
 
     try {
         # STEP A: Switch Azure Context immediately to the current VM's subscription
-        # Fixed: Removed the legacy -Force parameter to resolve module version conflicts
         Set-AzContext -SubscriptionId $SubId | Out-Null
         
-        # STEP B: Fetch current metadata tags *before* altering state to prevent race conditions
-        $VM = Get-AzVM -ResourceGroupName $RGName -Name $VMName -ErrorAction Stop
-        $Tags = $VM.Tags
-        if ($null -eq $Tags) { $Tags = @{} }
+        # STEP B: Check the live power state of the VM
+        $VMStatus = Get-AzVM -ResourceGroupName $RGName -Name $VMName -Status -ErrorAction Stop
+        $PowerState = ($VMStatus.Statuses | Where-Object Code -like "PowerState/*").Code
         
-        # STEP C: Inject the specialized Nerdio 30-minute time lock parameter
-        $ExpiryTime = (Get-Date).AddMinutes(30).ToString("o")
-        $Tags["Nerdio_Maintenance_Until"] = $ExpiryTime
-        
-        # STEP D: Apply the updated tag profile back to the VM object configuration
-        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -ErrorAction Stop | Out-Null
-        Write-Host "[SUCCESS] Nerdio auto-scale plan locked until: $ExpiryTime" -ForegroundColor Green
-        
-        # STEP E: Power on the host asynchronously after the tag is successfully written
-        Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
-        Write-Host "[SUCCESS] Power-on signal dispatched to Azure." -ForegroundColor Green
+        # STEP C: Evaluate state and take action
+        if ($PowerState -eq "PowerState/running") {
+            # VM is already on -> Restart it
+            Restart-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
+            Write-Host "[SUCCESS] Host is active. Graceful restart signal dispatched." -ForegroundColor Green
+        }
+        else {
+            # VM is stopped/deallocated -> Power it on
+            Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
+            Write-Host "[SUCCESS] Host is down. Power-on signal dispatched." -ForegroundColor Green
+        }
         
         $SuccessCount++
     } 
