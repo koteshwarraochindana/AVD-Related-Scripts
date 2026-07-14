@@ -1,6 +1,6 @@
 # ==============================================================================
 # SCRIPT: Bulk Power-On & 30-Min Auto-Scale Restriction (Universal Syntax)
-# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, SubscriptionId
+# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, Subscription ID
 # ==============================================================================
 
 # 1. Update this path to the location of your target CSV file
@@ -27,7 +27,9 @@ $FailureCount = 0
 foreach ($Row in $TargetVMs) {
     $VMName = $Row.VMName
     $RGName = $Row.ResourceGroupName
-    $SubId  = $Row.SubscriptionId
+    
+    # Safely maps the column using the exact space 'Subscription ID' format from Excel
+    $SubId  = $Row.'Subscription ID'
     
     Write-Host "------------------------------------------------------------------" -ForegroundColor Gray
     Write-Host "Targeting Host: $VMName" -ForegroundColor Yellow
@@ -41,7 +43,8 @@ foreach ($Row in $TargetVMs) {
 
     try {
         # STEP A: Switch Azure Context immediately to the current VM's subscription
-        Set-AzContext -SubscriptionId $SubId -Force | Out-Null
+        # Fixed: Removed the legacy -Force parameter to resolve module version conflicts
+        Set-AzContext -SubscriptionId $SubId | Out-Null
         
         # STEP B: Fetch current metadata tags *before* altering state to prevent race conditions
         $VM = Get-AzVM -ResourceGroupName $RGName -Name $VMName -ErrorAction Stop
@@ -53,7 +56,7 @@ foreach ($Row in $TargetVMs) {
         $Tags["Nerdio_Maintenance_Until"] = $ExpiryTime
         
         # STEP D: Apply the updated tag profile back to the VM object configuration
-        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -Force -ErrorAction Stop | Out-Null
+        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -ErrorAction Stop | Out-Null
         Write-Host "[SUCCESS] Nerdio auto-scale plan locked until: $ExpiryTime" -ForegroundColor Green
         
         # STEP E: Power on the host asynchronously after the tag is successfully written
