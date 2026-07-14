@@ -1,29 +1,29 @@
 # ==============================================================================
-# SCRIPT: Bulk Power-On & 30-Min Auto-Scale Restriction
+# SCRIPT: Bulk Power-On & 30-Min Auto-Scale Restriction (Universal Syntax)
 # PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, SubscriptionId
 # ==============================================================================
 
 # 1. Update this path to the location of your target CSV file
 $CSVPath = "C:\temp\targets.csv"
 
-# Verify the CSV exists before proceeding
+# Verify the CSV exists before running
 if (-not (Test-Path -Path $CSVPath)) {
-    Write-Error "CRITICAL: The CSV file could not be found at $CSVPath. Please verify the path."
+    Write-Error "CRITICAL: The CSV file could not be found at $CSVPath."
     return
 }
 
-# 2. Import the CSV data
+# 2. Import the CSV data rows
 $TargetVMs = Import-Csv -Path $CSVPath
 
 Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " [START] Processing $($TargetVMs.Count) VMs across multiple subscriptions" -ForegroundColor Cyan
+Write-Host " [START] Processing $($TargetVMs.Count) VMs across subscriptions" -ForegroundColor Cyan
 Write-Host "==================================================================" -ForegroundColor Cyan
 
-# Track success and failures for summary report
+# Track loop counters
 $SuccessCount = 0
 $FailureCount = 0
 
-# 3. Process each row in the CSV
+# 3. Sequential Execution Loop
 foreach ($Row in $TargetVMs) {
     $VMName = $Row.VMName
     $RGName = $Row.ResourceGroupName
@@ -31,55 +31,51 @@ foreach ($Row in $TargetVMs) {
     
     Write-Host "------------------------------------------------------------------" -ForegroundColor Gray
     Write-Host "Targeting Host: $VMName" -ForegroundColor Yellow
-    Write-Host "Location:       RG: $RGName | Sub: $SubId" -ForegroundColor DarkGray
 
-    # Skip processing if any of the three mandatory fields are missing in the row
+    # Catch empty or malformed rows instantly
     if ([string]::IsNullOrWhiteSpace($VMName) -or [string]::IsNullOrWhiteSpace($RGName) -or [string]::IsNullOrWhiteSpace($SubId)) {
-        Write-Host "[SKIP] Row has missing values. Check your CSV layout." -ForegroundColor Orange
+        Write-Host "[SKIP] Row has missing values. Check your CSV layout." -ForegroundColor Cyan
         $FailureCount++
         continue
     }
 
     try {
-        # A. Context Switch - Locks the execution session to the specific target subscription
-        # This completely replaces the broken interactive prompt
+        # STEP A: Switch Azure Context immediately to the current VM's subscription
         Set-AzContext -SubscriptionId $SubId -Force | Out-Null
         
-        # B. Power On Task - Issues an asynchronous boot command to Azure immediately
-        # Using '-NoWait' prevents the loop from pausing to wait for the OS to finish booting
-        Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop
-        Write-Host "[SUCCESS] Power-on signal dispatched to Azure." -ForegroundColor Green
-        
-        # C. Auto-Scale Lock - Format a 30-minute timestamp tracking window for Nerdio
-        # Nerdio's engine evaluates Azure tags to automatically honor manual maintenance overrides
-        $ExpiryTime = (Get-Date).AddMinutes(30).ToString("o")
-        
-        # D. Tag Extraction - Fetch current metadata so we do not overwrite existing environment tags
+        # STEP B: Fetch current metadata tags *before* altering state to prevent race conditions
         $VM = Get-AzVM -ResourceGroupName $RGName -Name $VMName -ErrorAction Stop
         $Tags = $VM.Tags
         if ($null -eq $Tags) { $Tags = @{} }
         
-        # E. Tag Injection - Insert the specialized Nerdio time lock parameter
+        # STEP C: Inject the specialized Nerdio 30-minute time lock parameter
+        $ExpiryTime = (Get-Date).AddMinutes(30).ToString("o")
         $Tags["Nerdio_Maintenance_Until"] = $ExpiryTime
         
-        # F. Apply Tags - Save the timestamp metadata configuration changes back to the VM object
-        # Using '-AsJob' parallelizes the data upload process to process the 370 VMs quickly
-        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -AsJob | Out-Null
+        # STEP D: Apply the updated tag profile back to the VM object configuration
+        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -Force -ErrorAction Stop | Out-Null
         Write-Host "[SUCCESS] Nerdio auto-scale plan locked until: $ExpiryTime" -ForegroundColor Green
+        
+        # STEP E: Power on the host asynchronously after the tag is successfully written
+        Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
+        Write-Host "[SUCCESS] Power-on signal dispatched to Azure." -ForegroundColor Green
         
         $SuccessCount++
     } 
     catch {
-        # Catch and surface configuration errors (e.g., typos, invalid IDs, bad naming syntax)
         Write-Host "[FAILURE] Could not execute commands for host $VMName." -ForegroundColor Red
         Write-Host "REASON: $_" -ForegroundColor Red
         $FailureCount++
     }
 }
 
+# Determine reporting color safely using PS 5.1 compatible standard IF block
+$FinalColor = "Green"
+if ($FailureCount -gt 0) { $FinalColor = "Red" }
+
 # 4. Final Run Execution Summary Report
 Write-Host "==================================================================" -ForegroundColor Cyan
 Write-Host " [FINISHED] Automated Workflow Completed!" -ForegroundColor Cyan
 Write-Host " Successful Executions: $SuccessCount" -ForegroundColor Green
-Write-Host " Failed/Skipped Rows:   $FailureCount" -ForegroundColor ($FailureCount -gt 0 ? "Red" : "Gray")
+Write-Host " Failed/Skipped Rows:   $FailureCount" -ForegroundColor $FinalColor
 Write-Host "==================================================================" -ForegroundColor Cyan
