@@ -1,22 +1,81 @@
-$OutputFile = "$env:USERPROFILE\Desktop\ControlPanel_Programs.csv"
+# ==============================================================================
+# SCRIPT: Bulk Power-On & 30-Min Auto-Scale Restriction (Universal Syntax)
+# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, SubscriptionId
+# ==============================================================================
 
-$Programs = Get-ItemProperty `
-    HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, `
-    HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* `
-    -ErrorAction SilentlyContinue |
+# 1. Update this path to the location of your target CSV file
+$CSVPath = "C:\temp\targets.csv"
 
-Where-Object {
-    $_.DisplayName -and $_.SystemComponent -ne 1
-} |
+# Verify the CSV exists before running
+if (-not (Test-Path -Path $CSVPath)) {
+    Write-Error "CRITICAL: The CSV file could not be found at $CSVPath."
+    return
+}
 
-Select-Object `
-    DisplayName,
-    Publisher,
-    DisplayVersion,
-    InstallDate |
+# 2. Import the CSV data rows
+$TargetVMs = Import-Csv -Path $CSVPath
 
-Sort-Object DisplayName -Unique
+Write-Host "==================================================================" -ForegroundColor Cyan
+Write-Host " [START] Processing $($TargetVMs.Count) VMs across subscriptions" -ForegroundColor Cyan
+Write-Host "==================================================================" -ForegroundColor Cyan
 
-$Programs | Export-Csv $OutputFile -NoTypeInformation
+# Track loop counters
+$SuccessCount = 0
+$FailureCount = 0
 
-Write-Host "Export completed: $OutputFile"
+# 3. Sequential Execution Loop
+foreach ($Row in $TargetVMs) {
+    $VMName = $Row.VMName
+    $RGName = $Row.ResourceGroupName
+    $SubId  = $Row.SubscriptionId
+    
+    Write-Host "------------------------------------------------------------------" -ForegroundColor Gray
+    Write-Host "Targeting Host: $VMName" -ForegroundColor Yellow
+
+    # Catch empty or malformed rows instantly
+    if ([string]::IsNullOrWhiteSpace($VMName) -or [string]::IsNullOrWhiteSpace($RGName) -or [string]::IsNullOrWhiteSpace($SubId)) {
+        Write-Host "[SKIP] Row has missing values. Check your CSV layout." -ForegroundColor Cyan
+        $FailureCount++
+        continue
+    }
+
+    try {
+        # STEP A: Switch Azure Context immediately to the current VM's subscription
+        Set-AzContext -SubscriptionId $SubId -Force | Out-Null
+        
+        # STEP B: Fetch current metadata tags *before* altering state to prevent race conditions
+        $VM = Get-AzVM -ResourceGroupName $RGName -Name $VMName -ErrorAction Stop
+        $Tags = $VM.Tags
+        if ($null -eq $Tags) { $Tags = @{} }
+        
+        # STEP C: Inject the specialized Nerdio 30-minute time lock parameter
+        $ExpiryTime = (Get-Date).AddMinutes(30).ToString("o")
+        $Tags["Nerdio_Maintenance_Until"] = $ExpiryTime
+        
+        # STEP D: Apply the updated tag profile back to the VM object configuration
+        Update-AzVM -ResourceGroupName $RGName -VM $VM -Tag $Tags -Force -ErrorAction Stop | Out-Null
+        Write-Host "[SUCCESS] Nerdio auto-scale plan locked until: $ExpiryTime" -ForegroundColor Green
+        
+        # STEP E: Power on the host asynchronously after the tag is successfully written
+        Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
+        Write-Host "[SUCCESS] Power-on signal dispatched to Azure." -ForegroundColor Green
+        
+        $SuccessCount++
+    } 
+    catch {
+        Write-Host "[FAILURE] Could not execute commands for host $VMName." -ForegroundColor Red
+        Write-Host "REASON: $_" -ForegroundColor Red
+        $FailureCount++
+    }
+}
+
+# Determine reporting color safely using PS 5.1 compatible standard IF block
+$FinalColor = "Green"
+if ($FailureCount -gt 0) { $FinalColor = "Red" }
+
+# 4. Final Run Execution Summary Report
+Write-Host "==================================================================" -ForegroundColor Cyan
+Write-Host " [FINISHED] Automated Workflow Completed!" -ForegroundColor Cyan
+Write-Host " Successful Executions: $SuccessCount" -ForegroundColor Green
+Write-Host " Failed/Skipped Rows:   $FailureCount" -ForegroundColor $FinalColor
+Write-Host "==================================================================" -ForegroundColor Cyan
