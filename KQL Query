@@ -1,4 +1,5 @@
-IntuneDevices
-
-| summarize arg_max(TimeGenerated, *) by DeviceName
-| project DeviceName, OS, JoinType = ManagementState
+WVDConnections
+| where State == "Connected"
+| summarize LastLoginTime = max(TimeGenerated) by UserName, HostPoolName, SessionHostName
+| project UserName, HostPoolName, SessionHostName, LastLoginTime
+| order by LastLoginTime desc
