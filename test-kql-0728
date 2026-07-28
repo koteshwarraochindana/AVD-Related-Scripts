@@ -1,0 +1,5 @@
+AzureActivity
+| where ResourceId has "PAVW0139"
+| where OperationNameValue contains "delete"
+| project TimeGenerated, OperationNameValue, ResourceGroup, Caller, CallerIpAddress
+| order by TimeGenerated desc
