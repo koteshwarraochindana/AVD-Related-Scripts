@@ -1,53 +1,323 @@
-# ===========================
-# MODULES & AUTH
-# ===========================
-# Ensure the AVD module is loaded
-if (-not (Get-Module -ListAvailable -Name "Az.DesktopVirtualization")) {
-    Install-Module -Name "Az.DesktopVirtualization" -Scope CurrentUser -Force
-}
-Import-Module "Az.DesktopVirtualization"
+<#
+AVD Session Host Details (Multi-Subscription) - READ-ONLY
+Bulk fetches VMs per subscription for speed - estimated 10-20 mins for 24,000 VMs
+Fix: Uses $sh.ResourceId.Split('/')[-1] for clean VM name (no domain suffix)
+Exports: C:\Temp\AVD_SessionHost_Details.csv
 
-# Authentication (Single Subscription)
+CHANGES IN THIS VERSION:
+- Removed image (Get-ImageDetailsFromRef) lookups entirely - this was the source of the
+  "Cannot bind argument to parameter 'ImageReference' because it is null" error, since some
+  VMs have a null StorageProfile.ImageReference and the function's parameter was Mandatory.
+- Added a single overall progress bar (1-100%) that reflects true progress across ALL
+  subscriptions and host pools, via a quick pre-scan pass that counts total host pools first.
+#>
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+
+$TargetSubscriptions = @(
+  "f9c819dc-4e16-4a04-8487-a734dcd880e1",
+  "c59f3913-9612-4704-94f8-4a1d4f695b2f",
+  "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+  "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+  "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+  "7160cf79-3964-41af-8168-05a588c5f99b",
+  "750da1a4-85cc-489e-b629-e512e0989c16",
+  "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+  "9ff6edd3-6b39-4d33-8776-56703398260c",
+  "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f",
+  "df7de03e-1d71-4adf-8fd1-bd5791326a26",
+  "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
+)
+
+$TenantId       = ""  # optional
+$DetailsCsvPath = "C:\Temp\AVD_SessionHost_Details.csv"
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+function Initialize-PSGalleryPreReqs {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        }
+    } catch {
+        Write-Host "WARNING: NuGet provider verification failed." -ForegroundColor Yellow
+    }
+}
+
+function Set-PSGalleryTrusted {
+    try {
+        $repo = Get-PSRepository -Name "PSGallery" -ErrorAction Stop
+        if ($repo.InstallationPolicy -ne "Trusted") {
+            Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        }
+    } catch {
+        Write-Host "WARNING: Unable to set PSGallery to Trusted." -ForegroundColor Yellow
+    }
+}
+
+function Ensure-Module {
+    param([Parameter(Mandatory=$true)][string]$ModuleName)
+    if (-not (Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue)) {
+        Install-Module $ModuleName -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+    Import-Module $ModuleName -ErrorAction Stop
+}
+
+function Get-ResourceGroupFromHostPool {
+    param([Parameter(Mandatory=$true)]$HostPool)
+    if ($HostPool.PSObject.Properties.Name -contains "ResourceGroupName" -and
+        -not [string]::IsNullOrWhiteSpace($HostPool.ResourceGroupName)) {
+        return $HostPool.ResourceGroupName
+    }
+    if ($HostPool.PSObject.Properties.Name -contains "Id" -and $HostPool.Id) {
+        if ($HostPool.Id -match "/resourceGroups/([^/]+)/") { return $matches[1] }
+    }
+    return ""
+}
+
+function Get-VMPowerState {
+    param([Parameter(Mandatory=$true)]$VM)
+    try {
+        $powerStatus = $VM.Statuses | Where-Object { $_.Code -like "PowerState/*" }
+        if ($powerStatus) {
+            return ($powerStatus.Code -replace "PowerState/", "")
+        }
+    } catch {}
+    return "Unknown"
+}
+
+# ==========================================================
+# START
+# ==========================================================
+
+$scriptStart = Get-Date
+
+Initialize-PSGalleryPreReqs
+Set-PSGalleryTrusted
+
+Ensure-Module "Az.Accounts"
+Ensure-Module "Az.Resources"
+Ensure-Module "Az.DesktopVirtualization"
+Ensure-Module "Az.Compute"
+
+# Auth
 Write-Host "Connecting to Azure..." -ForegroundColor Cyan
 try {
-    $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -WarningAction SilentlyContinue -ErrorAction Stop
+    }
 } catch {
-    $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        $null = Connect-AzAccount -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    } else {
+        $null = Connect-AzAccount -TenantId $TenantId -DeviceCode -WarningAction SilentlyContinue -ErrorAction Stop
+    }
 }
 
-# ===========================
-# DATA COLLECTION
-# ===========================
-Write-Host "Fetching session host details from all host pools..." -ForegroundColor Gray
+# Resolve subscriptions
+$allSubs = Get-AzSubscription
+$resolvedSubs = foreach ($id in $TargetSubscriptions) {
+    $match = $allSubs | Where-Object { $_.Id -eq $id }
+    if ($match) { $match }
+    else { Write-Host "WARNING: Subscription not found or not accessible: $id" -ForegroundColor Yellow }
+}
 
-$hostPools = Get-AzWvdHostPool
-$allSessionHosts = foreach ($hp in $hostPools) {
-    # Get hosts for the specific pool
-    $hosts = Get-AzWvdSessionHost -HostPoolName $hp.Name -ResourceGroupName $hp.ResourceGroupName
-    
-    foreach ($sh in $hosts) {
-        [PSCustomObject]@{
-            HostPoolName     = $hp.Name
-            SessionHostName  = $sh.Name.Split('/')[-1] # Clean name (remove path)
-            Status           = $sh.Status
-            AssignedUser     = $sh.AssignedUser
-            LastHeartbeat    = $sh.LastHeartBeat
-            UpdateState      = $sh.UpdateState
-            ResourceGroup    = $hp.ResourceGroupName
-            SubscriptionId   = $hp.Id.Split('/')[2]
+if (-not $resolvedSubs -or $resolvedSubs.Count -eq 0) {
+    Write-Host "ERROR: No valid subscriptions resolved." -ForegroundColor Red
+    return
+}
+
+$resolvedSubs = $resolvedSubs | Sort-Object Name
+Write-Host "Resolved $($resolvedSubs.Count) subscription(s)." -ForegroundColor Cyan
+
+# ==========================================================
+# PRE-SCAN: enumerate host pools per subscription so we know
+# the TOTAL amount of work up front -> lets us show a true
+# overall 1-100% progress bar instead of a per-subscription one.
+# ==========================================================
+
+Write-Host "`nPre-scanning host pools across all subscriptions..." -ForegroundColor Cyan
+
+$subHostPoolMap = @{}   # subscription.Id -> array of host pools
+$totalHostPools = 0
+
+foreach ($sub in $resolvedSubs) {
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+    try {
+        $hp = Get-AzWvdHostPool -ErrorAction Stop | Sort-Object Name
+    } catch {
+        Write-Host "  WARNING: Unable to enumerate host pools for $($sub.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+        $hp = @()
+    }
+    $subHostPoolMap[$sub.Id] = $hp
+    $totalHostPools += $hp.Count
+    Write-Host "  $($sub.Name): $($hp.Count) host pool(s)" -ForegroundColor Gray
+}
+
+if ($totalHostPools -eq 0) {
+    Write-Host "ERROR: No host pools found in any resolved subscription." -ForegroundColor Red
+    return
+}
+
+Write-Host "Total host pools to process: $totalHostPools`n" -ForegroundColor Cyan
+
+# ==========================================================
+# DATA COLLECTION
+# ==========================================================
+
+$allDetails       = New-Object System.Collections.Generic.List[object]
+$subIndex         = 0
+$hostPoolsDoneOverall = 0
+
+foreach ($sub in $resolvedSubs) {
+    $subIndex++
+
+    Write-Host "`n[$subIndex/$($resolvedSubs.Count)] Switching to: $($sub.Name)" -ForegroundColor Yellow
+    Set-AzContext -SubscriptionId $sub.Id -TenantId $sub.TenantId -ErrorAction Stop | Out-Null
+
+    # ----------------------------------------------------------
+    # BULK FETCH all VMs with -Status flag
+    # Key = vmname (lowercase) from ResourceId - no domain suffix
+    # ----------------------------------------------------------
+    Write-Host "  Bulk fetching all VMs (with power state)..." -ForegroundColor Gray
+    $allVMsInSub = @{}
+    try {
+        Get-AzVM -Status | ForEach-Object {
+            $allVMsInSub[$_.Name.ToLowerInvariant()] = $_
+        }
+        Write-Host "  Cached $($allVMsInSub.Count) VMs." -ForegroundColor Gray
+    } catch {
+        Write-Host "  WARNING: Could not bulk fetch VMs: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # ----------------------------------------------------------
+    # Host pools (already fetched during pre-scan)
+    # ----------------------------------------------------------
+    $hostPools = $subHostPoolMap[$sub.Id]
+
+    if (-not $hostPools -or $hostPools.Count -eq 0) {
+        Write-Host "  No host pools found. Skipping." -ForegroundColor Gray
+        continue
+    }
+
+    Write-Host "  Found $($hostPools.Count) host pool(s)." -ForegroundColor Gray
+
+    $hpIndex = 0
+    foreach ($hp in $hostPools) {
+        $hpIndex++
+        $hostPoolsDoneOverall++
+
+        $overallPercent = [Math]::Min(100, [Math]::Round(($hostPoolsDoneOverall / $totalHostPools) * 100, 1))
+
+        # Overall progress bar (Id 0) - true 1-100% across the whole script
+        Write-Progress -Id 0 -Activity "Overall AVD Inventory Progress" `
+            -Status ("{0}% complete  |  Host pool {1} of {2}" -f $overallPercent, $hostPoolsDoneOverall, $totalHostPools) `
+            -PercentComplete $overallPercent
+
+        # Detail progress bar (Id 1, child of 0) - what's happening right now
+        Write-Progress -Id 1 -ParentId 0 -Activity "Collecting Session Host Details" `
+            -Status ("Sub [{0}/{1}] {2}  |  HostPool [{3}/{4}] {5}" -f `
+                $subIndex, $resolvedSubs.Count, $sub.Name, `
+                $hpIndex, $hostPools.Count, $hp.Name) `
+            -PercentComplete (($hpIndex / [Math]::Max($hostPools.Count, 1)) * 100)
+
+        $rgName = Get-ResourceGroupFromHostPool -HostPool $hp
+        if ([string]::IsNullOrWhiteSpace($rgName)) {
+            Write-Host "    Could not resolve resource group for $($hp.Name). Skipping." -ForegroundColor Yellow
+            continue
+        }
+
+        $sessionHosts = @()
+        try {
+            $sessionHosts = Get-AzWvdSessionHost -ResourceGroupName $rgName -HostPoolName $hp.Name -ErrorAction Stop
+        } catch {
+            Write-Host "    WARNING: Could not fetch session hosts for $($hp.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        if (-not $sessionHosts -or $sessionHosts.Count -eq 0) {
+            Write-Host "    No session hosts in $($hp.Name). Skipping." -ForegroundColor Gray
+            continue
+        }
+
+        Write-Host "    $($hp.Name) -> $($sessionHosts.Count) host(s)" -ForegroundColor Gray
+
+        foreach ($sh in $sessionHosts) {
+
+            # Clean VM name (no domain suffix) via ResourceId
+            $vmName = $sh.ResourceId.Split('/')[-1]        # clean name e.g. "CAVWda58"
+            $vmRg   = $sh.ResourceId.Split('/')[4]         # resource group
+
+            # Power state lookup from bulk cache (no API call per VM)
+            $powerState = $null
+            $cachedVM   = $allVMsInSub[$vmName.ToLowerInvariant()]
+            if ($cachedVM) {
+                $powerState = Get-VMPowerState -VM $cachedVM
+            } else {
+                $powerState = "Unknown"
+            }
+
+            # AssignedUser
+            $assigned = $null
+            if ($sh.PSObject.Properties.Name -contains "AssignedUser") { $assigned = $sh.AssignedUser }
+
+            $allDetails.Add([pscustomobject]@{
+                SubscriptionName = $sub.Name
+                SubscriptionId   = $sub.Id
+                ResourceGroup    = $rgName
+                HostPoolName     = $hp.Name
+                HostPoolType     = $hp.HostPoolType
+                SessionHostName  = $sh.Name.Split('/')[-1]  # full name with domain e.g. CAVWda58.domain.com
+                VMName           = $vmName                   # clean name e.g. CAVWda58
+                VMResourceGroup  = $vmRg
+                Status           = $sh.Status
+                PowerState       = $powerState
+                AllowNewSession  = $sh.AllowNewSession
+                AssignedUser     = $assigned
+            })
         }
     }
 }
 
-# ===========================
-# EXPORT TO CSV
-# ===========================
-$csvPath = "C:\Temp\AVD_SessionHosts_FullReport.csv"
+Write-Progress -Id 1 -Activity "Collecting Session Host Details" -Completed
+Write-Progress -Id 0 -Activity "Overall AVD Inventory Progress" -Completed
 
-if ($allSessionHosts) {
-    $allSessionHosts | Export-Csv -Path $csvPath -NoTypeInformation -Force
-    $allSessionHosts | Format-Table -AutoSize
-    Write-Host "Success! All session host details exported to $csvPath" -ForegroundColor Green
+# ==========================================================
+# CONSOLE SUMMARY
+# ==========================================================
+
+Write-Host "`n$("=" * 100)" -ForegroundColor DarkGray
+Write-Host "COLLECTION COMPLETE" -ForegroundColor Cyan
+Write-Host "$("=" * 100)" -ForegroundColor DarkGray
+Write-Host "Total Session Hosts  : $($allDetails.Count)"
+Write-Host "Assigned             : $(($allDetails | Where-Object { -not [string]::IsNullOrWhiteSpace($_.AssignedUser) }).Count)"
+Write-Host "Unassigned           : $(($allDetails | Where-Object { [string]::IsNullOrWhiteSpace($_.AssignedUser) }).Count)"
+Write-Host "Running VMs          : $(($allDetails | Where-Object { $_.PowerState -eq 'running' }).Count)"
+Write-Host "Deallocated VMs      : $(($allDetails | Where-Object { $_.PowerState -eq 'deallocated' }).Count)"
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+if ($allDetails.Count -gt 0) {
+    $folder = Split-Path $DetailsCsvPath -Parent
+    if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+
+    $allDetails | Sort-Object SubscriptionName, HostPoolName, VMName |
+        Export-Csv -Path $DetailsCsvPath -NoTypeInformation -Encoding UTF8 -Force
+
+    Write-Host "`nDetails CSV exported: $DetailsCsvPath" -ForegroundColor Green
 } else {
-    Write-Host "No session hosts found in any host pool." -ForegroundColor Yellow
+    Write-Host "`nNo session hosts found. CSV not created." -ForegroundColor Yellow
 }
+
+$elapsed = New-TimeSpan -Start $scriptStart -End (Get-Date)
+Write-Host "Completed in: $([int]$elapsed.TotalMinutes)m $($elapsed.Seconds)s" -ForegroundColor Green
+Write-Host "Done." -ForegroundColor Green
