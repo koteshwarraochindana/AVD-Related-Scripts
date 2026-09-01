@@ -74,8 +74,17 @@ foreach ($Item in $Assignments) {
         $Message = $_.Exception.Message
     }
     
-    # Clean live tracking message (Only host vs user)
-    Write-Host "[$Counter/$TotalRows] $SessionHostName -> $AssignedUser ($Status)" -ForegroundColor ($Status -eq "Success" ? "Green" : ($Status -eq "Skipped" ? "Yellow" : "Red"))
+    # PowerShell 5.1 compatible color logic block
+    if ($Status -eq "Success") {
+        $TextColor = "Green"
+    } elseif ($Status -eq "Skipped") {
+        $TextColor = "Yellow"
+    } else {
+        $TextColor = "Red"
+    }
+
+    # Clean live tracking message (Only host vs user) using native color variable
+    Write-Host "[$Counter/$TotalRows] $SessionHostName -> $AssignedUser ($Status)" -ForegroundColor $TextColor
 
     $Results += [PSCustomObject]@{
         Sequence        = $Counter
