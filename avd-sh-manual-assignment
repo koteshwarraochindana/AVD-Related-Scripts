@@ -1,6 +1,6 @@
-# ============================================================
-# AVD Personal Host Assignment Script
-# ============================================================
+# ============================================================ #
+# AVD Personal Host Assignment Script (In-Memory Only)
+# ============================================================ #
 
 # -----------------------------
 # Environment Variables
@@ -12,100 +12,93 @@ $HostPoolName = "AVD-CAS2-CORP2-SC"
 # Hardcoded CSV file
 $CsvPath = "C:\Temp\Assignments.csv"
 
-# Log files
-$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$ReportFile = "C:\AVD\AVD_Assignment_Report_$TimeStamp.csv"
-$LogFile = "C:\AVD\AVD_Assignment_Log_$TimeStamp.txt"
-
 # -----------------------------
-# Start Logging
+# Connect to Azure
 # -----------------------------
-Start-Transcript -Path $LogFile
-
 Write-Host ""
 Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-
 Connect-AzAccount
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
 # -----------------------------
 # Read CSV
 # -----------------------------
+if (!(Test-Path $CsvPath)) {
+    Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
+    Exit
+}
+
 $Assignments = Import-Csv $CsvPath
+$TotalRows = $Assignments.Count
+
+Write-Host ""
+Write-Host "Found $TotalRows input records in CSV file." -ForegroundColor Cyan
+Write-Host "Starting processing..." -ForegroundColor Cyan
 
 $Results = @()
+$Counter = 1
 
-foreach ($Item in $Assignments)
-{
+foreach ($Item in $Assignments) {
     $SessionHostName = $Item.SessionHostName.Trim()
     $AssignedUser = $Item.AssignedUser.Trim()
-
+    
     Write-Host ""
-    Write-Host "Processing: $SessionHostName" -ForegroundColor Yellow
-
-    try
-    {
+    Write-Host "[$Counter/$TotalRows] Processing: $SessionHostName" -ForegroundColor Yellow
+    
+    try {
         # Verify User Exists
         $User = Get-AzADUser -UserPrincipalName $AssignedUser -ErrorAction Stop
-
+        
         # Get Session Host
         $SessionHost = Get-AzWvdSessionHost `
             -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
             -Name $SessionHostName `
             -ErrorAction Stop
-
-        # Check Existing Assignment
-        if (!:IsNullOrWhiteSpace($SessionHost.AssignedUser))
-        {
+        
+        # String validation
+        if (![string]::IsNullOrWhiteSpace($SessionHost.AssignedUser)) {
             $Status = "Skipped"
-
             $Message = "Already assigned to $($SessionHost.AssignedUser)"
-
             Write-Host "Skipped - Already assigned to $($SessionHost.AssignedUser)" -ForegroundColor Yellow
-        }
-        else
-        {
+        } else {
             Update-AzWvdSessionHost `
                 -ResourceGroupName $ResourceGroupName `
                 -HostPoolName $HostPoolName `
                 -Name $SessionHostName `
                 -AssignedUser $AssignedUser `
                 -ErrorAction Stop
-
+            
             $Status = "Success"
             $Message = "Assigned successfully"
-
             Write-Host "Assigned $AssignedUser" -ForegroundColor Green
         }
-    }
-    catch
-    {
+    } catch {
         $Status = "Failed"
         $Message = $_.Exception.Message
-
         Write-Host "Failed: $Message" -ForegroundColor Red
     }
-
+    
     $Results += [PSCustomObject]@{
-        TimeStamp       = Get-Date
+        Sequence        = $Counter
+        TimeStamp       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
         SessionHostName = $SessionHostName
         AssignedUser    = $AssignedUser
         Status          = $Status
         Message         = $Message
     }
+    
+    $Counter++
 }
 
 # -----------------------------
-# Export Results
+# Display Tabular Summary
 # -----------------------------
-$Results | Export-Csv $ReportFile -NoTypeInformation
-
-Stop-Transcript
-
 Write-Host ""
-Write-Host "==================================" -ForegroundColor Cyan
-Write-Host "Assignment process completed." -ForegroundColor Green
-Write-Host "Log File    : $LogFile"
-Write-Host "Report File : $ReportFile"
-Write-Host "==================================" -ForegroundColor Cyan
+Write-Host "========================================================================================" -ForegroundColor Cyan
+Write-Host "Assignment process completed. Total processed: $TotalRows" -ForegroundColor Green
+Write-Host "========================================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Display final metrics directly in the console window
+$Results | Format-Table -AutoSize
