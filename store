@@ -1,0 +1,76 @@
+param (
+    [string]$AppName = "notepad"
+)
+
+$repo = "\\smb.waunas23f.hcscint.net\infrastructure\Kotesh\store\$AppName"
+$temp = "C:\Temp\$AppName"
+$log  = "C:\Temp\$AppName-install.log"
+
+New-Item -Path $temp -ItemType Directory -Force | Out-Null
+New-Item -Path "C:\Temp" -ItemType Directory -Force | Out-Null
+
+Start-Transcript -Path $log -Append
+
+try {
+    Write-Host "====================================="
+    Write-Host "Provisioning $AppName for ALL USERS"
+    Write-Host "====================================="
+
+    # Copy files locally
+    Copy-Item -Path "$repo\*" -Destination $temp -Recurse -Force
+
+    # Get packages
+    $allPackages = Get-ChildItem -Path $temp -Recurse | Where-Object {
+        $_.Extension -in ".appx", ".appxbundle", ".msix", ".msixbundle"
+    }
+
+    if (-not $allPackages) {
+        throw "No installable packages found in $temp"
+    }
+
+    $dependencyPatterns = "VCLibs|UI.Xaml|NetNative|Framework|Runtime"
+    $dependencies = $allPackages | Where-Object { $_.Name -match $dependencyPatterns }
+    $appPackages  = $allPackages | Where-Object { $_.Name -notmatch $dependencyPatterns }
+
+    # Install dependencies (machine-wide context)
+    foreach ($dep in $dependencies) {
+        Write-Host "Installing dependency: $($dep.Name)"
+        Add-AppxPackage -Path $dep.FullName -ErrorAction SilentlyContinue
+    }
+
+    # Install app (current user first)
+    foreach ($pkg in $appPackages) {
+        Write-Host "Installing app (user context): $($pkg.Name)"
+        Add-AppxPackage -Path $pkg.FullName -ErrorAction Stop
+    }
+
+    # ✅ PROVISION for ALL USERS (future logins)
+    foreach ($pkg in $appPackages) {
+        Write-Host "Provisioning for all users: $($pkg.Name)"
+
+        Add-AppxProvisionedPackage -Online `
+            -PackagePath $pkg.FullName `
+            -SkipLicense `
+            -ErrorAction SilentlyContinue
+    }
+
+    # Validate
+    $installed = Get-AppxPackage -AllUsers | Where-Object {
+        $_.Name -eq "Microsoft.ScreenSketch"
+    }
+
+    if (-not $installed) {
+        throw "Provisioning completed but app not detected."
+    }
+
+    Write-Host "SUCCESS: $AppName provisioned for all users."
+
+    Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+catch {
+    Write-Host "ERROR: $($_.Exception.Message)"
+    exit 1
+}
+finally {
+    Stop-Transcript
+}
