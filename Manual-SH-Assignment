@@ -51,8 +51,7 @@ $Results = foreach ($Item in $Assignments) {
     $SessionHostName = $Item.SessionHostName.Trim()
     $AssignedUser = $Item.AssignedUser.Trim()
     
-    # Strip any domain extensions by selecting the first element of the split array
-    # This turns 'CAWw1ddd.adhcscint.net' into 'CAWw1ddd'
+    # Clean up the hostname by grabbing everything before the first period
     $ShortHostName = ($SessionHostName -split '\.')[0]
 
     # Combine the Host Pool Name with the clean, short computer name for Azure
