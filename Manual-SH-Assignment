@@ -1,0 +1,112 @@
+# ============================================================ #
+# AVD Personal Host Assignment Script (In-Memory / Clean Console)
+# ============================================================ #
+
+# -----------------------------
+# Environment Variables
+# -----------------------------
+$SubscriptionId = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
+$ResourceGroupName = "prd_scentral_avd_corp2_infra_rg"
+$HostPoolName = "AVD-CAS2-CORP2-SC"
+
+# Hardcoded CSV file
+$CsvPath = "C:\Temp\Assignments.csv"
+
+# -----------------------------
+# Connect to Azure
+# -----------------------------
+Write-Host ""
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+Connect-AzAccount
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+
+# -----------------------------
+# Read CSV
+# -----------------------------
+if (!(Test-Path $CsvPath)) {
+    Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
+    Exit
+}
+
+$Assignments = Import-Csv $CsvPath
+$TotalRows = $Assignments.Count
+
+Write-Host ""
+Write-Host "Found $TotalRows input records in CSV file." -ForegroundColor Cyan
+Write-Host "Starting processing..." -ForegroundColor Cyan
+
+$Results = @()
+$Counter = 1
+
+foreach ($Item in $Assignments) {
+    $SessionHostName = $Item.SessionHostName.Trim()
+    $AssignedUser = $Item.AssignedUser.Trim()
+    
+    try {
+        # Verify User Exists
+        $User = Get-AzADUser -UserPrincipalName $AssignedUser -ErrorAction Stop
+        
+        # Get Session Host
+        $SessionHost = Get-AzWvdSessionHost `
+            -ResourceGroupName $ResourceGroupName `
+            -HostPoolName $HostPoolName `
+            -Name $SessionHostName `
+            -ErrorAction Stop
+        
+        # String validation compatible with PowerShell 5.1
+        if (![string]::IsNullOrWhiteSpace($SessionHost.AssignedUser)) {
+            $Status = "Skipped"
+            $Message = "Already assigned to $($SessionHost.AssignedUser)"
+        } else {
+            # Added | Out-Null to suppress the verbose Azure object property dump
+            Update-AzWvdSessionHost `
+                -ResourceGroupName $ResourceGroupName `
+                -HostPoolName $HostPoolName `
+                -Name $SessionHostName `
+                -AssignedUser $AssignedUser `
+                -ErrorAction Stop | Out-Null
+            
+            $Status = "Success"
+            $Message = "Assigned successfully"
+        }
+    } catch {
+        $Status = "Failed"
+        $Message = $_.Exception.Message
+    }
+    
+    # Safe color logic assignment block for Windows PowerShell 5.1
+    if ($Status -eq "Success") {
+        $TextColor = "Green"
+    } elseif ($Status -eq "Skipped") {
+        $TextColor = "Yellow"
+    } else {
+        $TextColor = "Red"
+    }
+
+    # Clean live tracking message pairing host to target identity
+    Write-Host "[$Counter/$TotalRows] $SessionHostName -> $AssignedUser ($Status)" -ForegroundColor $TextColor
+
+    # Track data metrics internally in memory
+    $Results += [PSCustomObject]@{
+        Sequence        = $Counter
+        TimeStamp       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        SessionHostName = $SessionHostName
+        AssignedUser    = $AssignedUser
+        Status          = $Status
+        Message         = $Message
+    }
+    
+    $Counter++
+}
+
+# -----------------------------
+# Display Tabular Summary
+# -----------------------------
+Write-Host ""
+Write-Host "========================================================================================" -ForegroundColor Cyan
+Write-Host "Assignment process completed. Total processed: $TotalRows" -ForegroundColor Green
+Write-Host "========================================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Output final compiled tabular matrix metrics onto console window
+$Results | Format-Table -AutoSize
