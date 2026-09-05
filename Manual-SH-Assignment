@@ -27,7 +27,12 @@ if (!(Test-Path $CsvPath)) {
 # Connect to Azure
 # -----------------------------
 Write-Host ""
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+Write-Host "Clearing stale sessions and connecting to Azure..." -ForegroundColor Cyan
+
+# Force clear any stuck or expired auth tokens
+Clear-AzContext -Force -ErrorAction SilentlyContinue
+
+# Trigger a fresh authentication prompt
 Connect-AzAccount -WarningAction SilentlyContinue
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
@@ -46,8 +51,8 @@ $Results = foreach ($Item in $Assignments) {
     $SessionHostName = $Item.SessionHostName.Trim()
     $AssignedUser = $Item.AssignedUser.Trim()
     
-    # Strip any domain extensions (grabs everything before the first dot)
-    # This safely turns 'CAWw1ddd.adhcscint.net' into 'CAWw1ddd'
+    # Strip any domain extensions by selecting the first element of the split array
+    # This turns 'CAWw1ddd.adhcscint.net' into 'CAWw1ddd'
     $ShortHostName = ($SessionHostName -split '\.')[0]
 
     # Combine the Host Pool Name with the clean, short computer name for Azure
