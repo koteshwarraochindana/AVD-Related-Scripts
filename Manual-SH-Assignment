@@ -1,17 +1,17 @@
 # ============================================================ #
-# AVD Personal Host Assignment Script (Optimized & Fixed)     #
+# AVD Personal Host Assignment Script (Final Working Build)   #
 # ============================================================ #
 
 # -----------------------------
-# Environment Variables
+# Configuration
 # -----------------------------
-$SubscriptionId = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
+$SubscriptionId   = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
 $ResourceGroupName = "prd_scentral_avd_corp2_infra_rg"
-$HostPoolName = "AVD-CAS2-CORP2-SC"
-$CsvPath = "C:\Temp\Assignments.csv"
+$HostPoolName      = "AVD-CAS2-CORP2-SC"
+$CsvPath           = "C:\Temp\Assignments.csv"
 
 # -----------------------------
-# Prerequisite Check
+# Pre-Run Checks
 # -----------------------------
 if (!(Get-Module -ListAvailable -Name Az.DesktopVirtualization, Az.Resources)) {
     Write-Host "Error: Required Azure PowerShell modules are missing." -ForegroundColor Red
@@ -19,56 +19,51 @@ if (!(Get-Module -ListAvailable -Name Az.DesktopVirtualization, Az.Resources)) {
 }
 
 if (!(Test-Path $CsvPath)) {
-    Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
+    Write-Host "Error: CSV file not found at $CsvPath" -ForegroundColor Red
     Return
 }
 
 # -----------------------------
-# Connect to Azure
+# Azure Authentication
 # -----------------------------
 Write-Host ""
-Write-Host "Clearing stale sessions and connecting to Azure..." -ForegroundColor Cyan
-
-# Force clear any stuck or expired auth tokens
-Clear-AzContext -Force -ErrorAction SilentlyContinue
-
-# Trigger a fresh authentication prompt
-Connect-AzAccount -WarningAction SilentlyContinue
-Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+Write-Host "Connecting to Azure Subscription..." -ForegroundColor Cyan
+Select-AzSubscription -SubscriptionId $SubscriptionId | Out-Null
 
 # -----------------------------
-# Process CSV
+# Process Input Data
 # -----------------------------
 $Assignments = Import-Csv $CsvPath
-$TotalRows = $Assignments.Count
-$Counter = 1
+$TotalRows   = $Assignments.Count
+$Counter     = 1
 
 Write-Host ""
-Write-Host "Found $TotalRows input records in CSV file. Starting processing..." -ForegroundColor Cyan
+Write-Host "Processing $TotalRows records from your CSV list..." -ForegroundColor Cyan
+Write-Host "--------------------------------------------------------" -ForegroundColor Cyan
 
-# Assigning loop directly to variable prevents array rebuild slowness
 $Results = foreach ($Item in $Assignments) {
-    $SessionHostName = $Item.SessionHostName.Trim()
+    # Clean input strings
+    $RawHostName = $Item.SessionHostName.Trim()
     $AssignedUser = $Item.AssignedUser.Trim()
     
-    # Clean up the hostname by grabbing everything before the first period
-    $ShortHostName = ($SessionHostName -split '\.')[0]
+    # Strip domain suffix safely (turns machine.domain.net into machine)
+    $ShortHostName = $RawHostName.Split('.')[0]
 
-    # Combine the Host Pool Name with the clean, short computer name for Azure
+    # Format the exact target path Azure requires
     $FullHostName = "$HostPoolName/$ShortHostName"
 
     try {
-        # Verify User Exists
+        # 1. Verify User exists in Azure Active Directory
         $User = Get-AzADUser -UserPrincipalName $AssignedUser -ErrorAction Stop
 
-        # Get Session Host
+        # 2. Get the current Session Host status
         $SessionHost = Get-AzWvdSessionHost `
             -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
             -Name $FullHostName `
             -ErrorAction Stop
 
-        # Check existing assignments
+        # 3. Handle Assignment checking and writing
         if (![string]::IsNullOrWhiteSpace($SessionHost.AssignedUser)) {
             $Status = "Skipped"
             $Message = "Already assigned to $($SessionHost.AssignedUser)"
@@ -87,21 +82,23 @@ $Results = foreach ($Item in $Assignments) {
         $Message = $_.Exception.Message
     }
 
-    # Color assignment
-    $TextColor = switch ($Status) {
+    # Color customization for live logs
+    $LineColor = switch ($Status) {
         "Success" { "Green" }
         "Skipped" { "Yellow" }
         Default   { "Red" }
     }
 
-    Write-Host "[$Counter/$TotalRows] $SessionHostName -> $AssignedUser ($Status)" -ForegroundColor $TextColor
+    # Print live status message
+    Write-Host "[$Counter/$TotalRows] $ShortHostName -> $AssignedUser ($Status)" -ForegroundColor $LineColor
     $Counter++
 
-    # Output object directly to the $Results collection
+    # Send object data to final summary matrix collection
     [PSCustomObject]@{
         Sequence        = $Counter - 1
         TimeStamp       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        SessionHostName = $SessionHostName
+        SessionHostName = $RawHostName
+        CleanHostName   = $ShortHostName
         AssignedUser    = $AssignedUser
         Status          = $Status
         Message         = $Message
@@ -109,12 +106,12 @@ $Results = foreach ($Item in $Assignments) {
 }
 
 # -----------------------------
-# Display Tabular Summary
+# Print Final Log Table
 # -----------------------------
 Write-Host ""
 Write-Host "========================================================================================" -ForegroundColor Cyan
-Write-Host "Assignment process completed. Total processed: $TotalRows" -ForegroundColor Green
+Write-Host "Process Finished! Total Processed Rows: $TotalRows" -ForegroundColor Green
 Write-Host "========================================================================================" -ForegroundColor Cyan
 Write-Host ""
 
-$Results | Format-Table -AutoSize
+$Results | Format-Table -Property Sequence, TimeStamp, CleanHostName, AssignedUser, Status, Message -AutoSize
