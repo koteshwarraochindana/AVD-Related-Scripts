@@ -46,12 +46,12 @@ $Results = foreach ($Item in $Assignments) {
     $SessionHostName = $Item.SessionHostName.Trim()
     $AssignedUser = $Item.AssignedUser.Trim()
     
-    # Ensure correct AVD format (HostPoolName/ComputerName)
-    if ($SessionHostName -notmatch "^$HostPoolName/") {
-        $FullHostName = "$HostPoolName/$SessionHostName"
-    } else {
-        $FullHostName = $SessionHostName
-    }
+    # Strip any domain extensions (grabs everything before the first dot)
+    # This safely turns 'CAWw1ddd.adhcscint.net' into 'CAWw1ddd'
+    $ShortHostName = ($SessionHostName -split '\.')[0]
+
+    # Combine the Host Pool Name with the clean, short computer name for Azure
+    $FullHostName = "$HostPoolName/$ShortHostName"
 
     try {
         # Verify User Exists
