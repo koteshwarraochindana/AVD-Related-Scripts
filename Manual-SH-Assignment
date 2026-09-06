@@ -1,54 +1,90 @@
 # ============================================================
-# AVD Personal Host Pool - Bulk Session Host Assignment
+# AVD Personal Host Pool - CSV Based Bulk Assignment
+# ============================================================
+#
+# CSV format:
+#
+# SessionHostName,UserEmail
+# CAWV1abc,user1@company.com
+# CAWV1def,user2@company.com
+#
+# The CSV is the source of truth.
+#
+# This script:
+#   1. Reads SessionHostName and UserEmail from CSV
+#   2. Finds the session host in the specified host pool
+#   3. Assigns the CSV UserEmail to that session host
+#   4. Exports success/failure results
+#
+# This script does NOT:
+#   - Validate the user in Entra ID
+#   - Check AD group membership
+#   - Check assignment group membership
+#   - Discover the user's current assignment
+#   - Select a user automatically
+#
 # ============================================================
 
-# -----------------------------
+
+# ------------------------------------------------------------
 # Configuration
-# -----------------------------
+# ------------------------------------------------------------
+
 $SubscriptionId    = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
 $ResourceGroupName = "prd_scentral_avd_corp2_infra_rg"
 $HostPoolName      = "AVD-CAS2-CORP2-SC"
+
 $CsvPath           = "C:\Temp\Assignments.csv"
 $OutputPath        = "C:\Temp\AVD_Assignment_Results.csv"
 
 
-# -----------------------------
-# Validate Module
-# -----------------------------
+# ------------------------------------------------------------
+# Validate Az.DesktopVirtualization module
+# ------------------------------------------------------------
+
 if (-not (Get-Module -ListAvailable -Name Az.DesktopVirtualization)) {
 
     Write-Host ""
     Write-Host "ERROR: Az.DesktopVirtualization module is not installed." `
         -ForegroundColor Red
 
-    exit
+    exit 1
 }
 
+Import-Module Az.DesktopVirtualization -ErrorAction Stop
 
-# -----------------------------
+
+# ------------------------------------------------------------
 # Validate CSV
-# -----------------------------
-if (-not (Test-Path $CsvPath)) {
+# ------------------------------------------------------------
+
+if (-not (Test-Path -Path $CsvPath)) {
 
     Write-Host ""
-    Write-Host "ERROR: CSV file not found:" -ForegroundColor Red
-    Write-Host $CsvPath -ForegroundColor Yellow
+    Write-Host "ERROR: CSV file not found:" `
+        -ForegroundColor Red
 
-    exit
+    Write-Host $CsvPath `
+        -ForegroundColor Yellow
+
+    exit 1
 }
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Select Azure Subscription
-# -----------------------------
+# ------------------------------------------------------------
+
 Write-Host ""
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
+Write-Host "Selecting Azure subscription..." `
+    -ForegroundColor Cyan
 
 try {
 
     Set-AzContext `
         -SubscriptionId $SubscriptionId `
-        -ErrorAction Stop | Out-Null
+        -ErrorAction Stop |
+        Out-Null
 
     Write-Host "Azure subscription selected successfully." `
         -ForegroundColor Green
@@ -59,64 +95,93 @@ catch {
     Write-Host "ERROR: Unable to select Azure subscription." `
         -ForegroundColor Red
 
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Red
 
-    exit
+    exit 1
 }
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Import CSV
-# -----------------------------
-$Assignments = Import-Csv -Path $CsvPath
+# ------------------------------------------------------------
 
-if (-not $Assignments -or $Assignments.Count -eq 0) {
+try {
+
+    $Assignments = @(Import-Csv -Path $CsvPath -ErrorAction Stop)
+}
+catch {
+
+    Write-Host ""
+    Write-Host "ERROR: Unable to read CSV." `
+        -ForegroundColor Red
+
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Red
+
+    exit 1
+}
+
+
+if ($Assignments.Count -eq 0) {
 
     Write-Host ""
     Write-Host "ERROR: CSV contains no records." `
         -ForegroundColor Red
 
-    exit
+    exit 1
 }
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Validate CSV Columns
-# -----------------------------
+# ------------------------------------------------------------
+
 $Columns = $Assignments[0].PSObject.Properties.Name
+
 
 if ($Columns -notcontains "SessionHostName") {
 
     Write-Host ""
-    Write-Host "ERROR: CSV must contain column: SessionHostName" `
+    Write-Host "ERROR: CSV must contain:" `
         -ForegroundColor Red
 
-    exit
+    Write-Host "SessionHostName" `
+        -ForegroundColor Yellow
+
+    exit 1
 }
+
 
 if ($Columns -notcontains "UserEmail") {
 
     Write-Host ""
-    Write-Host "ERROR: CSV must contain column: UserEmail" `
+    Write-Host "ERROR: CSV must contain:" `
         -ForegroundColor Red
 
-    exit
+    Write-Host "UserEmail" `
+        -ForegroundColor Yellow
+
+    exit 1
 }
 
 
-# -----------------------------
-# Retrieve All Session Hosts
-# -----------------------------
+# ------------------------------------------------------------
+# Retrieve Session Hosts
+# ------------------------------------------------------------
+
 Write-Host ""
 Write-Host "Retrieving session hosts from host pool..." `
     -ForegroundColor Cyan
 
 try {
 
-    $SessionHosts = Get-AzWvdSessionHost `
-        -ResourceGroupName $ResourceGroupName `
-        -HostPoolName $HostPoolName `
-        -ErrorAction Stop
+    $SessionHosts = @(
+        Get-AzWvdSessionHost `
+            -ResourceGroupName $ResourceGroupName `
+            -HostPoolName $HostPoolName `
+            -ErrorAction Stop
+    )
 }
 catch {
 
@@ -124,136 +189,137 @@ catch {
     Write-Host "ERROR: Unable to retrieve session hosts." `
         -ForegroundColor Red
 
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Red
 
-    exit
+    exit 1
 }
 
+
+Write-Host ""
 Write-Host "Session hosts found: $($SessionHosts.Count)" `
     -ForegroundColor Green
 
 
-# -----------------------------
-# Process CSV
-# -----------------------------
+# ------------------------------------------------------------
+# Prepare Results
+# ------------------------------------------------------------
+
 $Results = @()
 
 $TotalRows = $Assignments.Count
-$Counter = 0
+$Counter   = 0
+
 
 Write-Host ""
-Write-Host "Starting assignment process..." `
+Write-Host "============================================================" `
     -ForegroundColor Cyan
 
-Write-Host "============================================================"
+Write-Host "Starting CSV based assignment..." `
+    -ForegroundColor Cyan
 
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
+
+
+# ------------------------------------------------------------
+# Process CSV
+# ------------------------------------------------------------
 
 foreach ($Item in $Assignments) {
 
     $Counter++
 
-    # -----------------------------
+
+    # --------------------------------------------------------
     # Read CSV values
-    # -----------------------------
-    $RawHostName = if ($null -ne $Item.SessionHostName) {
-        $Item.SessionHostName.Trim()
-    }
-    else {
-        ""
-    }
+    # --------------------------------------------------------
 
-    $UserEmail = if ($null -ne $Item.UserEmail) {
-        $Item.UserEmail.Trim()
-    }
-    else {
-        ""
+    $RawHostName = ""
+
+    if ($null -ne $Item.SessionHostName) {
+        $RawHostName = $Item.SessionHostName.ToString().Trim()
     }
 
 
-    # -----------------------------
-    # Remove FQDN from CSV
-    # -----------------------------
-    $ShortHostName = ($RawHostName -split "\.")[0]
+    $UserEmail = ""
 
+    if ($null -ne $Item.UserEmail) {
+        $UserEmail = $Item.UserEmail.ToString().Trim()
+    }
+
+
+    # --------------------------------------------------------
+    # Normalize Session Host Name
+    #
+    # Supported CSV examples:
+    #
+    # CAWV1abc
+    # CAWV1abc.domain.com
+    # AVD-CAS2-CORP2-SC/CAWV1abc.domain.com
+    #
+    # Result:
+    #
+    # CAWV1abc
+    # --------------------------------------------------------
+
+    $ShortHostName = $RawHostName
+
+
+    if ($ShortHostName -match "/") {
+        $ShortHostName = ($ShortHostName -split "/")[-1]
+    }
+
+
+    if ($ShortHostName -match "\.") {
+        $ShortHostName = ($ShortHostName -split "\.")[0]
+    }
+
+
+    $ShortHostName = $ShortHostName.Trim()
+
+
+    # --------------------------------------------------------
+    # Display current CSV row
+    # --------------------------------------------------------
 
     Write-Host ""
-    Write-Host "[$Counter/$TotalRows] $ShortHostName -> $UserEmail" `
+    Write-Host "[$Counter/$TotalRows]" `
         -ForegroundColor Cyan
 
+    Write-Host "Session Host : $ShortHostName"
+    Write-Host "User Email   : $UserEmail"
 
-    # -----------------------------
-    # Validate CSV values
-    # -----------------------------
+
+    # --------------------------------------------------------
+    # Validate SessionHostName
+    # --------------------------------------------------------
+
     if ([string]::IsNullOrWhiteSpace($ShortHostName)) {
 
-        Write-Host "SKIPPED - Session host name is empty." `
-            -ForegroundColor Yellow
+        Write-Host "FAILED - SessionHostName is empty." `
+            -ForegroundColor Red
 
         $Results += [PSCustomObject]@{
             Sequence        = $Counter
             TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             SessionHostName = $RawHostName
             UserEmail       = $UserEmail
-            CurrentAssigned = ""
-            Status          = "Skipped"
-            Message         = "Session host name is empty"
+            Status          = "Failed"
+            Message         = "SessionHostName is empty"
         }
 
         continue
     }
 
+
+    # --------------------------------------------------------
+    # Validate UserEmail
+    # --------------------------------------------------------
 
     if ([string]::IsNullOrWhiteSpace($UserEmail)) {
 
-        Write-Host "SKIPPED - User email is empty." `
-            -ForegroundColor Yellow
-
-        $Results += [PSCustomObject]@{
-            Sequence        = $Counter
-            TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            SessionHostName = $ShortHostName
-            UserEmail       = $UserEmail
-            CurrentAssigned = ""
-            Status          = "Skipped"
-            Message         = "User email is empty"
-        }
-
-        continue
-    }
-
-
-    # -----------------------------
-    # Find Session Host
-    # -----------------------------
-    # Azure may return:
-    #
-    # AVD-CAS2-CORP2-SC/CAWV1ddd.adhcscint.net
-    #
-    # CSV may contain:
-    #
-    # CAWV1ddd
-    #
-    # Normalize both to:
-    #
-    # CAWV1ddd
-    # -----------------------------
-
-    $TargetHost = $SessionHosts | Where-Object {
-
-        $AzureSessionHostName = ($_.Name -split "/")[-1]
-
-        $AzureShortHostName = ($AzureSessionHostName -split "\.")[0]
-
-        $AzureShortHostName -ieq $ShortHostName
-    }
-
-
-    # -----------------------------
-    # Session Host Not Found
-    # -----------------------------
-    if (-not $TargetHost) {
-
-        Write-Host "FAILED - Session host not found." `
+        Write-Host "FAILED - UserEmail is empty." `
             -ForegroundColor Red
 
         $Results += [PSCustomObject]@{
@@ -261,7 +327,59 @@ foreach ($Item in $Assignments) {
             TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             SessionHostName = $ShortHostName
             UserEmail       = $UserEmail
-            CurrentAssigned = ""
+            Status          = "Failed"
+            Message         = "UserEmail is empty"
+        }
+
+        continue
+    }
+
+
+    # --------------------------------------------------------
+    # Find Session Host
+    # --------------------------------------------------------
+    #
+    # Azure commonly returns:
+    #
+    # AVD-CAS2-CORP2-SC/CAWV1abc.domain.com
+    #
+    # We compare only:
+    #
+    # CAWV1abc
+    #
+    # --------------------------------------------------------
+
+    $TargetHost = $SessionHosts |
+        Where-Object {
+
+            $AzureSessionHostName = ($_.Name -split "/")[-1]
+
+            $AzureShortHostName = ($AzureSessionHostName -split "\.")[0]
+
+            $AzureShortHostName -ieq $ShortHostName
+
+        } |
+        Select-Object -First 1
+
+
+    # --------------------------------------------------------
+    # Session Host Not Found
+    # --------------------------------------------------------
+
+    if (-not $TargetHost) {
+
+        Write-Host ""
+        Write-Host "FAILED - Session host not found in host pool." `
+            -ForegroundColor Red
+
+        Write-Host "CSV Session Host: $ShortHostName" `
+            -ForegroundColor Yellow
+
+        $Results += [PSCustomObject]@{
+            Sequence        = $Counter
+            TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            SessionHostName = $ShortHostName
+            UserEmail       = $UserEmail
             Status          = "Failed"
             Message         = "Session host not found in host pool"
         }
@@ -270,59 +388,56 @@ foreach ($Item in $Assignments) {
     }
 
 
-    # -----------------------------
-    # Get Current Assignment
-    # -----------------------------
-    $CurrentAssigned = $TargetHost.AssignedUser
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Get-AzWvdSessionHost returns Name similar to:
+    #
+    # AVD-CAS2-CORP2-SC/CAWV1abc.domain.com
+    #
+    # Update-AzWvdSessionHost -Name must receive:
+    #
+    # CAWV1abc.domain.com
+    #
+    # NOT:
+    #
+    # AVD-CAS2-CORP2-SC/CAWV1abc.domain.com
+    #
+    # --------------------------------------------------------
+
+    $SessionHostResourceName = ($TargetHost.Name -split "/")[-1]
 
 
-    # -----------------------------
-    # NEVER overwrite existing user
-    # -----------------------------
-    if (-not [string]::IsNullOrWhiteSpace($CurrentAssigned)) {
+    Write-Host ""
+    Write-Host "Azure Session Host : $SessionHostResourceName" `
+        -ForegroundColor DarkGray
 
-        Write-Host "SKIPPED - Already assigned to $CurrentAssigned" `
-            -ForegroundColor Yellow
-
-        $Results += [PSCustomObject]@{
-            Sequence        = $Counter
-            TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            SessionHostName = $ShortHostName
-            UserEmail       = $UserEmail
-            CurrentAssigned = $CurrentAssigned
-            Status          = "Skipped"
-            Message         = "Session host already has an assigned user. No changes made."
-        }
-
-        continue
-    }
+    Write-Host "Assigning user..." `
+        -ForegroundColor Cyan
 
 
-    # -----------------------------
-    # Assign User
-    # -----------------------------
+    # --------------------------------------------------------
+    # ASSIGN USER
+    # --------------------------------------------------------
+
     try {
-
-        # Use the exact Azure resource name returned by Azure.
-        # This avoids FQDN/name-format issues.
-        $SessionHostResourceName = $TargetHost.Name
 
         Update-AzWvdSessionHost `
             -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
             -Name $SessionHostResourceName `
             -AssignedUser $UserEmail `
+            -Force `
             -ErrorAction Stop |
             Out-Null
 
 
-        Write-Host "SUCCESS - Assigned to $UserEmail" `
+        Write-Host ""
+        Write-Host "SUCCESS" `
             -ForegroundColor Green
 
-
-        # Update local object so that if the same host
-        # appears twice in the CSV, it won't be assigned twice.
-        $TargetHost.AssignedUser = $UserEmail
+        Write-Host "$ShortHostName -> $UserEmail" `
+            -ForegroundColor Green
 
 
         $Results += [PSCustomObject]@{
@@ -330,7 +445,6 @@ foreach ($Item in $Assignments) {
             TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             SessionHostName = $ShortHostName
             UserEmail       = $UserEmail
-            CurrentAssigned = ""
             Status          = "Success"
             Message         = "Session host assigned successfully"
         }
@@ -338,10 +452,14 @@ foreach ($Item in $Assignments) {
     }
     catch {
 
+        $ErrorMessage = $_.Exception.Message
+
+
+        Write-Host ""
         Write-Host "FAILED - Assignment failed." `
             -ForegroundColor Red
 
-        Write-Host $_.Exception.Message `
+        Write-Host $ErrorMessage `
             -ForegroundColor Red
 
 
@@ -350,61 +468,95 @@ foreach ($Item in $Assignments) {
             TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             SessionHostName = $ShortHostName
             UserEmail       = $UserEmail
-            CurrentAssigned = ""
             Status          = "Failed"
-            Message         = $_.Exception.Message
+            Message         = $ErrorMessage
         }
     }
 }
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Export Results
-# -----------------------------
-Write-Host ""
-Write-Host "============================================================"
-Write-Host "Assignment Process Completed" `
-    -ForegroundColor Green
-Write-Host "============================================================"
-
-
-$Results |
-    Export-Csv `
-        -Path $OutputPath `
-        -NoTypeInformation `
-        -Encoding UTF8
-
-
-# -----------------------------
-# Summary
-# -----------------------------
-$SuccessCount = @(
-    $Results | Where-Object { $_.Status -eq "Success" }
-).Count
-
-$SkippedCount = @(
-    $Results | Where-Object { $_.Status -eq "Skipped" }
-).Count
-
-$FailedCount = @(
-    $Results | Where-Object { $_.Status -eq "Failed" }
-).Count
-
+# ------------------------------------------------------------
 
 Write-Host ""
-Write-Host "                    SUMMARY" `
+Write-Host "============================================================" `
     -ForegroundColor Cyan
 
-Write-Host "------------------------------------------------------------"
+Write-Host "Assignment Process Completed" `
+    -ForegroundColor Green
+
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
+
+
+try {
+
+    $Results |
+        Export-Csv `
+            -Path $OutputPath `
+            -NoTypeInformation `
+            -Encoding UTF8 `
+            -Force
+
+    Write-Host ""
+    Write-Host "Results exported to:" `
+        -ForegroundColor Cyan
+
+    Write-Host $OutputPath `
+        -ForegroundColor White
+}
+catch {
+
+    Write-Host ""
+    Write-Host "WARNING: Unable to export results CSV." `
+        -ForegroundColor Yellow
+
+    Write-Host $_.Exception.Message `
+        -ForegroundColor Yellow
+}
+
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+$SuccessCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "Success"
+        }
+).Count
+
+
+$FailedCount = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "Failed"
+        }
+).Count
+
+
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Cyan
+
+Write-Host "                         SUMMARY" `
+    -ForegroundColor Cyan
+
+Write-Host "============================================================"
 
 Write-Host "Total Records : $TotalRows"
 Write-Host "Successful    : $SuccessCount" -ForegroundColor Green
-Write-Host "Skipped       : $SkippedCount" -ForegroundColor Yellow
 Write-Host "Failed        : $FailedCount" -ForegroundColor Red
 
-Write-Host "------------------------------------------------------------"
+Write-Host "============================================================"
 
 Write-Host ""
-Write-Host "Results exported to:" -ForegroundColor Cyan
-Write-Host $OutputPath -ForegroundColor White
+Write-Host "Results file:" `
+    -ForegroundColor Cyan
+
+Write-Host $OutputPath `
+    -ForegroundColor White
+
 Write-Host ""
