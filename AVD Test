@@ -134,3 +134,7 @@ if ($Commit) {
 }
 
 $Results | Format-Table -AutoSize
+
+-----------------------------------------------------
+
+& "C:\Users\U579652\Downloads\scripts\AD Related Scripts\remove-members-from-sg.ps1" -Commit
