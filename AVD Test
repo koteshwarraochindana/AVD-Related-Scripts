@@ -2,52 +2,62 @@ Import-Module ActiveDirectory
 
 $GroupName = "MSAZURE_PROD_AVD_CORP2_CAS2_SC"
 $UserFile  = "C:\Temp\UsersToRemove.txt"
-$LogFile   = "C:\Temp\DryRunResults.csv"
+
+# Make sure the file exists first
+if (-not (Test-Path $UserFile)) {
+    Write-Error "Cannot find the file at $UserFile"
+    return
+}
 
 $Users = Get-Content $UserFile
-$Results = @()
+
+# Fetch group members once before starting the loop
+try {
+    Write-Host "Fetching group members for $GroupName..." -ForegroundColor Yellow
+    $GroupMembers = Get-ADGroupMember -Identity $GroupName -Recursive | Select-Object -ExpandProperty SamAccountName
+} catch {
+    Write-Error "Could not find or read group: $GroupName. Script stopping."
+    return
+}
+
+# Create a list to hold the report data
+$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+Write-Host "Processing users. Please wait..." -ForegroundColor Yellow
 
 foreach ($User in $Users) {
-
     try {
-
-        # If value contains @, treat it as UPN/email
+        # Check if the input is a UPN (contains @)
         if ($User -match "@") {
             $ADUser = Get-ADUser -Filter "UserPrincipalName -eq '$User'" -Properties UserPrincipalName -ErrorAction Stop
-        }
-        else {
+        } else {
             $ADUser = Get-ADUser -Identity $User -ErrorAction Stop
         }
 
-        if (Get-ADGroupMember $GroupName -Recursive | Where-Object { $_.SamAccountName -eq $ADUser.SamAccountName }) {
-
-            Write-Host "[DRY RUN] Would remove: $($ADUser.SamAccountName)" -ForegroundColor Cyan
-
-            $Results += [PSCustomObject]@{
+        # Check if the user is in our pre-fetched list
+        if ($GroupMembers -contains $ADUser.SamAccountName) {
+            $Results.Add([PSCustomObject]@{
                 InputValue     = $User
                 SamAccountName = $ADUser.SamAccountName
                 Status         = "Would Remove"
-            }
-        }
-        else {
-
-            $Results += [PSCustomObject]@{
+            })
+        } else {
+            $Results.Add([PSCustomObject]@{
                 InputValue     = $User
                 SamAccountName = $ADUser.SamAccountName
                 Status         = "Not Found in Group"
-            }
+            })
         }
-    }
+    } 
     catch {
-
-        $Results += [PSCustomObject]@{
+        $Results.Add([PSCustomObject]@{
             InputValue     = $User
-            SamAccountName = ""
-            Status         = "User Not Found"
-        }
+            SamAccountName = "N/A"
+            Status         = "User Not Found in AD"
+        })
     }
 }
 
-$Results | Export-Csv $LogFile -NoTypeInformation
-
-Write-Host "Dry run completed. Results exported to $LogFile" -ForegroundColor Green
+# Print the final report right to the console window
+Write-Host "`n======================= DRY RUN SUMMARY REPORT =======================" -ForegroundColor Green
+$Results | Format-Table -AutoSize
