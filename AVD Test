@@ -63,3 +63,74 @@ foreach ($User in $Users) {
 # Print the final report right to the console window
 Write-Host "`n======================= DRY RUN SUMMARY REPORT =======================" -ForegroundColor Green
 $Results | Format-Table -AutoSize
+
+-------------------------------------------------
+
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$false)]
+    [switch]$Commit
+)
+
+Import-Module ActiveDirectory
+
+$GroupName = "MSAZURE_PROD_AVD_CORP2_CAS2_SC"
+$UserFile  = "C:\Temp\UsersToRemove.txt"
+
+if (-not (Test-Path $UserFile)) {
+    Write-Error "Cannot find the file at $UserFile"
+    return
+}
+
+$Users = Get-Content $UserFile
+
+try {
+    Write-Host "Fetching group object..." -ForegroundColor Yellow
+    $GroupDN = (Get-ADGroup -Identity $GroupName).DistinguishedName
+    
+    Write-Host "Safely scanning nested group members..." -ForegroundColor Yellow
+    $GroupMembers = Get-ADUser -Filter "memberOf -RecursiveMatch '$GroupDN'" | Select-Object -ExpandProperty SamAccountName
+} catch {
+    Write-Error "Could not read group '$GroupName'. Check your connection to the Domain Controller."
+    return
+}
+
+$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($User in $Users) {
+    try {
+        if ($User -match "@") {
+            $ADUser = Get-ADUser -Filter "UserPrincipalName -eq '$User'" -ErrorAction Stop
+        } else {
+            $ADUser = Get-ADUser -Identity $User -ErrorAction Stop
+        }
+
+        if ($GroupMembers -contains $ADUser.SamAccountName) {
+            if ($Commit) {
+                # REAL ACTION: Removes the user from the parent group
+                Remove-ADGroupMember -Identity $GroupName -Members $ADUser.SamAccountName -Confirm:$false
+                $StatusAction = "REMOVED FROM GROUP"
+            } else {
+                # DRY RUN MODE
+                $StatusAction = "Would Remove (Dry Run)"
+            }
+            $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = $ADUser.SamAccountName; Status = $StatusAction })
+        } else {
+            $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = $ADUser.SamAccountName; Status = "Not Found in Group" })
+        }
+    } 
+    catch {
+        $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = "N/A"; Status = "User Not Found in AD" })
+    }
+}
+
+# Print the final report right to the screen
+if ($Commit) {
+    Write-Host "`n======================= LIVE REMOVAL SUMMARY REPORT =======================" -ForegroundColor Green
+} else {
+    Write-Host "`n======================= DRY RUN SUMMARY REPORT =======================" -ForegroundColor Cyan
+    Write-Host "NOTE: No changes were made. Run with -Commit to apply changes." -ForegroundColor Yellow
+}
+
+$Results | Format-Table -AutoSize
