@@ -11,12 +11,16 @@ if (-not (Test-Path $UserFile)) {
 
 $Users = Get-Content $UserFile
 
-# Fetch group members once before starting the loop
+# Fetch group members using the safer -RecursiveMatch filter
 try {
-    Write-Host "Fetching group members for $GroupName..." -ForegroundColor Yellow
-    $GroupMembers = Get-ADGroupMember -Identity $GroupName -Recursive | Select-Object -ExpandProperty SamAccountName
+    Write-Host "Fetching group object..." -ForegroundColor Yellow
+    $GroupDN = (Get-ADGroup -Identity $GroupName).DistinguishedName
+    
+    Write-Host "Safely scanning nested group members..." -ForegroundColor Yellow
+    # This bypasses the Get-ADGroupMember bug completely
+    $GroupMembers = Get-ADUser -Filter "memberOf -RecursiveMatch '$GroupDN'" | Select-Object -ExpandProperty SamAccountName
 } catch {
-    Write-Error "Could not find or read group: $GroupName. Script stopping."
+    Write-Error "Could not read group '$GroupName'. Check your connection to the Domain Controller."
     return
 }
 
@@ -27,14 +31,12 @@ Write-Host "Processing users. Please wait..." -ForegroundColor Yellow
 
 foreach ($User in $Users) {
     try {
-        # Check if the input is a UPN (contains @)
         if ($User -match "@") {
             $ADUser = Get-ADUser -Filter "UserPrincipalName -eq '$User'" -Properties UserPrincipalName -ErrorAction Stop
         } else {
             $ADUser = Get-ADUser -Identity $User -ErrorAction Stop
         }
 
-        # Check if the user is in our pre-fetched list
         if ($GroupMembers -contains $ADUser.SamAccountName) {
             $Results.Add([PSCustomObject]@{
                 InputValue     = $User
