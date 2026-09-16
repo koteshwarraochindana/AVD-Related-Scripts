@@ -1,140 +1,300 @@
-Import-Module ActiveDirectory
+# ============================================================
+# AVD Personal Desktop Migration Tool
+# Same Host Pool - Domain Swap
+#
+# adhcscint.net <--> prd.hcscad.net
+# ============================================================
 
-$GroupName = "MSAZURE_PROD_AVD_CORP2_CAS2_SC"
-$UserFile  = "C:\Temp\UsersToRemove.txt"
+# ------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------
 
-# Make sure the file exists first
-if (-not (Test-Path $UserFile)) {
-    Write-Error "Cannot find the file at $UserFile"
-    return
-}
+$SubscriptionId    = "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
+$ResourceGroupName = "PRD_NCentral_AVD_Corp4_Infra_RG"
+$HostPoolName      = "AVD-CAS-CORP4-NC"
 
-$Users = Get-Content $UserFile
+# ------------------------------------------------------------
+# CONNECT AZURE
+# ------------------------------------------------------------
 
-# Fetch group members using the safer -RecursiveMatch filter
-try {
-    Write-Host "Fetching group object..." -ForegroundColor Yellow
-    $GroupDN = (Get-ADGroup -Identity $GroupName).DistinguishedName
-    
-    Write-Host "Safely scanning nested group members..." -ForegroundColor Yellow
-    # This bypasses the Get-ADGroupMember bug completely
-    $GroupMembers = Get-ADUser -Filter "memberOf -RecursiveMatch '$GroupDN'" | Select-Object -ExpandProperty SamAccountName
-} catch {
-    Write-Error "Could not read group '$GroupName'. Check your connection to the Domain Controller."
-    return
-}
-
-# Create a list to hold the report data
-$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-Write-Host "Processing users. Please wait..." -ForegroundColor Yellow
-
-foreach ($User in $Users) {
-    try {
-        if ($User -match "@") {
-            $ADUser = Get-ADUser -Filter "UserPrincipalName -eq '$User'" -Properties UserPrincipalName -ErrorAction Stop
-        } else {
-            $ADUser = Get-ADUser -Identity $User -ErrorAction Stop
-        }
-
-        if ($GroupMembers -contains $ADUser.SamAccountName) {
-            $Results.Add([PSCustomObject]@{
-                InputValue     = $User
-                SamAccountName = $ADUser.SamAccountName
-                Status         = "Would Remove"
-            })
-        } else {
-            $Results.Add([PSCustomObject]@{
-                InputValue     = $User
-                SamAccountName = $ADUser.SamAccountName
-                Status         = "Not Found in Group"
-            })
-        }
-    } 
-    catch {
-        $Results.Add([PSCustomObject]@{
-            InputValue     = $User
-            SamAccountName = "N/A"
-            Status         = "User Not Found in AD"
-        })
-    }
-}
-
-# Print the final report right to the console window
-Write-Host "`n======================= DRY RUN SUMMARY REPORT =======================" -ForegroundColor Green
-$Results | Format-Table -AutoSize
-
--------------------------------------------------
-
-
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory=$false)]
-    [switch]$Commit
-)
-
-Import-Module ActiveDirectory
-
-$GroupName = "MSAZURE_PROD_AVD_CORP2_CAS2_SC"
-$UserFile  = "C:\Temp\UsersToRemove.txt"
-
-if (-not (Test-Path $UserFile)) {
-    Write-Error "Cannot find the file at $UserFile"
-    return
-}
-
-$Users = Get-Content $UserFile
+Write-Host ""
+Write-Host "Connecting to Azure..." -ForegroundColor Cyan
 
 try {
-    Write-Host "Fetching group object..." -ForegroundColor Yellow
-    $GroupDN = (Get-ADGroup -Identity $GroupName).DistinguishedName
-    
-    Write-Host "Safely scanning nested group members..." -ForegroundColor Yellow
-    $GroupMembers = Get-ADUser -Filter "memberOf -RecursiveMatch '$GroupDN'" | Select-Object -ExpandProperty SamAccountName
-} catch {
-    Write-Error "Could not read group '$GroupName'. Check your connection to the Domain Controller."
+    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Host "Please run Connect-AzAccount first." -ForegroundColor Red
     return
 }
 
-$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+# ------------------------------------------------------------
+# USER INPUT
+# ------------------------------------------------------------
 
-foreach ($User in $Users) {
-    try {
-        if ($User -match "@") {
-            $ADUser = Get-ADUser -Filter "UserPrincipalName -eq '$User'" -ErrorAction Stop
-        } else {
-            $ADUser = Get-ADUser -Identity $User -ErrorAction Stop
-        }
+Write-Host ""
+$UserEmail = Read-Host "Enter User Email"
 
-        if ($GroupMembers -contains $ADUser.SamAccountName) {
-            if ($Commit) {
-                # REAL ACTION: Removes the user from the parent group
-                Remove-ADGroupMember -Identity $GroupName -Members $ADUser.SamAccountName -Confirm:$false
-                $StatusAction = "REMOVED FROM GROUP"
-            } else {
-                # DRY RUN MODE
-                $StatusAction = "Would Remove (Dry Run)"
-            }
-            $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = $ADUser.SamAccountName; Status = $StatusAction })
-        } else {
-            $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = $ADUser.SamAccountName; Status = "Not Found in Group" })
-        }
-    } 
-    catch {
-        $Results.Add([PSCustomObject]@{ InputValue = $User; SamAccountName = "N/A"; Status = "User Not Found in AD" })
-    }
+try {
+    $ADUser = Get-AzADUser `
+        -UserPrincipalName $UserEmail `
+        -ErrorAction Stop
+}
+catch {
+    Write-Host ""
+    Write-Host "User not found." -ForegroundColor Red
+    return
 }
 
-# Print the final report right to the screen
-if ($Commit) {
-    Write-Host "`n======================= LIVE REMOVAL SUMMARY REPORT =======================" -ForegroundColor Green
-} else {
-    Write-Host "`n======================= DRY RUN SUMMARY REPORT =======================" -ForegroundColor Cyan
-    Write-Host "NOTE: No changes were made. Run with -Commit to apply changes." -ForegroundColor Yellow
+# ------------------------------------------------------------
+# GET SESSION HOSTS
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Loading session hosts..." -ForegroundColor Cyan
+
+try {
+
+    $AllHosts = Get-AzWvdSessionHost `
+        -ResourceGroupName $ResourceGroupName `
+        -HostPoolName $HostPoolName `
+        -ErrorAction Stop
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "Failed to retrieve session hosts." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    return
 }
 
-$Results | Format-Table -AutoSize
+# ------------------------------------------------------------
+# FIND CURRENT ASSIGNMENT
+# ------------------------------------------------------------
 
------------------------------------------------------
+$CurrentHost = $AllHosts | Where-Object {
+    $_.AssignedUser -and
+    $_.AssignedUser.ToLower() -eq $UserEmail.ToLower()
+}
 
-& "C:\Users\U579652\Downloads\scripts\AD Related Scripts\remove-members-from-sg.ps1" -Commit
+if (-not $CurrentHost) {
+
+    Write-Host ""
+    Write-Host "User has no current AVD assignment." -ForegroundColor Yellow
+    return
+}
+
+$CurrentHostName = $CurrentHost.Name.Split("/")[-1]
+
+# ------------------------------------------------------------
+# DETERMINE DOMAIN
+# ------------------------------------------------------------
+
+if ($CurrentHostName.ToLower().Contains("adhcscint.net")) {
+
+    $CurrentDomain = "adhcscint.net"
+    $TargetDomain  = "prd.hcscad.net"
+
+}
+elseif ($CurrentHostName.ToLower().Contains("prd.hcscad.net")) {
+
+    $CurrentDomain = "prd.hcscad.net"
+    $TargetDomain  = "adhcscint.net"
+
+}
+else {
+
+    Write-Host ""
+    Write-Host "Unable to determine domain." -ForegroundColor Red
+    Write-Host "Current Host : $CurrentHostName"
+    return
+}
+
+# ------------------------------------------------------------
+# FIND AVAILABLE TARGET HOSTS
+# ------------------------------------------------------------
+
+$AvailableHosts = $AllHosts | Where-Object {
+
+    :IsNullOrWhiteSpace($_.AssignedUser) -and
+    $_.Name.ToLower().Contains($TargetDomain.ToLower())
+}
+
+$AvailableCount = @($AvailableHosts).Count
+
+if ($AvailableCount -eq 0) {
+
+    Write-Host ""
+    Write-Host "No available hosts found in $TargetDomain" -ForegroundColor Red
+    return
+}
+
+$TopHosts = $AvailableHosts |
+    Sort-Object Name |
+    Select-Object -First 3
+
+# ------------------------------------------------------------
+# DISPLAY USER INFO
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "=============================================================" -ForegroundColor Cyan
+Write-Host "USER INFORMATION"
+Write-Host "=============================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "User Name       : $($ADUser.DisplayName)"
+Write-Host "User Email      : $UserEmail"
+Write-Host ""
+Write-Host "Current Host    : $CurrentHostName"
+Write-Host "Current Domain  : $CurrentDomain"
+Write-Host "Target Domain   : $TargetDomain"
+Write-Host ""
+Write-Host "Available Hosts : $AvailableCount"
+Write-Host ""
+Write-Host "Top Available Hosts"
+Write-Host "-------------------"
+
+$Counter = 1
+
+foreach ($SessionHost in $TopHosts) {
+
+    $Name = $SessionHost.Name.Split('/')[-1]
+
+    Write-Host "$Counter. $Name"
+
+    $Counter++
+}
+
+# ------------------------------------------------------------
+# SELECT HOST
+# ------------------------------------------------------------
+
+Write-Host ""
+
+$Selection = Read-Host "Select machine (1-$($TopHosts.Count))"
+
+if (
+    ($Selection -notmatch '^\d+$') -or
+    ([int]$Selection -lt 1) -or
+    ([int]$Selection -gt $TopHosts.Count)
+) {
+    Write-Host "Invalid selection." -ForegroundColor Red
+    return
+}
+
+$TargetHost     = $TopHosts[[int]$Selection - 1]
+$TargetHostName = $TargetHost.Name.Split('/')[-1]
+
+# ------------------------------------------------------------
+# REVIEW
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "=============================================================" -ForegroundColor Yellow
+Write-Host "REVIEW CHANGES"
+Write-Host "=============================================================" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "User         : $UserEmail"
+Write-Host "Current Host : $CurrentHostName"
+Write-Host "Target Host  : $TargetHostName"
+Write-Host ""
+
+$Confirm = Read-Host "Type YES to continue"
+
+if ($Confirm -ne "YES") {
+
+    Write-Host ""
+    Write-Host "Operation cancelled." -ForegroundColor Yellow
+    return
+}
+
+# ------------------------------------------------------------
+# VERIFY TARGET HOST
+# ------------------------------------------------------------
+
+$LatestTarget = Get-AzWvdSessionHost `
+    -ResourceGroupName $ResourceGroupName `
+    -HostPoolName $HostPoolName `
+    -Name $TargetHostName
+
+if ($LatestTarget.AssignedUser) {
+
+    Write-Host ""
+    Write-Host "Target host is no longer available." -ForegroundColor Red
+    return
+}
+
+# ------------------------------------------------------------
+# REMOVE EXISTING ASSIGNMENT
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Removing current assignment..." -ForegroundColor Cyan
+
+try {
+
+    Update-AzWvdSessionHost `
+        -ResourceGroupName $ResourceGroupName `
+        -HostPoolName $HostPoolName `
+        -Name $CurrentHostName `
+        -AssignedUser "" `
+        -Force `
+        -ErrorAction Stop | Out-Null
+
+    Write-Host "SUCCESS" -ForegroundColor Green
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "Failed to remove assignment." -ForegroundColor Red
+    Write-Host $_.Exception.Message
+    return
+}
+
+# ------------------------------------------------------------
+# ASSIGN NEW HOST
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Assigning target host..." -ForegroundColor Cyan
+
+try {
+
+    Update-AzWvdSessionHost `
+        -ResourceGroupName $ResourceGroupName `
+        -HostPoolName $HostPoolName `
+        -Name $TargetHostName `
+        -AssignedUser $UserEmail `
+        -ErrorAction Stop | Out-Null
+
+    Write-Host "SUCCESS" -ForegroundColor Green
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "Assignment failed." -ForegroundColor Red
+    Write-Host $_.Exception.Message
+
+    return
+}
+
+# ------------------------------------------------------------
+# SUMMARY
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "=============================================================" -ForegroundColor Green
+Write-Host "MIGRATION COMPLETED"
+Write-Host "=============================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "User            : $UserEmail"
+Write-Host "Old Host        : $CurrentHostName"
+Write-Host "New Host        : $TargetHostName"
+Write-Host "Current Domain  : $CurrentDomain"
+Write-Host "Target Domain   : $TargetDomain"
+Write-Host "Available Hosts : $AvailableCount"
+Write-Host "Completed       : $(Get-Date)"
+Write-Host ""
