@@ -13,6 +13,10 @@ $SubscriptionId    = "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
 $ResourceGroupName = "PRD_NCentral_AVD_Corp4_Infra_RG"
 $HostPoolName      = "AVD-CAS-CORP4-NC"
 
+# Target domains for the swap
+$OldDomain         = "adhcscint.net"
+$NewDomain         = "prd.hcscad.net"
+
 # ------------------------------------------------------------
 # CONNECT AZURE
 # ------------------------------------------------------------
@@ -33,16 +37,11 @@ catch {
 # ------------------------------------------------------------
 
 Write-Host ""
-$UserEmail = Read-Host "Enter User Email"
+$UserEmail = Read-Host "Enter Current User Email (e.g., user@$OldDomain)"
 
-try {
-    $ADUser = Get-AzADUser `
-        -UserPrincipalName $UserEmail `
-        -ErrorAction Stop
-}
-catch {
-    Write-Host ""
-    Write-Host "User not found." -ForegroundColor Red
+# Validate email format quickly
+if ($UserEmail -notlike "*@*") {
+    Write-Host "Invalid email format." -ForegroundColor Red
     return
 }
 
@@ -54,15 +53,12 @@ Write-Host ""
 Write-Host "Loading session hosts..." -ForegroundColor Cyan
 
 try {
-
     $AllHosts = Get-AzWvdSessionHost `
         -ResourceGroupName $ResourceGroupName `
         -HostPoolName $HostPoolName `
         -ErrorAction Stop
-
 }
 catch {
-
     Write-Host ""
     Write-Host "Failed to retrieve session hosts." -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Yellow
@@ -73,228 +69,59 @@ catch {
 # FIND CURRENT ASSIGNMENT
 # ------------------------------------------------------------
 
-$CurrentHost = $AllHosts | Where-Object {
-    $_.AssignedUser -and
-    $_.AssignedUser.ToLower() -eq $UserEmail.ToLower()
-}
+Write-Host ""
+Write-Host "Searching for assigned desktop..." -ForegroundColor Cyan
 
-if (-not $CurrentHost) {
+# Find the host currently assigned to the target user
+$AssignedHost = $AllHosts | Where-Object { $_.AssignedUser -eq $UserEmail }
 
-    Write-Host ""
-    Write-Host "User has no current AVD assignment." -ForegroundColor Yellow
+if ($null -eq $AssignedHost) {
+    Write-Host "No personal desktop found for user: $UserEmail" -ForegroundColor Red
     return
 }
 
-$CurrentHostName = $CurrentHost.Name.Split("/")[-1]
+# Extract just the short name of the session host
+$HostShortName = $AssignedHost.Name.Split('/')[-1]
+Write-Host "Found Desktop: $HostShortName" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# DETERMINE DOMAIN
+# CALCULATE NEW UPN / SWAP DOMAIN
 # ------------------------------------------------------------
 
-if ($CurrentHostName.ToLower().Contains("adhcscint.net")) {
+# Generate the new email by replacing the old domain name
+$NewUserEmail = $UserEmail.Replace($OldDomain, $NewDomain)
 
-    $CurrentDomain = "adhcscint.net"
-    $TargetDomain  = "prd.hcscad.net"
+Write-Host ""
+Write-Host "Ready to swap assignment:" -ForegroundColor Yellow
+Write-Host "  From: $UserEmail" -ForegroundColor White
+Write-Host "  To:   $NewUserEmail" -ForegroundColor White
+Write-Host ""
 
-}
-elseif ($CurrentHostName.ToLower().Contains("prd.hcscad.net")) {
-
-    $CurrentDomain = "prd.hcscad.net"
-    $TargetDomain  = "adhcscint.net"
-
-}
-else {
-
-    Write-Host ""
-    Write-Host "Unable to determine domain." -ForegroundColor Red
-    Write-Host "Current Host : $CurrentHostName"
+$Confirm = Read-Host "Proceed with domain swap? (Y/N)"
+if ($Confirm -ne "Y" -and $Confirm -ne "y") {
+    Write-Host "Migration canceled." -ForegroundColor Red
     return
 }
 
 # ------------------------------------------------------------
-# FIND AVAILABLE TARGET HOSTS
-# ------------------------------------------------------------
-
-$AvailableHosts = $AllHosts | Where-Object {
-
-    :IsNullOrWhiteSpace($_.AssignedUser) -and
-    $_.Name.ToLower().Contains($TargetDomain.ToLower())
-}
-
-$AvailableCount = @($AvailableHosts).Count
-
-if ($AvailableCount -eq 0) {
-
-    Write-Host ""
-    Write-Host "No available hosts found in $TargetDomain" -ForegroundColor Red
-    return
-}
-
-$TopHosts = $AvailableHosts |
-    Sort-Object Name |
-    Select-Object -First 3
-
-# ------------------------------------------------------------
-# DISPLAY USER INFO
+# UPDATE ASSIGNMENT
 # ------------------------------------------------------------
 
 Write-Host ""
-Write-Host "=============================================================" -ForegroundColor Cyan
-Write-Host "USER INFORMATION"
-Write-Host "=============================================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "User Name       : $($ADUser.DisplayName)"
-Write-Host "User Email      : $UserEmail"
-Write-Host ""
-Write-Host "Current Host    : $CurrentHostName"
-Write-Host "Current Domain  : $CurrentDomain"
-Write-Host "Target Domain   : $TargetDomain"
-Write-Host ""
-Write-Host "Available Hosts : $AvailableCount"
-Write-Host ""
-Write-Host "Top Available Hosts"
-Write-Host "-------------------"
-
-$Counter = 1
-
-foreach ($SessionHost in $TopHosts) {
-
-    $Name = $SessionHost.Name.Split('/')[-1]
-
-    Write-Host "$Counter. $Name"
-
-    $Counter++
-}
-
-# ------------------------------------------------------------
-# SELECT HOST
-# ------------------------------------------------------------
-
-Write-Host ""
-
-$Selection = Read-Host "Select machine (1-$($TopHosts.Count))"
-
-if (
-    ($Selection -notmatch '^\d+$') -or
-    ([int]$Selection -lt 1) -or
-    ([int]$Selection -gt $TopHosts.Count)
-) {
-    Write-Host "Invalid selection." -ForegroundColor Red
-    return
-}
-
-$TargetHost     = $TopHosts[[int]$Selection - 1]
-$TargetHostName = $TargetHost.Name.Split('/')[-1]
-
-# ------------------------------------------------------------
-# REVIEW
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "=============================================================" -ForegroundColor Yellow
-Write-Host "REVIEW CHANGES"
-Write-Host "=============================================================" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "User         : $UserEmail"
-Write-Host "Current Host : $CurrentHostName"
-Write-Host "Target Host  : $TargetHostName"
-Write-Host ""
-
-$Confirm = Read-Host "Type YES to continue"
-
-if ($Confirm -ne "YES") {
-
-    Write-Host ""
-    Write-Host "Operation cancelled." -ForegroundColor Yellow
-    return
-}
-
-# ------------------------------------------------------------
-# VERIFY TARGET HOST
-# ------------------------------------------------------------
-
-$LatestTarget = Get-AzWvdSessionHost `
-    -ResourceGroupName $ResourceGroupName `
-    -HostPoolName $HostPoolName `
-    -Name $TargetHostName
-
-if ($LatestTarget.AssignedUser) {
-
-    Write-Host ""
-    Write-Host "Target host is no longer available." -ForegroundColor Red
-    return
-}
-
-# ------------------------------------------------------------
-# REMOVE EXISTING ASSIGNMENT
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Removing current assignment..." -ForegroundColor Cyan
+Write-Host "Updating AVD assignment..." -ForegroundColor Cyan
 
 try {
-
+    # Update the assigned user on the session host
     Update-AzWvdSessionHost `
         -ResourceGroupName $ResourceGroupName `
         -HostPoolName $HostPoolName `
-        -Name $CurrentHostName `
-        -AssignedUser "" `
-        -Force `
+        -Name $HostShortName `
+        -AssignedUser $NewUserEmail `
         -ErrorAction Stop | Out-Null
 
-    Write-Host "SUCCESS" -ForegroundColor Green
-
+    Write-Host "Success! Desktop $HostShortName has been migrated to $NewUserEmail." -ForegroundColor Green
 }
 catch {
-
-    Write-Host ""
-    Write-Host "Failed to remove assignment." -ForegroundColor Red
-    Write-Host $_.Exception.Message
-    return
+    Write-Host "Failed to update session host assignment." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
 }
-
-# ------------------------------------------------------------
-# ASSIGN NEW HOST
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Assigning target host..." -ForegroundColor Cyan
-
-try {
-
-    Update-AzWvdSessionHost `
-        -ResourceGroupName $ResourceGroupName `
-        -HostPoolName $HostPoolName `
-        -Name $TargetHostName `
-        -AssignedUser $UserEmail `
-        -ErrorAction Stop | Out-Null
-
-    Write-Host "SUCCESS" -ForegroundColor Green
-
-}
-catch {
-
-    Write-Host ""
-    Write-Host "Assignment failed." -ForegroundColor Red
-    Write-Host $_.Exception.Message
-
-    return
-}
-
-# ------------------------------------------------------------
-# SUMMARY
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "=============================================================" -ForegroundColor Green
-Write-Host "MIGRATION COMPLETED"
-Write-Host "=============================================================" -ForegroundColor Green
-Write-Host ""
-Write-Host "User            : $UserEmail"
-Write-Host "Old Host        : $CurrentHostName"
-Write-Host "New Host        : $TargetHostName"
-Write-Host "Current Domain  : $CurrentDomain"
-Write-Host "Target Domain   : $TargetDomain"
-Write-Host "Available Hosts : $AvailableCount"
-Write-Host "Completed       : $(Get-Date)"
-Write-Host ""
