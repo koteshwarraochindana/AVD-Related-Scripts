@@ -1,13 +1,5 @@
 Get-WinEvent -LogName System | 
 
-Where-Object { 
+Where-Object {$_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient"} | 
 
-    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and 
-
-    $_.Id -eq 20 
-
-} | 
-
-Select-Object TimeCreated, Message | 
-
-Format-List 
+Select-Object TimeCreated, Id, LevelDisplayName, Message -First 5 
