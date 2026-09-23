@@ -1,5 +1,13 @@
-AzureActivity
-| where ResourceId has "PAVW0139"
-| where OperationNameValue contains "delete"
-| project TimeGenerated, OperationNameValue, ResourceGroup, Caller, CallerIpAddress
-| order by TimeGenerated desc
+Get-WinEvent -LogName System | 
+
+Where-Object { 
+
+    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and 
+
+    $_.Id -eq 20 
+
+} | 
+
+Select-Object TimeCreated, Message | 
+
+Format-List 
