@@ -1,5 +1,7 @@
-Get-WinEvent -LogName System | 
-
-Where-Object {$_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient"} | 
-
-Select-Object TimeCreated, Id, LevelDisplayName, Message -First 5 
+Get-WinEvent -LogName System |
+Where-Object {
+    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and
+    $_.Message -match "rollback|failed|revert"
+} |
+Select-Object TimeCreated, Id, Message |
+Format-List
