@@ -5,3 +5,25 @@ Where-Object {
 } |
 Select-Object TimeCreated, Id, Message |
 Format-List
+
+
+
+
+
+Get-WinEvent -LogName Microsoft-Windows-Servicing/Operational |
+Select-Object TimeCreated, Id, LevelDisplayName, Message |
+Sort-Object TimeCreated -Descending |
+Select-Object -First 50
+
+
+
+
+
+Get-WinEvent -LogName System |
+Where-Object {
+    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and
+    $_.Id -in 20,21,25,31,34,35,43
+} |
+Select-Object TimeCreated, Id, Message |
+Sort-Object TimeCreated -Descending
+``
