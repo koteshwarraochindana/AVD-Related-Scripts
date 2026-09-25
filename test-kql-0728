@@ -35,15 +35,16 @@ Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.LocalPath -like
 ---------------------------------
 
 # --- CONFIGURATION ---
-$Username = "target_username" # <-- Change this to the user's actual folder name in C:\Users\
+$Username = "target_username" # <-- CHANGE THIS to the user's folder name in C:\Users\
 # ---------------------
 
 # 1. Get the user's SID
 try {
     $UserAccount = New-Object System.Security.Principal.NTAccount($Username)
     $SID = $UserAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    Write-Host "Found SID for user $Username: $SID" -ForegroundColor Green
 } catch {
-    Write-Error "Could not find a valid SID for '$Username'."
+    Write-Error "Could not find a valid SID for '$Username'. Make sure the username is correct."
     return
 }
 
@@ -57,7 +58,7 @@ if (-not $HiveLoaded) {
         reg load "HKEY_USERS\$SID" $ProfilePath | Out-Null
         Write-Host "Loaded registry hive for $Username." -ForegroundColor Yellow
     } else {
-        Write-Error "Could not find NTUSER.DAT for $Username. Are you sure the folder path is correct?"
+        Write-Error "Could not find NTUSER.DAT for $Username. Are you sure the profile folder exists?"
         return
     }
 }
@@ -69,14 +70,17 @@ foreach ($Protocol in $Protocols) {
     if (Test-Path $UserChoicePath) {
         Remove-Item -Path $UserChoicePath -Force -Recurse
         Write-Host "Cleared $Protocol association registry override for $Username." -ForegroundColor Green
+    } else {
+        Write-Host "No $Protocol registry override found for $Username. It might already be clean." -ForegroundColor Gray
     }
 }
 
 # 4. Clean up and unload the hive if we loaded it manually
 if (-not $HiveLoaded) {
-    # Small pause to ensure handles are released
     Start-Sleep -Seconds 2
     [GC]::Collect()
     reg unload "HKEY_USERS\$SID" | Out-Null
     Write-Host "Unloaded registry hive for $Username safely." -ForegroundColor Yellow
+}
 
+Write-Host "Fix applied. Have the user log back in and select Chrome/Edge as default." -ForegroundColor Cyan
