@@ -30,3 +30,53 @@ Sort-Object TimeCreated -Descending
 
 $Username = "jdoe"  # <-- Change jdoe to the actual username
 Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$Username" } | Remove-CimInstance
+
+
+---------------------------------
+
+# --- CONFIGURATION ---
+$Username = "target_username" # <-- Change this to the user's actual folder name in C:\Users\
+# ---------------------
+
+# 1. Get the user's SID
+try {
+    $UserAccount = New-Object System.Security.Principal.NTAccount($Username)
+    $SID = $UserAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+} catch {
+    Write-Error "Could not find a valid SID for '$Username'."
+    return
+}
+
+# 2. Check if the registry hive is already loaded, if not, load it manually
+$HiveLoaded = Test-Path "Registry::HKEY_USERS\$SID"
+
+if (-not $HiveLoaded) {
+    $ProfilePath = "C:\Users\$Username\NTUSER.DAT"
+    if (Test-Path $ProfilePath) {
+        # Load the user's registry hive into HKEY_USERS
+        reg load "HKEY_USERS\$SID" $ProfilePath | Out-Null
+        Write-Host "Loaded registry hive for $Username." -ForegroundColor Yellow
+    } else {
+        Write-Error "Could not find NTUSER.DAT for $Username. Are you sure the folder path is correct?"
+        return
+    }
+}
+
+# 3. Clear the broken URL associations
+$Protocols = @("http", "https")
+foreach ($Protocol in $Protocols) {
+    $UserChoicePath = "Registry::HKEY_USERS\$SID\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$Protocol\UserChoice"
+    if (Test-Path $UserChoicePath) {
+        Remove-Item -Path $UserChoicePath -Force -Recurse
+        Write-Host "Cleared $Protocol association registry override for $Username." -ForegroundColor Green
+    }
+}
+
+# 4. Clean up and unload the hive if we loaded it manually
+if (-not $HiveLoaded) {
+    # Small pause to ensure handles are released
+    Start-Sleep -Seconds 2
+    [GC]::Collect()
+    reg unload "HKEY_USERS\$SID" | Out-Null
+    Write-Host "Unloaded registry hive for $Username safely." -ForegroundColor Yellow
+
