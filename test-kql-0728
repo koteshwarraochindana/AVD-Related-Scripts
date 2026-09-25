@@ -27,3 +27,6 @@ Where-Object {
 Select-Object TimeCreated, Id, Message |
 Sort-Object TimeCreated -Descending
 ``
+
+$Username = "jdoe"  # <-- Change jdoe to the actual username
+Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$Username" } | Remove-CimInstance
