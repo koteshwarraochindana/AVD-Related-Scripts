@@ -11,7 +11,6 @@
 \$CsvPath           = "C:\Temp\UnAssignments.csv"
 \$OutputPath        = "C:\Temp\AVD_UnAssignment_Results.csv"
 
-
 # -----------------------------
 # Prerequisite Check
 # -----------------------------
