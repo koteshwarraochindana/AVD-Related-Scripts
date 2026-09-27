@@ -1,0 +1,145 @@
+# ============================================================
+# AVD Personal Host Un-Assignment Script
+# ============================================================
+
+# -----------------------------
+# Environment Variables
+# -----------------------------
+$SubscriptionId    = "750da1a4-85cc-489e-b629-e512e0989c16"
+$ResourceGroupName = "prd_scentral_avd3_infra_rg"
+$HostPoolName      = "AVD-CA2-AVD3-WIN11-SC1"
+
+$CsvPath = "C:\Temp\UnAssignments.csv"
+
+# -----------------------------
+# Azure Context
+# -----------------------------
+Write-Host ""
+Write-Host "Setting Azure Context..." -ForegroundColor Cyan
+
+try {
+    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Host "No Azure session found." -ForegroundColor Red
+    Write-Host "Run Connect-AzAccount first." -ForegroundColor Yellow
+    return
+}
+
+# -----------------------------
+# Validate Host Pool
+# -----------------------------
+$HostPool = Get-AzWvdHostPool `
+    -ResourceGroupName $ResourceGroupName `
+    -Name $HostPoolName `
+    -ErrorAction Stop
+
+if ($HostPool.HostPoolType -ne "Personal") {
+    Write-Host "ERROR: Host Pool is not Personal." -ForegroundColor Red
+    return
+}
+
+# -----------------------------
+# Read CSV
+# -----------------------------
+if (!(Test-Path $CsvPath)) {
+    Write-Host "Error: CSV file not found at $CsvPath" -ForegroundColor Red
+    return
+}
+
+$Hosts = @(Import-Csv $CsvPath)
+
+if ($Hosts.Count -eq 0) {
+    Write-Host "CSV contains no records." -ForegroundColor Red
+    return
+}
+
+$TotalRows = $Hosts.Count
+
+Write-Host ""
+Write-Host "Found $TotalRows records." -ForegroundColor Cyan
+Write-Host "Starting processing..." -ForegroundColor Cyan
+
+# -----------------------------
+# Cache Session Hosts
+# -----------------------------
+$AllSessionHosts = Get-AzWvdSessionHost `
+    -ResourceGroupName $ResourceGroupName `
+    -HostPoolName $HostPoolName
+
+$Results = @()
+$Counter = 1
+
+foreach ($Item in $Hosts) {
+
+    $SessionHostName = $Item.SessionHostName.Trim()
+
+    try {
+
+        $SessionHost = $AllSessionHosts | Where-Object {
+            $_.Name.Split('/')[-1].ToLower() -eq $SessionHostName.ToLower()
+        }
+
+        if (-not $SessionHost) {
+            throw "Session host not found."
+        }
+
+        if (-not $SessionHost.AssignedUser) {
+
+            $Status  = "Skipped"
+            $Message = "No user assignment found."
+        }
+        else {
+
+            $PreviousUser = $SessionHost.AssignedUser
+
+            Update-AzWvdSessionHost `
+                -ResourceGroupName $ResourceGroupName `
+                -HostPoolName $HostPoolName `
+                -Name $SessionHostName `
+                -AssignedUser $null `
+                -ErrorAction Stop | Out-Null
+
+            $Status  = "Success"
+            $Message = "Removed assignment from $PreviousUser"
+        }
+    }
+    catch {
+
+        $Status  = "Failed"
+        $Message = $_.Exception.Message
+    }
+
+    Write-Host "[$Counter/$TotalRows] $SessionHostName ($Status)" `
+        -ForegroundColor $(if($Status -eq "Success"){"Green"}elseif($Status -eq "Skipped"){"Yellow"}else{"Red"})
+
+    $Results += [PSCustomObject]@{
+        Sequence        = $Counter
+        TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        SessionHostName = $SessionHostName
+        Status          = $Status
+        Message         = $Message
+    }
+
+    $Counter++
+}
+
+# -----------------------------
+# Summary
+# -----------------------------
+$SuccessCount = @($Results | Where-Object Status -eq "Success").Count
+$SkippedCount = @($Results | Where-Object Status -eq "Skipped").Count
+$FailedCount  = @($Results | Where-Object Status -eq "Failed").Count
+
+Write-Host ""
+Write-Host "========================================================================" -ForegroundColor Cyan
+Write-Host "Un-assignment process completed." -ForegroundColor Green
+Write-Host "========================================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Total   : $TotalRows"
+Write-Host "Success : $SuccessCount" -ForegroundColor Green
+Write-Host "Skipped : $SkippedCount" -ForegroundColor Yellow
+Write-Host "Failed  : $FailedCount" -ForegroundColor Red
+Write-Host ""
+
+$Results | Format-Table -AutoSize
