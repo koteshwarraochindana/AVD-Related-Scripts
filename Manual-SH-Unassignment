@@ -1,15 +1,16 @@
 # ============================================================ #
-# AVD Personal Host Un-Assignment - CSV Based                  #
+# AVD Personal Host Un-Assignment - CSV Based                 #
 # ============================================================ #
 
 # -----------------------------
 # Environment Variables
 # -----------------------------
-\$SubscriptionId    = "750da1a4-85cc-489e-b629-e512e0989c16"
-\$ResourceGroupName = "prd_scentral_avd3_infra_rg"
-\$HostPoolName      = "AVD-CA2-AVD3-WIN11-SC1"
-\$CsvPath           = "C:\Temp\UnAssignments.csv"
-\$OutputPath        = "C:\Temp\AVD_UnAssignment_Results.csv"
+$SubscriptionId    = "750da1a4-85cc-489e-b629-e512e0989c16"
+$ResourceGroupName = "prd_scentral_avd3_infra_rg"
+$HostPoolName      = "AVD-CA2-AVD3-WIN11-SC1"
+$CsvPath           = "C:\Temp\UnAssignments.csv"
+$OutputPath        = "C:\Temp\AVD_UnAssignment_Results.csv"
+
 
 # -----------------------------
 # Prerequisite Check
@@ -19,8 +20,8 @@ if (!(Get-Module -ListAvailable -Name Az.DesktopVirtualization)) {
     return
 }
 
-if (!(Test-Path \$CsvPath)) {
-    Write-Host "Error: Input CSV file not found at \$CsvPath" -ForegroundColor Red
+if (!(Test-Path $CsvPath)) {
+    Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
     return
 }
 
@@ -74,59 +75,59 @@ $Results = foreach ($Item in $UnAssignments) {
         }
 
 
-        # Remove user assignment by passing $null directly
+        # Remove user assignment
         Update-AzWvdSessionHost `
-            -ResourceGroupName \$ResourceGroupName `
+            -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
-            -Name \$FullHostName `
+            -Name $FullHostName `
             -AssignedUser $null `
             -ErrorAction Stop |
             Out-Null
 
 
-        \$Status = "Success"
-        \$Message = "Unassigned successfully"
+        $Status = "Success"
+        $Message = "Unassigned successfully"
 
     }
     catch {
 
-        \$Status = "Failed"
-        Message = _.Exception.Message
+        $Status = "Failed"
+        $Message = $_.Exception.Message
     }
 
 
     # -----------------------------
     # Display Result
     # -----------------------------
-    TextColor = switch (Status) {
+    $TextColor = switch ($Status) {
         "Success" { "Green" }
         Default   { "Red" }
     }
 
     Write-Host `
         "[$Counter/$TotalRows] $SessionHostName -> Unassigned ($Status)" `
-        -ForegroundColor \$TextColor
+        -ForegroundColor $TextColor
 
 
     # -----------------------------
     # Result Object
     # -----------------------------
     [PSCustomObject]@{
-        Sequence        = \$Counter
+        Sequence        = $Counter
         TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        SessionHostName = \$SessionHostName
-        Status          = \$Status
-        Message         = \$Message
+        SessionHostName = $SessionHostName
+        Status          = $Status
+        Message         = $Message
     }
 
-    \$Counter++
+    $Counter++
 }
 
 
 # -----------------------------
 # Export Results
 # -----------------------------
-\$Results |
+$Results |
     Export-Csv `
         -Path $OutputPath `
         -NoTypeInformation `
@@ -154,5 +155,6 @@ Write-Host "Failed   : $FailedCount" -ForegroundColor Red
 Write-Host ""
 Write-Host "Results exported to:" -ForegroundColor Cyan
 Write-Host $OutputPath
+
 Write-Host "================================================================================" `
     -ForegroundColor Cyan
