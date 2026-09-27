@@ -1,17 +1,14 @@
 # ============================================================ #
-# AVD Personal Host Assignment - CSV Based                    #
+# AVD Personal Host Un-Assignment - CSV Based                  #
 # ============================================================ #
-
 # -----------------------------
 # Environment Variables
 # -----------------------------
-$SubscriptionId    = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
-$ResourceGroupName = "prd_scentral_avd_corp2_infra_rg"
-$HostPoolName      = "AVD-CAS2-CORP2-SC"
-$CsvPath           = "C:\Temp\Assignments.csv"
-$OutputPath        = "C:\Temp\AVD_Assignment_Results.csv"
-
-
+$SubscriptionId    = "750da1a4-85cc-489e-b629-e512e0989c16"
+$ResourceGroupName = "prd_scentral_avd3_infra_rg"
+$HostPoolName      = "AVD-CA2-AVD3-WIN11-SC1"
+$CsvPath           = "C:\Temp\UnAssignments.csv"
+$OutputPath        = "C:\Temp\AVD_UnAssignment_Results.csv"
 # -----------------------------
 # Prerequisite Check
 # -----------------------------
@@ -24,48 +21,36 @@ if (!(Test-Path $CsvPath)) {
     Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
     return
 }
-
-
 # -----------------------------
 # Connect to Azure
 # -----------------------------
 Write-Host ""
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-
-Connect-AzAccount -WarningAction SilentlyContinue
+Write-Host "Setting Azure Context..." -ForegroundColor Cyan
 
 Set-AzContext `
     -SubscriptionId $SubscriptionId |
     Out-Null
-
-
 # -----------------------------
 # Import CSV
 # -----------------------------
-$Assignments = Import-Csv $CsvPath
+$UnAssignments = Import-Csv $CsvPath
 
-if (!$Assignments) {
+if (!$UnAssignments) {
     Write-Host "Error: CSV contains no records." -ForegroundColor Red
     return
 }
-
-$TotalRows = $Assignments.Count
+$TotalRows = $UnAssignments.Count
 $Counter = 1
-
-
 Write-Host ""
 Write-Host "Found $TotalRows input records in CSV file." -ForegroundColor Cyan
-Write-Host "Starting assignment process..." -ForegroundColor Cyan
+Write-Host "Starting un-assignment process..." -ForegroundColor Cyan
 Write-Host ""
-
-
 # -----------------------------
 # Process CSV
 # -----------------------------
-$Results = foreach ($Item in $Assignments) {
+$Results = foreach ($Item in $UnAssignments) {
 
     $SessionHostName = $Item.SessionHostName.Trim()
-    $AssignedUser    = $Item.UserEmail.Trim()
 
     try {
 
@@ -78,18 +63,18 @@ $Results = foreach ($Item in $Assignments) {
         }
 
 
-        # Assign user directly from CSV
+        # Remove user assignment by passing $null directly
         Update-AzWvdSessionHost `
             -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
             -Name $FullHostName `
-            -AssignedUser $AssignedUser `
+            -AssignedUser $null `
             -ErrorAction Stop |
             Out-Null
 
 
         $Status = "Success"
-        $Message = "Assigned successfully"
+        $Message = "Unassigned successfully"
 
     }
     catch {
@@ -108,7 +93,7 @@ $Results = foreach ($Item in $Assignments) {
     }
 
     Write-Host `
-        "[$Counter/$TotalRows] $SessionHostName -> $AssignedUser ($Status)" `
+        "[$Counter/$TotalRows] $SessionHostName -> Unassigned ($Status)" `
         -ForegroundColor $TextColor
 
 
@@ -119,7 +104,6 @@ $Results = foreach ($Item in $Assignments) {
         Sequence        = $Counter
         TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         SessionHostName = $SessionHostName
-        AssignedUser    = $AssignedUser
         Status          = $Status
         Message         = $Message
     }
@@ -149,7 +133,7 @@ Write-Host ""
 Write-Host "================================================================================" `
     -ForegroundColor Cyan
 
-Write-Host "Assignment process completed." `
+Write-Host "Un-assignment process completed." `
     -ForegroundColor Green
 
 Write-Host "Total    : $TotalRows"
