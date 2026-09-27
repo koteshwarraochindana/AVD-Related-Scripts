@@ -1,160 +1,122 @@
+```powershell
 # ============================================================ #
-# AVD Personal Host Un-Assignment - CSV Based                 #
+# AVD Personal Host Un-Assignment - CSV Based                  #
 # ============================================================ #
 
 # -----------------------------
 # Environment Variables
 # -----------------------------
-$SubscriptionId    = "750da1a4-85cc-489e-b629-e512e0989c16"
-$ResourceGroupName = "prd_scentral_avd3_infra_rg"
-$HostPoolName      = "AVD-CA2-AVD3-WIN11-SC1"
-$CsvPath           = "C:\Temp\UnAssignments.csv"
-$OutputPath        = "C:\Temp\AVD_UnAssignment_Results.csv"
+$SubscriptionId    = "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55"
+$ResourceGroupName = "prd_scentral_avd_corp2_infra_rg"
+$HostPoolName      = "AVD-CAS2-CORP2-SC"
 
-
-# -----------------------------
-# Prerequisite Check
-# -----------------------------
-if (!(Get-Module -ListAvailable -Name Az.DesktopVirtualization)) {
-    Write-Host "Error: Az.DesktopVirtualization module is missing." -ForegroundColor Red
-    return
-}
-
-if (!(Test-Path $CsvPath)) {
-    Write-Host "Error: Input CSV file not found at $CsvPath" -ForegroundColor Red
-    return
-}
-
+$InputCsv  = "C:\Temp\Assignments.csv"
+$OutputCsv = "C:\Temp\AVD_UnAssignment_Results.csv"
 
 # -----------------------------
-# Connect to Azure
+# Set Subscription
 # -----------------------------
-Write-Host ""
-Write-Host "Setting Azure Context..." -ForegroundColor Cyan
-
-Set-AzContext `
-    -SubscriptionId $SubscriptionId |
-    Out-Null
-
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
 # -----------------------------
 # Import CSV
 # -----------------------------
-$UnAssignments = Import-Csv $CsvPath
+$Assignments = Import-Csv -Path $InputCsv
 
-if (!$UnAssignments) {
-    Write-Host "Error: CSV contains no records." -ForegroundColor Red
-    return
-}
-
-$TotalRows = $UnAssignments.Count
-$Counter = 1
-
-
-Write-Host ""
-Write-Host "Found $TotalRows input records in CSV file." -ForegroundColor Cyan
-Write-Host "Starting un-assignment process..." -ForegroundColor Cyan
-Write-Host ""
-
+$Results = @()
 
 # -----------------------------
-# Process CSV
+# Process Each Session Host
 # -----------------------------
-$Results = foreach ($Item in $UnAssignments) {
+foreach ($Assignment in $Assignments) {
 
-    $SessionHostName = $Item.SessionHostName.Trim()
+    $SessionHostName = $Assignment.SessionHostName.Trim()
+
+    # Remove FQDN if present
+    $ShortHostName = $SessionHostName.Split(".")[0]
+
+    Write-Host ""
+    Write-Host "Processing: $ShortHostName" -ForegroundColor Cyan
 
     try {
 
-        # Ensure correct AVD session host format
-        if ($SessionHostName -notmatch "^$HostPoolName/") {
-            $FullHostName = "$HostPoolName/$SessionHostName"
-        }
-        else {
-            $FullHostName = $SessionHostName
+        # -----------------------------
+        # Get Session Host
+        # -----------------------------
+        $SessionHost = Get-AzWvdSessionHost `
+            -ResourceGroupName $ResourceGroupName `
+            -HostPoolName $HostPoolName `
+            -Name $ShortHostName `
+            -SubscriptionId $SubscriptionId `
+            -ErrorAction Stop
+
+        # -----------------------------
+        # Check Current Assignment
+        # -----------------------------
+        $ExistingUser = $SessionHost.AssignedUser
+
+        if ([string]::IsNullOrWhiteSpace($ExistingUser)) {
+
+            Write-Host "SKIPPED - No user is currently assigned." -ForegroundColor Yellow
+
+            $Results += [PSCustomObject]@{
+                SessionHostName = $ShortHostName
+                ExistingUser    = ""
+                Status          = "Skipped"
+                Reason          = "No user is currently assigned to this session host."
+            }
+
+            continue
         }
 
-
-        # Remove user assignment
+        # -----------------------------
+        # Remove Assignment
+        # -----------------------------
         Update-AzWvdSessionHost `
             -ResourceGroupName $ResourceGroupName `
             -HostPoolName $HostPoolName `
-            -Name $FullHostName `
+            -Name $ShortHostName `
             -AssignedUser $null `
-            -ErrorAction Stop |
-            Out-Null
+            -SubscriptionId $SubscriptionId `
+            -ErrorAction Stop | Out-Null
 
+        Write-Host "SUCCESS - Unassigned $ExistingUser" -ForegroundColor Green
 
-        $Status = "Success"
-        $Message = "Unassigned successfully"
+        $Results += [PSCustomObject]@{
+            SessionHostName = $ShortHostName
+            ExistingUser    = $ExistingUser
+            Status          = "Success"
+            Reason          = "User assignment removed successfully."
+        }
 
     }
     catch {
 
-        $Status = "Failed"
-        $Message = $_.Exception.Message
+        $ErrorReason = $_.Exception.Message
+
+        Write-Host "FAILED - $ErrorReason" -ForegroundColor Red
+
+        $Results += [PSCustomObject]@{
+            SessionHostName = $ShortHostName
+            ExistingUser    = $ExistingUser
+            Status          = "Failed"
+            Reason          = $ErrorReason
+        }
     }
-
-
-    # -----------------------------
-    # Display Result
-    # -----------------------------
-    $TextColor = switch ($Status) {
-        "Success" { "Green" }
-        Default   { "Red" }
-    }
-
-    Write-Host `
-        "[$Counter/$TotalRows] $SessionHostName -> Unassigned ($Status)" `
-        -ForegroundColor $TextColor
-
-
-    # -----------------------------
-    # Result Object
-    # -----------------------------
-    [PSCustomObject]@{
-        Sequence        = $Counter
-        TimeStamp       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-        SessionHostName = $SessionHostName
-        Status          = $Status
-        Message         = $Message
-    }
-
-    $Counter++
 }
-
 
 # -----------------------------
 # Export Results
 # -----------------------------
-$Results |
-    Export-Csv `
-        -Path $OutputPath `
-        -NoTypeInformation `
-        -Encoding UTF8
-
-
-# -----------------------------
-# Summary
-# -----------------------------
-$SuccessCount = @($Results | Where-Object Status -eq "Success").Count
-$FailedCount  = @($Results | Where-Object Status -eq "Failed").Count
-
+$Results | Export-Csv `
+    -Path $OutputCsv `
+    -NoTypeInformation `
+    -Encoding UTF8
 
 Write-Host ""
-Write-Host "================================================================================" `
-    -ForegroundColor Cyan
-
-Write-Host "Un-assignment process completed." `
-    -ForegroundColor Green
-
-Write-Host "Total    : $TotalRows"
-Write-Host "Success  : $SuccessCount" -ForegroundColor Green
-Write-Host "Failed   : $FailedCount" -ForegroundColor Red
-
-Write-Host ""
-Write-Host "Results exported to:" -ForegroundColor Cyan
-Write-Host $OutputPath
-
-Write-Host "================================================================================" `
-    -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "Un-assignment processing completed." -ForegroundColor Green
+Write-Host "Results saved to:" -ForegroundColor Cyan
+Write-Host $OutputCsv -ForegroundColor White
+Write-Host "============================================" -ForegroundColor Cyan
+```
