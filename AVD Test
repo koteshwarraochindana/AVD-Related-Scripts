@@ -1,127 +1,155 @@
-# ============================================================
-# AVD Personal Desktop Migration Tool
-# Same Host Pool - Domain Swap
-#
-# adhcscint.net <--> prd.hcscad.net
-# ============================================================
+<#
+Azure VM Inventory with Tags (READ-ONLY)
 
-# ------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------
+Exports:
+- Subscription Name
+- Subscription ID
+- Resource Group
+- VM Name
+- Separate column for every tag
 
-$SubscriptionId    = "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e"
-$ResourceGroupName = "PRD_NCentral_AVD_Corp4_Infra_RG"
-$HostPoolName      = "AVD-CAS-CORP4-NC"
+Output:
+C:\Temp\AzureVM_Tags.csv
+#>
 
-# Target domains for the swap
-$OldDomain         = "adhcscint.net"
-$NewDomain         = "prd.hcscad.net"
+# ==========================================================
+# CONFIG
+# ==========================================================
 
-# ------------------------------------------------------------
-# CONNECT AZURE
-# ------------------------------------------------------------
+$TargetSubscriptions = @(
+"f9c819dc-4e16-4a04-8487-a734dcd880e1",
+"c59f3913-9612-4704-94f8-4a1d4f695b2f",
+"750da1a4-85cc-489e-b629-e512e0989c16",
+"56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+"df7de03e-1d71-4adf-8fd1-bd5791326a26",
+"0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e",
+"752e53bf-6605-464f-ab75-bcead037561e",
+"ffabf3d6-ec1e-4626-b146-ec289cfe71ab",
+"3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+"236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+"5412eea3-1603-414b-9d0f-5c21a191c8f3",
+"20760d19-cc7b-4363-a17e-8a4ab8b6e9e5",
+"bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+"7160cf79-3964-41af-8168-05a588c5f99b",
+"9ff6edd3-6b39-4d33-8776-56703398260c",
+"c4b71001-3b61-4bd7-af51-df7bfc0d9f1f"
+)
+
+$OutputCsv = "C:\Temp\AzureVM_Tags.csv"
+
+# ==========================================================
+# MODULES
+# ==========================================================
+
+Import-Module Az.Accounts -ErrorAction Stop
+Import-Module Az.Compute  -ErrorAction Stop
+
+# ==========================================================
+# AUTH
+# ==========================================================
+
+Connect-AzAccount
+
+# ==========================================================
+# COLLECT ALL VMS
+# ==========================================================
+
+Write-Host "Collecting Azure VM inventory..." -ForegroundColor Cyan
+
+$Results = New-Object System.Collections.Generic.List[Object]
+$AllTagNames = New-Object System.Collections.Generic.HashSet[string]
+
+foreach ($SubId in $TargetSubscriptions)
+{
+    try
+    {
+        Set-AzContext -SubscriptionId $SubId -ErrorAction Stop | Out-Null
+
+        $Sub = Get-AzContext
+
+        Write-Host "Processing: $($Sub.Subscription.Name)" -ForegroundColor Yellow
+
+        $VMs = Get-AzVM
+
+        foreach ($VM in $VMs)
+        {
+            # Collect all unique tag names
+            if ($VM.Tags)
+            {
+                foreach ($TagName in $VM.Tags.Keys)
+                {
+                    $null = $AllTagNames.Add($TagName)
+                }
+            }
+
+            $Results.Add([PSCustomObject]@{
+                SubscriptionName = $Sub.Subscription.Name
+                SubscriptionId   = $Sub.Subscription.Id
+                ResourceGroup    = $VM.ResourceGroupName
+                VMName           = $VM.Name
+                Tags             = $VM.Tags
+            })
+        }
+
+        Write-Host "  Found $($VMs.Count) VMs" -ForegroundColor Green
+    }
+    catch
+    {
+        Write-Host "  Failed: $SubId" -ForegroundColor Red
+        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# ==========================================================
+# BUILD EXPORT WITH DYNAMIC TAG COLUMNS
+# ==========================================================
+
+Write-Host "Building export..." -ForegroundColor Cyan
+
+$ExportData = foreach ($VM in $Results)
+{
+    $row = [ordered]@{
+        SubscriptionName = $VM.SubscriptionName
+        SubscriptionId   = $VM.SubscriptionId
+        ResourceGroup    = $VM.ResourceGroup
+        VMName           = $VM.VMName
+    }
+
+    foreach ($TagName in ($AllTagNames | Sort-Object))
+    {
+        $row[$TagName] = $null
+
+        if ($VM.Tags -and $VM.Tags.ContainsKey($TagName))
+        {
+            $row[$TagName] = $VM.Tags[$TagName]
+        }
+    }
+
+    [PSCustomObject]$row
+}
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+$Folder = Split-Path $OutputCsv -Parent
+
+if (!(Test-Path $Folder))
+{
+    New-Item -Path $Folder -ItemType Directory -Force | Out-Null
+}
+
+$ExportData |
+Sort-Object SubscriptionName, VMName |
+Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+
+# ==========================================================
+# SUMMARY
+# ==========================================================
 
 Write-Host ""
-Write-Host "Connecting to Azure..." -ForegroundColor Cyan
-
-try {
-    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
-}
-catch {
-    Write-Host "Please run Connect-AzAccount first." -ForegroundColor Red
-    return
-}
-
-# ------------------------------------------------------------
-# USER INPUT
-# ------------------------------------------------------------
-
-Write-Host ""
-$UserEmail = Read-Host "Enter Current User Email (e.g., user@$OldDomain)"
-
-# Validate email format quickly
-if ($UserEmail -notlike "*@*") {
-    Write-Host "Invalid email format." -ForegroundColor Red
-    return
-}
-
-# ------------------------------------------------------------
-# GET SESSION HOSTS
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Loading session hosts..." -ForegroundColor Cyan
-
-try {
-    $AllHosts = Get-AzWvdSessionHost `
-        -ResourceGroupName $ResourceGroupName `
-        -HostPoolName $HostPoolName `
-        -ErrorAction Stop
-}
-catch {
-    Write-Host ""
-    Write-Host "Failed to retrieve session hosts." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
-    return
-}
-
-# ------------------------------------------------------------
-# FIND CURRENT ASSIGNMENT
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Searching for assigned desktop..." -ForegroundColor Cyan
-
-# Find the host currently assigned to the target user
-$AssignedHost = $AllHosts | Where-Object { $_.AssignedUser -eq $UserEmail }
-
-if ($null -eq $AssignedHost) {
-    Write-Host "No personal desktop found for user: $UserEmail" -ForegroundColor Red
-    return
-}
-
-# Extract just the short name of the session host
-$HostShortName = $AssignedHost.Name.Split('/')[-1]
-Write-Host "Found Desktop: $HostShortName" -ForegroundColor Green
-
-# ------------------------------------------------------------
-# CALCULATE NEW UPN / SWAP DOMAIN
-# ------------------------------------------------------------
-
-# Generate the new email by replacing the old domain name
-$NewUserEmail = $UserEmail.Replace($OldDomain, $NewDomain)
-
-Write-Host ""
-Write-Host "Ready to swap assignment:" -ForegroundColor Yellow
-Write-Host "  From: $UserEmail" -ForegroundColor White
-Write-Host "  To:   $NewUserEmail" -ForegroundColor White
-Write-Host ""
-
-$Confirm = Read-Host "Proceed with domain swap? (Y/N)"
-if ($Confirm -ne "Y" -and $Confirm -ne "y") {
-    Write-Host "Migration canceled." -ForegroundColor Red
-    return
-}
-
-# ------------------------------------------------------------
-# UPDATE ASSIGNMENT
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Updating AVD assignment..." -ForegroundColor Cyan
-
-try {
-    # Update the assigned user on the session host
-    Update-AzWvdSessionHost `
-        -ResourceGroupName $ResourceGroupName `
-        -HostPoolName $HostPoolName `
-        -Name $HostShortName `
-        -AssignedUser $NewUserEmail `
-        -ErrorAction Stop | Out-Null
-
-    Write-Host "Success! Desktop $HostShortName has been migrated to $NewUserEmail." -ForegroundColor Green
-}
-catch {
-    Write-Host "Failed to update session host assignment." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
-}
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "Total VMs : $($ExportData.Count)" -ForegroundColor Green
+Write-Host "Total Tags Discovered : $($AllTagNames.Count)" -ForegroundColor Green
+Write-Host "CSV Exported : $OutputCsv" -ForegroundColor Green
+Write-Host "==========================================" -ForegroundColor Cyan
