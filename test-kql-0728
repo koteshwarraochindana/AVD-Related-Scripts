@@ -1,1 +1,39 @@
-https://www.ibm.com/support/pages/apar/IC57470
+Write-Host "======================================================================" -ForegroundColor Cyan
+Write-Host "         LAUNCHING DEEP IBM PCOMM / CPA AUTOMATION DIAGNOSTICS        " -ForegroundColor Cyan
+Write-Host "======================================================================" -ForegroundColor Cyan
+
+# 1. Pull the exact Faulting Exception Offset and Binary Versions from Event ID 1000
+\$CrashEvents = Get-WinEvent -FilterHashtable @{LogName='Application'; ID=1000} -ErrorAction SilentlyContinue | 
+               Where-Object {\(_.Message -match "pcsws.exe" -or \)_.Message -match "pcscm.exe"}
+
+if (\$CrashEvents) {
+    Write-Host "`n[+] RECENT CRASH ANALYSIS:" -ForegroundColor Green
+    foreach ($Event in $CrashEvents[0..4]) { # Analyze the 5 most recent failures
+        $Xml = [xml]$Event.ToXml()
+        $AppName = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "AppName"}).'#text'
+        $ModName = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "ModName"}).'#text'
+        $Offset  = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "Offset"}).'#text'
+        
+        Write-Host "  * Time: $($Event.TimeCreated) | App: $AppName | Module: $ModName | Fault Offset: $Offset" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "`n[-] No IBM PCOMM application crash logs found." -ForegroundColor Red
+}
+
+# 2. Extract explicit parameters from the CPA (Claim Process Analytics) Telemetry Stream
+\$CPAEvents = Get-WinEvent -FilterHashtable @{LogName='Application'; ID=1001} -ErrorAction SilentlyContinue | 
+             Where-Object {\(_.ProviderName -eq "CPA" -or \)_.Message -match "Claim Process Analytics"}
+
+if (\$CPAEvents) {
+    Write-Host "`n[+] RECENT CPA AUTOMATION ACTIVITIES CAUGHT:" -ForegroundColor Green
+    foreach ($CPA in $CPAEvents[0..2]) { # Analyze last 3 events
+        Write-Host "  * Timestamp: $($CPA.TimeCreated)" -ForegroundColor Gray
+        $Lines = $CPA.Message -split "`n" | Where-Object {\(_ -match "Emulator" -or \)_ -match "Sink" -or \(_ -match "Version" -or \)_ -match "started"}
+        foreach (Line in Lines) {
+            Write-Host "    > (Line.Trim())" -ForegroundColor White
+        }
+    }
+} else {
+    Write-Host "`n[-] No accompanying CPA automation logs located." -ForegroundColor Red
+}
+Write-Host "`n======================================================================" -ForegroundColor Cyan
