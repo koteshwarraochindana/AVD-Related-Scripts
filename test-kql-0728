@@ -1,35 +1,23 @@
-# Define the query parameters for the Application Error log
-\$Filter = @{
-    LogName = 'Application'
-    ID      = 1000
-}
+Subject: Technical RCA: IBM PCOMM Emulator Crash Loop (PCSTQ.dll) Conflicting with Claim Process Analytics (CPA) Automation
+Team,
+We have isolated the root cause of the ongoing 0xc0000005 (Access Violation) crash loop affecting the IBM Personal Communications terminal emulator (pcsws.exe and pcscm.exe) on our single-session AVD host environment.
 
-# Fetch the crash events matching our application or module names
-\(Crashes = Get-WinEvent -FilterHashtable\)Filter -ErrorAction SilentlyContinue | 
-    Where-Object { \(_.Message -match "pcsws.exe" -or \)_.Message -match "PCSTQ.dll" }
+Forensic Findings & Evidence
 
-if (\$Crashes) {
-    Write-Host "Found (\((\)Crashes.Count)) crash events related to pcsws.exe / PCSTQ.dll.`n" -ForegroundColor Green
-    
-    foreach (\(Event in\)Crashes) {
-        Write-Host "======================================================================" -ForegroundColor Cyan
-        Write-Host "CRASH TIMESTAMP : \((\)Event.TimeCreated)" -ForegroundColor Yellow
-        Write-Host "PROCESS ID      : \((\)Event.ProcessId)"
-        Write-Host "======================================================================"
-        
-        # Output the clean textual message details from Event Viewer
-        Write-Host \$Event.Message
-        
-        # Extract the underlying XML structural layout data
-        Write-Host "`n--- Raw XML Log Data Elements ---" -ForegroundColor Gray
-        $Xml = [xml]$Event.ToXml()
-        foreach ($Data in $Xml.Event.EventData.Data) {
-            if ($Data.Name -and $Data.'#text') {
-                Write-Host "  $($Data.Name) : $($Data.'#text')" -ForegroundColor White
-            }
-        }
-        Write-Host "`n"
-    }
-} else {
-    Write-Host "No pcsws.exe or PCSTQ.dll Event 1000 crash instances were found in the log." -ForegroundColor Red
-}
+Forensic tracking from the host's Windows Application event log shows a direct 1:1 concurrency collision between the Claim Process Analytics (CPA) automation utility and the IBM PCOMM client binaries:
+1. The Automation Trigger: Event ID 1001 logs from source CPA (Version 2022.8.17) show that the CPA monitoring engine is rapidly spinning up an automated child process (Emulator name: A, CDS Sink: DSGReceiveData) to process workload.
+2. The Memory Collision: Almost at the exact same millisecond, the emulator display session (pcsws.exe) and the central IBM Communication Manager (pcscm.exe) crash with a 0xc0000005 exception inside PCSTQ.dll (Fault offset: 00004429 / 00004580).
+3. The Loop: When the child process crashes, the CPA engine immediately attempts to restart it a few seconds later, driving an endless application failure loop.
+
+Underlying Root Cause
+
+This is a known architectural memory timing defect within this version of IBM PCOMM (aligned with IBM APAR IC57470). In a virtual desktop layer, when an automated tool opens, writes data, and shuts down sessions in rapid succession, the central coordinator (pcscm.exe) unloads PCSTQ.dll from the system workspace. If another automated execution string calls for that space while cleanup is active, a cross-thread memory collision occurs, causing an instant access violation crash.
+
+Requested Resolution / Fix
+
+Because this occurs within a single-session AVD context, we can permanently resolve this by decoupling the automation's emulator instances from the shared central coordinate engine.
+Please modify the backend launch configuration parameters within the Claim Process Analytics (CPA) execution script. When the tool executes the command line to spawn the pcsws.exe engine, append the /Mc standalone memory switch:
+• Target Path Configuration Example:
+"C:\Program Files (x86)\IBM\Personal Communications\pcsws.exe" C:\Path\To\YourProfile.ws /Mc
+Why this fixes it: The /Mc switch forces each automated child session window to instantiate its own private, isolated memory container, completely bypassing the shared pcscm.exe queue and preventing the PCSTQ.dll thread crash.
+Please let me know once this launch argument change is applied to our staging task workflows so we can verify the fix.
