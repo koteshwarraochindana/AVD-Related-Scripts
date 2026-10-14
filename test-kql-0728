@@ -5,16 +5,16 @@
 }
 
 # Fetch the crash events matching our application or module names
-Crashes = Get-WinEvent -FilterHashtable Filter -ErrorAction SilentlyContinue | 
+\(Crashes = Get-WinEvent -FilterHashtable\)Filter -ErrorAction SilentlyContinue | 
     Where-Object { \(_.Message -match "pcsws.exe" -or \)_.Message -match "PCSTQ.dll" }
 
 if (\$Crashes) {
-    Write-Host "Found ((Crashes.Count)) crash events related to pcsws.exe / PCSTQ.dll.`n" -ForegroundColor Green
+    Write-Host "Found (\((\)Crashes.Count)) crash events related to pcsws.exe / PCSTQ.dll.`n" -ForegroundColor Green
     
-    foreach (Event in Crashes) {
+    foreach (\(Event in\)Crashes) {
         Write-Host "======================================================================" -ForegroundColor Cyan
-        Write-Host "CRASH TIMESTAMP : (Event.TimeCreated)" -ForegroundColor Yellow
-        Write-Host "PROCESS ID      : (Event.ProcessId)"
+        Write-Host "CRASH TIMESTAMP : \((\)Event.TimeCreated)" -ForegroundColor Yellow
+        Write-Host "PROCESS ID      : \((\)Event.ProcessId)"
         Write-Host "======================================================================"
         
         # Output the clean textual message details from Event Viewer
