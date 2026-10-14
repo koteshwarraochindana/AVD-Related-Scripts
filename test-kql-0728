@@ -1,86 +1,35 @@
-Get-WinEvent -LogName System |
-Where-Object {
-    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and
-    $_.Message -match "rollback|failed|revert"
-} |
-Select-Object TimeCreated, Id, Message |
-Format-List
-
-
-
-
-
-Get-WinEvent -LogName Microsoft-Windows-Servicing/Operational |
-Select-Object TimeCreated, Id, LevelDisplayName, Message |
-Sort-Object TimeCreated -Descending |
-Select-Object -First 50
-
-
-
-
-
-Get-WinEvent -LogName System |
-Where-Object {
-    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and
-    $_.Id -in 20,21,25,31,34,35,43
-} |
-Select-Object TimeCreated, Id, Message |
-Sort-Object TimeCreated -Descending
-``
-
-$Username = "jdoe"  # <-- Change jdoe to the actual username
-Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$Username" } | Remove-CimInstance
-
-
----------------------------------
-
-# --- CONFIGURATION ---
-$Username = "target_username" # <-- CHANGE THIS to the user's folder name in C:\Users\
-# ---------------------
-
-# 1. Get the user's SID
-try {
-    $UserAccount = New-Object System.Security.Principal.NTAccount($Username)
-    $SID = $UserAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    Write-Host "Found SID for user $Username: $SID" -ForegroundColor Green
-} catch {
-    Write-Error "Could not find a valid SID for '$Username'. Make sure the username is correct."
-    return
+# Define the query parameters for the Application Error log
+\$Filter = @{
+    LogName = 'Application'
+    ID      = 1000
 }
 
-# 2. Check if the registry hive is already loaded, if not, load it manually
-$HiveLoaded = Test-Path "Registry::HKEY_USERS\$SID"
+# Fetch the crash events matching our application or module names
+Crashes = Get-WinEvent -FilterHashtable Filter -ErrorAction SilentlyContinue | 
+    Where-Object { \(_.Message -match "pcsws.exe" -or \)_.Message -match "PCSTQ.dll" }
 
-if (-not $HiveLoaded) {
-    $ProfilePath = "C:\Users\$Username\NTUSER.DAT"
-    if (Test-Path $ProfilePath) {
-        # Load the user's registry hive into HKEY_USERS
-        reg load "HKEY_USERS\$SID" $ProfilePath | Out-Null
-        Write-Host "Loaded registry hive for $Username." -ForegroundColor Yellow
-    } else {
-        Write-Error "Could not find NTUSER.DAT for $Username. Are you sure the profile folder exists?"
-        return
+if (\$Crashes) {
+    Write-Host "Found ((Crashes.Count)) crash events related to pcsws.exe / PCSTQ.dll.`n" -ForegroundColor Green
+    
+    foreach (Event in Crashes) {
+        Write-Host "======================================================================" -ForegroundColor Cyan
+        Write-Host "CRASH TIMSTAMP : (Event.TimeCreated)" -ForegroundColor Yellow
+        Write-Host "PROCESS ID     : (Event.ProcessId)"
+        Write-Host "======================================================================"
+        
+        # Output the clean textual message details from Event Viewer
+        Write-Host \$Event.Message
+        
+        # Extract the underlying XML structural layout data
+        Write-Host "`n--- Raw XML Log Data Elements ---" -ForegroundColor Thin
+        $Xml = [xml]$Event.ToXml()
+        foreach ($Data in $Xml.Event.EventData.Data) {
+            if ($Data.Name -and $Data.'#text') {
+                Write-Host "  $($Data.Name) : $($Data.'#text')" -ForegroundColor Gray
+            }
+        }
+        Write-Host "`n"
     }
+} else {
+    Write-Host "No pcsws.exe or PCSTQ.dll Event 1000 crash instances were found in the log." -ForegroundColor Red
 }
-
-# 3. Clear the broken URL associations
-$Protocols = @("http", "https")
-foreach ($Protocol in $Protocols) {
-    $UserChoicePath = "Registry::HKEY_USERS\$SID\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$Protocol\UserChoice"
-    if (Test-Path $UserChoicePath) {
-        Remove-Item -Path $UserChoicePath -Force -Recurse
-        Write-Host "Cleared $Protocol association registry override for $Username." -ForegroundColor Green
-    } else {
-        Write-Host "No $Protocol registry override found for $Username. It might already be clean." -ForegroundColor Gray
-    }
-}
-
-# 4. Clean up and unload the hive if we loaded it manually
-if (-not $HiveLoaded) {
-    Start-Sleep -Seconds 2
-    [GC]::Collect()
-    reg unload "HKEY_USERS\$SID" | Out-Null
-    Write-Host "Unloaded registry hive for $Username safely." -ForegroundColor Yellow
-}
-
-Write-Host "Fix applied. Have the user log back in and select Chrome/Edge as default." -ForegroundColor Cyan
