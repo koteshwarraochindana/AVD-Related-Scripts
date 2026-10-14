@@ -2,12 +2,20 @@ $User = "U579652"
 
 # Get VM Boot Time
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$MinutesSinceBoot = [math]::Round(((Get-Date) - $BootTime).TotalMinutes, 1)
+
+if ($MinutesSinceBoot -lt 5) {
+    $CurrentVMState = "VM likely started recently due to a user connection"
+} elseif ($MinutesSinceBoot -lt 15) {
+    $CurrentVMState = "VM recently started"
+} else {
+    $CurrentVMState = "VM already available and running long before this check"
+}
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "AVD LOGIN EVENT REFERENCE" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
-
 Write-Host "41 = User initiated AVD connection"
 Write-Host "42 = Session assigned by broker"
 Write-Host "21 = User authentication completed"
@@ -15,41 +23,35 @@ Write-Host "22 = Desktop ready"
 Write-Host ""
 Write-Host "Time to Desktop = Event 22 - Event 41"
 Write-Host "Authentication = Event 21 - Event 41"
-Write-Host "Desktop Load   = Event 22 - Event 21"
+Write-Host "Desktop Load = Event 22 - Event 21"
 
 # Collect Events
 $Events = Get-WinEvent -FilterHashtable @{
-    LogName  = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     StartTime = (Get-Date).AddDays(-7)
-} |
-Where-Object {
-    $_.Id -in 21,22,41,42 -and
-    $_.Message -match $User
-} |
-Sort-Object TimeCreated
+    Id        = 21, 22, 41, 42
+} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "RAW EVENT TIMELINE" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
-$Events |
-Select-Object `
-    TimeCreated,
-    Id,
-    @{
-        Name='Meaning'
-        Expression={
-            switch ($_.Id)
-            {
-                41 {'AVD Connection Started'}
-                42 {'Session Assigned'}
-                21 {'Logon Succeeded'}
-                22 {'Desktop Ready'}
-            }
-        }
-    } |
-Format-Table -AutoSize
+if ($null -eq $Events) {
+    Write-Host "No raw events found for user '$User' in the last 7 days." -ForegroundColor Yellow
+} else {
+    $Events | Select-Object TimeCreated, Id, @{ 
+        Name       = 'Meaning' 
+        Expression = { 
+            switch ($_.Id) { 
+                41 { 'AVD Connection Started' } 
+                42 { 'Session Assigned' } 
+                21 { 'Logon Succeeded' } 
+                22 { 'Desktop Ready' } 
+            } 
+        } 
+    } | Format-Table -AutoSize
+}
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -58,69 +60,62 @@ Write-Host "============================================================" -Foreg
 
 $StartTime = $null
 $LogonTime = $null
+$SummaryGenerated = $false
 
-foreach ($Event in $Events)
-{
-    switch ($Event.Id)
-    {
-        41 {
-            $StartTime = $Event.TimeCreated
+foreach ($Event in $Events) {
+    switch ($Event.Id) {
+        41 { 
+            $StartTime = $Event.TimeCreated 
         }
-
-        21 {
-            $LogonTime = $Event.TimeCreated
+        21 { 
+            $LogonTime = $Event.TimeCreated 
         }
-
         22 {
+            if ($StartTime -and $LogonTime) {
+                $SummaryGenerated = $true
+                $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
+                $DesktopLoadSec     = [math]::Round(($Event.TimeCreated - $LogonTime).TotalSeconds, 0)
+                $TotalLoginSec      = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
+                $EventMinutesSinceBoot = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
 
-            if ($StartTime -and $LogonTime)
-            {
-                $AuthenticationSec = [math]::Round(
-                    ($LogonTime - $StartTime).TotalSeconds,0
-                )
-
-                $DesktopLoadSec = [math]::Round(
-                    ($Event.TimeCreated - $LogonTime).TotalSeconds,0
-                )
-
-                $TotalLoginSec = [math]::Round(
-                    ($Event.TimeCreated - $StartTime).TotalSeconds,0
-                )
-
-                $MinutesSinceBoot = [math]::Round(
-                    ($StartTime - $BootTime).TotalMinutes,1
-                )
-
-                if ($MinutesSinceBoot -lt 5)
-                {
+                if ($EventMinutesSinceBoot -lt 5) {
                     $VMState = "VM likely started due to user connection"
                 }
-                elseif ($MinutesSinceBoot -lt 15)
-                {
+                elseif ($EventMinutesSinceBoot -lt 15) {
                     $VMState = "VM recently started before user login"
                 }
-                else
-                {
+                else {
                     $VMState = "VM already available before user login"
                 }
 
-                [PSCustomObject]@{
+                ([PSCustomObject]@{
                     VMLastBoot        = $BootTime
                     VMState           = $VMState
-                    MinutesSinceBoot  = $MinutesSinceBoot
+                    MinutesSinceBoot  = $EventMinutesSinceBoot
                     LoginStarted      = $StartTime
                     LogonSucceeded    = $LogonTime
                     DesktopReady      = $Event.TimeCreated
                     AuthenticationSec = $AuthenticationSec
-             Desktop
+                    DesktopLoadSec    = $DesktopLoadSec
                     TotalLoginSec     = $TotalLoginSec
-                } | Format-List
+                }) | Format-List
 
                 Write-Host "------------------------------------------------------------"
-
+                
                 $StartTime = $null
                 $LogonTime = $null
             }
         }
     }
+}
+
+# Fallback: Triggered if no complete (41 + 21 + 22) tracking sequence was successfully generated
+if (-not $SummaryGenerated) {
+    Write-Host "CURRENT VM STATE:" -ForegroundColor Cyan
+    Write-Host "  Last Boot Time   : $BootTime"
+    Write-Host "  Up Time (Minutes): $MinutesSinceBoot"
+    Write-Host "  Status Context   : $CurrentVMState"
+    Write-Host ""
+    Write-Host "[-] NOTICE: There is no complete user login history found for '$User' over the past 7 days." -ForegroundColor Red
+    Write-Host "------------------------------------------------------------"
 }
