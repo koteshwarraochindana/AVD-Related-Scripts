@@ -13,19 +13,19 @@ if (\$Crashes) {
     
     foreach (Event in Crashes) {
         Write-Host "======================================================================" -ForegroundColor Cyan
-        Write-Host "CRASH TIMSTAMP : (Event.TimeCreated)" -ForegroundColor Yellow
-        Write-Host "PROCESS ID     : (Event.ProcessId)"
+        Write-Host "CRASH TIMESTAMP : (Event.TimeCreated)" -ForegroundColor Yellow
+        Write-Host "PROCESS ID      : (Event.ProcessId)"
         Write-Host "======================================================================"
         
         # Output the clean textual message details from Event Viewer
         Write-Host \$Event.Message
         
         # Extract the underlying XML structural layout data
-        Write-Host "`n--- Raw XML Log Data Elements ---" -ForegroundColor Thin
+        Write-Host "`n--- Raw XML Log Data Elements ---" -ForegroundColor Gray
         $Xml = [xml]$Event.ToXml()
         foreach ($Data in $Xml.Event.EventData.Data) {
             if ($Data.Name -and $Data.'#text') {
-                Write-Host "  $($Data.Name) : $($Data.'#text')" -ForegroundColor Gray
+                Write-Host "  $($Data.Name) : $($Data.'#text')" -ForegroundColor White
             }
         }
         Write-Host "`n"
