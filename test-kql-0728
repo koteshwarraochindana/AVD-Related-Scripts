@@ -1,39 +1,126 @@
-Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "         LAUNCHING DEEP IBM PCOMM / CPA AUTOMATION DIAGNOSTICS        " -ForegroundColor Cyan
-Write-Host "======================================================================" -ForegroundColor Cyan
+$User = "U579652"
 
-# 1. Pull the exact Faulting Exception Offset and Binary Versions from Event ID 1000
-\$CrashEvents = Get-WinEvent -FilterHashtable @{LogName='Application'; ID=1000} -ErrorAction SilentlyContinue | 
-               Where-Object {\(_.Message -match "pcsws.exe" -or \)_.Message -match "pcscm.exe"}
+# Get VM Boot Time
+$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 
-if (\$CrashEvents) {
-    Write-Host "`n[+] RECENT CRASH ANALYSIS:" -ForegroundColor Green
-    foreach ($Event in $CrashEvents[0..4]) { # Analyze the 5 most recent failures
-        $Xml = [xml]$Event.ToXml()
-        $AppName = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "AppName"}).'#text'
-        $ModName = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "ModName"}).'#text'
-        $Offset  = ($Xml.Event.EventData.Data | Where-Object {$_.Name -eq "Offset"}).'#text'
-        
-        Write-Host "  * Time: $($Event.TimeCreated) | App: $AppName | Module: $ModName | Fault Offset: $Offset" -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "`n[-] No IBM PCOMM application crash logs found." -ForegroundColor Red
-}
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "AVD LOGIN EVENT REFERENCE" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
 
-# 2. Extract explicit parameters from the CPA (Claim Process Analytics) Telemetry Stream
-\$CPAEvents = Get-WinEvent -FilterHashtable @{LogName='Application'; ID=1001} -ErrorAction SilentlyContinue | 
-             Where-Object {\(_.ProviderName -eq "CPA" -or \)_.Message -match "Claim Process Analytics"}
+Write-Host "41 = User initiated AVD connection"
+Write-Host "42 = Session assigned by broker"
+Write-Host "21 = User authentication completed"
+Write-Host "22 = Desktop ready"
+Write-Host ""
+Write-Host "Time to Desktop = Event 22 - Event 41"
+Write-Host "Authentication = Event 21 - Event 41"
+Write-Host "Desktop Load   = Event 22 - Event 21"
 
-if (\$CPAEvents) {
-    Write-Host "`n[+] RECENT CPA AUTOMATION ACTIVITIES CAUGHT:" -ForegroundColor Green
-    foreach ($CPA in $CPAEvents[0..2]) { # Analyze last 3 events
-        Write-Host "  * Timestamp: $($CPA.TimeCreated)" -ForegroundColor Gray
-        $Lines = $CPA.Message -split "`n" | Where-Object {\(_ -match "Emulator" -or \)_ -match "Sink" -or \(_ -match "Version" -or \)_ -match "started"}
-        foreach (Line in Lines) {
-            Write-Host "    > (Line.Trim())" -ForegroundColor White
+# Collect Events
+$Events = Get-WinEvent -FilterHashtable @{
+    LogName  = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    StartTime = (Get-Date).AddDays(-7)
+} |
+Where-Object {
+    $_.Id -in 21,22,41,42 -and
+    $_.Message -match $User
+} |
+Sort-Object TimeCreated
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "RAW EVENT TIMELINE" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+$Events |
+Select-Object `
+    TimeCreated,
+    Id,
+    @{
+        Name='Meaning'
+        Expression={
+            switch ($_.Id)
+            {
+                41 {'AVD Connection Started'}
+                42 {'Session Assigned'}
+                21 {'Logon Succeeded'}
+                22 {'Desktop Ready'}
+            }
+        }
+    } |
+Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "LOGIN SUMMARY" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+$StartTime = $null
+$LogonTime = $null
+
+foreach ($Event in $Events)
+{
+    switch ($Event.Id)
+    {
+        41 {
+            $StartTime = $Event.TimeCreated
+        }
+
+        21 {
+            $LogonTime = $Event.TimeCreated
+        }
+
+        22 {
+
+            if ($StartTime -and $LogonTime)
+            {
+                $AuthenticationSec = [math]::Round(
+                    ($LogonTime - $StartTime).TotalSeconds,0
+                )
+
+                $DesktopLoadSec = [math]::Round(
+                    ($Event.TimeCreated - $LogonTime).TotalSeconds,0
+                )
+
+                $TotalLoginSec = [math]::Round(
+                    ($Event.TimeCreated - $StartTime).TotalSeconds,0
+                )
+
+                $MinutesSinceBoot = [math]::Round(
+                    ($StartTime - $BootTime).TotalMinutes,1
+                )
+
+                if ($MinutesSinceBoot -lt 5)
+                {
+                    $VMState = "VM likely started due to user connection"
+                }
+                elseif ($MinutesSinceBoot -lt 15)
+                {
+                    $VMState = "VM recently started before user login"
+                }
+                else
+                {
+                    $VMState = "VM already available before user login"
+                }
+
+                [PSCustomObject]@{
+                    VMLastBoot        = $BootTime
+                    VMState           = $VMState
+                    MinutesSinceBoot  = $MinutesSinceBoot
+                    LoginStarted      = $StartTime
+                    LogonSucceeded    = $LogonTime
+                    DesktopReady      = $Event.TimeCreated
+                    AuthenticationSec = $AuthenticationSec
+             Desktop
+                    TotalLoginSec     = $TotalLoginSec
+                } | Format-List
+
+                Write-Host "------------------------------------------------------------"
+
+                $StartTime = $null
+                $LogonTime = $null
+            }
         }
     }
-} else {
-    Write-Host "`n[-] No accompanying CPA automation logs located." -ForegroundColor Red
 }
-Write-Host "`n======================================================================" -ForegroundColor Cyan
