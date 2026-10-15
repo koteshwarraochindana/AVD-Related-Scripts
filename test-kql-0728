@@ -1,42 +1,58 @@
-$User = "U579652"
+# 🤖 Automatically detect the currently logged-in AVD username (Handles Active/Disconnected state)
+$User = qwinsta | ForEach-Object {
+    $Fields = $_ -split '\s+'
+    # Look for rows where State is Active ('Active') or Disconnected ('Disc') and extract user
+    if ($Fields[3] -eq 'Active' -or $Fields[2] -eq 'Disc') {
+        if ($Fields[1] -ne 'SYSTEM' -and $Fields[1] -ne 'NETWORK') {
+            $Fields[1] # This captures the real username
+        }
+    }
+} | Select-Object -First 1
 
-# Get VM Hardware Boot Initiation Time
+# --- FALLBACK PROTECTION ---
+# If no active user session is found right now, exit safely with the VM State block
+if ([string]::IsNullOrWhiteSpace($User)) {
+    $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $CurrentMinutesSince = [math]::Round(((Get-Date) - $BootTime).TotalMinutes, 1)
+    
+    # Calculate True Boot Time
+    $Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
+    $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { "Unknown" }
+
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "CURRENT VM STATUS" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  Last Boot Time     : $BootTime"
+    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
+    Write-Host "  Uptime (Minutes)   : $CurrentMinutesSince"
+    Write-Host ""
+    Write-Host "[✓] CONFIRMED: No active AVD user sessions detected on this machine right now." -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Exit 0
+}
+
+# --- PROCESS ACTIVE USER EVENT LOG ENTRY ---
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 
-# Calculate Time Taken to Boot the VM (Using Event 6005 - Event Log Service Started)
+# Calculate VM Boot Performance time (Event 6005)
 $Event6005 = Get-WinEvent -FilterHashtable @{
     LogName   = 'System'
     Id        = 6005
     StartTime = $BootTime.AddMinutes(-1)
 } -MaxEvents 1 -ErrorAction SilentlyContinue
 
-if ($Event6005) {
-    $BootReadyTime = $Event6005.TimeCreated
-    $BootDurationSec = [math]::Round(($BootReadyTime - $BootTime).TotalSeconds, 0)
-    $BootTimeDisplay = "$BootDurationSec Seconds"
-} else {
-    $BootTimeDisplay = "Unable to calculate (Log missing)"
-}
+$BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { "Log Missing" }
 
-Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "AVD LOGIN EVENT REFERENCE" -ForegroundColor Cyan
+Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User" -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "41 = User initiated AVD connection"
-Write-Host "21 = User authentication completed"
-Write-Host "22 = Desktop ready"
 
-# Collect Events - ONLY grab events that happened AFTER the current VM boot time
+# Collect Events for the auto-discovered user
 $Events = Get-WinEvent -FilterHashtable @{
     LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     StartTime = $BootTime
     Id        = 21, 22, 41, 42
 } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
-
-Write-Host ""
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "LOGIN SUMMARY (CURRENT BOOT CYCLE ONLY)" -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
 
 $StartTime = $null
 $LogonTime = $null
@@ -44,12 +60,8 @@ $SummaryGenerated = $false
 
 foreach ($Event in $Events) {
     switch ($Event.Id) {
-        41 { 
-            $StartTime = $Event.TimeCreated 
-        }
-        21 { 
-            $LogonTime = $Event.TimeCreated 
-        }
+        41 { $StartTime = $Event.TimeCreated }
+        21 { $LogonTime = $Event.TimeCreated }
         22 {
             if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
                 $SummaryGenerated = $true
@@ -58,16 +70,12 @@ foreach ($Event in $Events) {
                 $TotalLoginSec      = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
                 $MinutesSinceBoot   = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
 
-                if ($MinutesSinceBoot -lt 5) {
-                    $VMState = "VM likely started due to user connection"
-                } elseif ($MinutesSinceBoot -lt 15) {
-                    $VMState = "VM recently started before user login"
-                } else {
-                    $VMState = "VM already available before user login"
-                }
+                if ($MinutesSinceBoot -lt 5) { $VMState = "VM likely started due to user connection" }
+                elseif ($MinutesSinceBoot -lt 15) { $VMState = "VM recently started before user login" }
+                else { $VMState = "VM already available before user login" }
 
-                # Removed MinutesSinceBoot property and replaced with VM_BootTimeTaken
                 ([PSCustomObject]@{
+                    TargetUser        = $User
                     VMLastBoot        = $BootTime
                     VM_BootTimeTaken  = $BootTimeDisplay
                     VMState           = $VMState
@@ -78,11 +86,8 @@ foreach ($Event in $Events) {
                     DesktopLoadSec    = $DesktopLoadSec
                     TotalLoginSec     = $TotalLoginSec
                 }) | Format-List
-
                 Write-Host "------------------------------------------------------------"
-                
-                $StartTime = $null
-                $LogonTime = $null
+                $StartTime = $null; $LogonTime = $null
             }
         }
     }
@@ -90,9 +95,10 @@ foreach ($Event in $Events) {
 
 if (-not $SummaryGenerated) {
     Write-Host "CURRENT VM STATUS:" -ForegroundColor Cyan
+    Write-Host "  Target Active User : $User"
     Write-Host "  Last Boot Time     : $BootTime"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host ""
-    Write-Host "[✓] CONFIRMED: User '$User' has NOT logged into this VM during the current boot cycle." -ForegroundColor Green
+    Write-Host "[-] NOTICE: User '$User' is connected, but a complete matching logon footprint (Events 41->21->22) does not exist inside this specific boot cycle." -ForegroundColor Yellow
     Write-Host "============================================================" -ForegroundColor Cyan
 }
