@@ -88,23 +88,6 @@ if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
     $IdleDisplay = "N/A"
 }
 
-# 🛠️ FIXED WAKE SOURCE LOOKUP
-$ColdBootEvent = Get-WinEvent -FilterHashtable @{
-    LogName      = 'System'
-    ProviderName = 'Microsoft-Windows-Kernel-Power'
-    Id           = 41
-    StartTime    = $BootTime.AddMinutes(-1)
-} -ErrorAction SilentlyContinue | Select-Object -First 1
-
-if (-not $ColdBootEvent) {
-    $ColdBootEvent = Get-WinEvent -FilterHashtable @{
-        LogName      = 'System'
-        ProviderName = 'Microsoft-Windows-Kernel-Power'
-        Id           = 109
-        StartTime    = $BootTime.AddMinutes(-1)
-    } -ErrorAction SilentlyContinue | Select-Object -First 1
-}
-
 Write-Host ""
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
@@ -139,7 +122,8 @@ foreach ($Event in $Events) {
                 if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) {
                     $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
                 }
-                elseif ($MinutesSinceBoot -lt 5 -and $ColdBootEvent) { 
+                # Resilient Check: If a connection falls within 5 minutes of a cold boot, it is verified
+                elif ($MinutesSinceBoot -lt 5) { 
                     $VMState = 'VM CONFIRMED started due to user connection' 
                 }
                 elseif ($MinutesSinceBoot -lt 15) { 
