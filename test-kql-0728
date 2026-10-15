@@ -1,27 +1,36 @@
 # Get local Hostname
 $Hostname = $env:COMPUTERNAME
 
-# 🤖 Resilient detection of the currently logged-in user session (Handles Active AND Disconnected 'Disc' states)
-$UserSession = qwinsta | ForEach-Object {
-    $Line = $_.Trim()
-    if ($Line -match '^(?<session>[\w\-]+)?\s+(?<user>[a-zA-Z0-9_\-]+)\s+\d+\s+(?<state>Active|Disc)') {
-        $FoundUser = $Matches['user'].Trim()
-        $FoundState = $Matches['state'].Trim()
-        if ($FoundUser -notin @('SYSTEM', 'NETWORK', 'SERVICE', 'USERNAME')) {
-            # Create a custom tracker object to pass downstream
+# 🤖 Resilient detection of local user sessions via native CIM mapping (Bypasses qwinsta text truncation)
+$AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
+    $SessionId = $_.LogonId
+    
+    # Filter for Interactive (2) and Remote Interactive / RDP (10) logon types
+    if ($_.LogonType -in @(2, 10)) {
+        # Correlate session ID to get the real account username string
+        $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
+        
+        if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) {
+            # Query qwinsta matching the exact user to parse their active connection state safely
+            $QState = qwinsta $UserQuery.Name 2>$null | ForEach-Object {
+                if ($_ -match 'Active') { 'Active' }
+                elseif ($_ -match 'Disc') { 'Disconnected' }
+            } | Select-Object -First 1
+
             [PSCustomObject]@{
-                Username = $FoundUser
-                State    = if ($FoundState -eq 'Disc') { 'Disconnected' } else { 'Active' }
+                Username = $UserQuery.Name
+                State    = if ($QState) { $QState } else { 'Disconnected' } # Default to disconnected if terminal channel dropped
             }
         }
     }
-} | Select-Object -First 1
+} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group[0] } # Remove duplicate session IDs
 
+$UserSession = $AVDSessions | Select-Object -First 1
 $User = $UserSession.Username
 $SessionState = $UserSession.State
 
 # --- FALLBACK PROTECTION ---
-# If no active or disconnected user session is found right now, exit safely with the VM State block
+# Triggers if absolutely no active or disconnected user account footprints are matched
 if ([string]::IsNullOrWhiteSpace($User)) {
     $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
     $UptimeSpan = (Get-Date) - $BootTime
@@ -40,12 +49,12 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
-    Write-Host '[✓] CONFIRMED: No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
+    Write-Host 'No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
     Write-Host '============================================================' -ForegroundColor Cyan
     Exit 0
 }
 
-# --- PROCESS ACTIVE/DISCONNECTED USER EVENT LOG ENTRY ---
+# --- PROCESS USER EVENT LOG ENTRIES ---
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 $UptimeSpan = (Get-Date) - $BootTime
 $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
@@ -64,7 +73,7 @@ Write-Host '============================================================' -Foreg
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
 Write-Host '============================================================' -ForegroundColor Cyan
 
-# Collect Events for the auto-discovered user
+# Collect Events for the auto-discovered user string
 $Events = Get-WinEvent -FilterHashtable @{
     LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     StartTime = $BootTime
