@@ -1,17 +1,20 @@
 # Get local Hostname
 $Hostname = $env:COMPUTERNAME
 
-# 🤖 Resilient detection of local user sessions via native CIM mapping (Bypasses qwinsta text truncation)
+# Define the target local timezone for conversion
+$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+
+function Convert-ToLocalTime($UtcTime) {
+    if ($null -eq $UtcTime) { return $null }
+    return [System.TimeZoneInfo]::ConvertTime($UtcTime, $LocalTimeZone)
+}
+
+# 🤖 Resilient detection of local user sessions via native CIM mapping
 $AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
     $SessionId = $_.LogonId
-    
-    # Filter for Interactive (2) and Remote Interactive / RDP (10) logon types
     if ($_.LogonType -in @(2, 10)) {
-        # Correlate session ID to get the real account username string
         $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
-        
         if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) {
-            # Query qwinsta matching the exact user to parse their active connection state safely
             $QState = qwinsta $UserQuery.Name 2>$null | ForEach-Object {
                 if ($_ -match 'Active') { 'Active' }
                 elseif ($_ -match 'Disc') { 'Disconnected' }
@@ -19,24 +22,23 @@ $AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
 
             [PSCustomObject]@{
                 Username = $UserQuery.Name
-                State    = if ($QState) { $QState } else { 'Disconnected' } # Default to disconnected if terminal channel dropped
+                State    = if ($QState) { $QState } else { 'Disconnected' }
             }
         }
     }
-} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group } # Remove duplicate session IDs
+} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group }
 
 $UserSession = $AVDSessions | Select-Object -First 1
 $User = $UserSession.Username
 $SessionState = $UserSession.State
 
 # --- FALLBACK PROTECTION ---
-# Triggers if absolutely no active or disconnected user account footprints are matched
 if ([string]::IsNullOrWhiteSpace($User)) {
     $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $LocalBootTime = Convert-ToLocalTime $BootTime
     $UptimeSpan = (Get-Date) - $BootTime
     $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
     
-    # Calculate True Boot Time
     $Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
     $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Unknown' }
 
@@ -45,7 +47,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     Write-Host 'CURRENT VM STATUS' -ForegroundColor Cyan
     Write-Host '============================================================' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
-    Write-Host "  Last Boot Time     : $BootTime"
+    Write-Host "  Last Boot Time     : $LocalBootTime (ET)"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
@@ -56,10 +58,10 @@ if ([string]::IsNullOrWhiteSpace($User)) {
 
 # --- PROCESS USER EVENT LOG ENTRIES ---
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$LocalBootTime = Convert-ToLocalTime $BootTime
 $UptimeSpan = (Get-Date) - $BootTime
 $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
 
-# Calculate VM Boot Performance time (Event 6005)
 $Event6005 = Get-WinEvent -FilterHashtable @{
     LogName   = 'System'
     Id        = 6005
@@ -68,7 +70,6 @@ $Event6005 = Get-WinEvent -FilterHashtable @{
 
 $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Log Missing' }
 
-# Look for Event ID 24 (Session Disconnected) for this user to extract dynamic disconnect metrics
 $DisconnectEvent = Get-WinEvent -FilterHashtable @{
     LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     Id        = 24
@@ -77,10 +78,11 @@ $DisconnectEvent = Get-WinEvent -FilterHashtable @{
 
 if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
     $DisconnectTime = $DisconnectEvent.TimeCreated
+    $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (ET)"
     $IdleSpan = (Get-Date) - $DisconnectTime
     $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
 } else {
-    $DisconnectTime = "N/A (User is currently Active)"
+    $LocalDisconnectTime = "N/A (User is currently Active)"
     $IdleDisplay = "N/A"
 }
 
@@ -89,7 +91,6 @@ Write-Host '============================================================' -Foreg
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
 Write-Host '============================================================' -ForegroundColor Cyan
 
-# Collect Connection Events for the profile metrics
 $Events = Get-WinEvent -FilterHashtable @{
     LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     StartTime = $BootTime
@@ -116,19 +117,18 @@ foreach ($Event in $Events) {
                 elseif ($MinutesSinceBoot -lt 15) { $VMState = 'VM recently started before user login' }
                 else { $VMState = 'VM already available before user login' }
 
-                # 📋 EXACT REQUESTED RE-ORDERING ORDER
                 ([PSCustomObject]@{
                     Hostname          = $Hostname
                     TargetUser        = $User
-                    VMLastBoot        = $BootTime
+                    VMLastBoot        = "$LocalBootTime (ET)"
                     VM_BootTimeTaken  = $BootTimeDisplay
                     SessionState      = $SessionState
-                    DisconnectedAt    = $DisconnectTime
+                    DisconnectedAt    = $LocalDisconnectTime
                     TotalIdleTime     = $IdleDisplay
                     VMState           = $VMState
-                    LoginStarted      = $StartTime
-                    LogonSucceeded    = $LogonTime
-                    DesktopReady      = $Event.TimeCreated
+                    LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (ET)"
+                    LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (ET)"
+                    DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (ET)"
                     AuthenticationSec = $AuthenticationSec
                     DesktopLoadSec    = $DesktopLoadSec
                     TotalLoginSec     = $TotalLoginSec
@@ -144,10 +144,10 @@ if (-not $SummaryGenerated) {
     Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
-    Write-Host "  Last Boot Time     : $BootTime"
+    Write-Host "  Last Boot Time     : $LocalBootTime (ET)"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Current State      : $SessionState"
-    Write-Host "  Disconnected At    : $DisconnectTime"
+    Write-Host "  Disconnected At    : $LocalDisconnectTime"
     Write-Host "  Total Idle Time    : $IdleDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
