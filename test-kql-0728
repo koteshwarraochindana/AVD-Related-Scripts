@@ -28,8 +28,9 @@ $AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
     }
 } | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group }
 
-$User = $AVDSessions[0].Username
-$SessionState = $AVDSessions[0].State
+$UserSession = $AVDSessions | Select-Object -First 1
+$User = $UserSession.Username
+$SessionState = $UserSession.State
 
 # --- FALLBACK PROTECTION ---
 if ([string]::IsNullOrWhiteSpace($User)) {
@@ -87,13 +88,22 @@ if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
     $IdleDisplay = "N/A"
 }
 
-# 🛠️ Query Kernel-Power logs to trace absolute wake source origin
+# 🛠️ FIXED WAKE SOURCE LOOKUP
 $ColdBootEvent = Get-WinEvent -FilterHashtable @{
-    LogName   = 'System'
+    LogName      = 'System'
     ProviderName = 'Microsoft-Windows-Kernel-Power'
-    Id        = 41, 109
-    StartTime = $BootTime.AddMinutes(-1)
+    Id           = 41
+    StartTime    = $BootTime.AddMinutes(-1)
 } -ErrorAction SilentlyContinue | Select-Object -First 1
+
+if (-not $ColdBootEvent) {
+    $ColdBootEvent = Get-WinEvent -FilterHashtable @{
+        LogName      = 'System'
+        ProviderName = 'Microsoft-Windows-Kernel-Power'
+        Id           = 109
+        StartTime    = $BootTime.AddMinutes(-1)
+    } -ErrorAction SilentlyContinue | Select-Object -First 1
+}
 
 Write-Host ""
 Write-Host '============================================================' -ForegroundColor Cyan
@@ -163,7 +173,6 @@ foreach ($Event in $Events) {
 }
 
 if (-not $SummaryGenerated) {
-    # Establish fallback window assessment
     $LocalBootHour = (Get-Date $LocalBootTime).Hour
     $LocalBootMinute = (Get-Date $LocalBootTime).Minute
     if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) { $FallbackState = 'VM CONFIRMED started due to Nerdio Pre-Stage' }
