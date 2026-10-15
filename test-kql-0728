@@ -116,21 +116,22 @@ foreach ($Event in $Events) {
                 elseif ($MinutesSinceBoot -lt 15) { $VMState = 'VM recently started before user login' }
                 else { $VMState = 'VM already available before user login' }
 
+                # 📋 EXACT REQUESTED RE-ORDERING ORDER
                 ([PSCustomObject]@{
-                    Hostname           = $Hostname
-                    TargetUser         = $User
-                    SessionState       = $SessionState
-                    DisconnectedAt     = $DisconnectTime
-                    TotalIdleTime      = $IdleDisplay
-                    VMLastBoot         = $BootTime
-                    VM_BootTimeTaken   = $BootTimeDisplay
-                    VMState            = $VMState
-                    LoginStarted       = $StartTime
-                    LogonSucceeded     = $LogonTime
-                    DesktopReady       = $Event.TimeCreated
-                    AuthenticationSec  = $AuthenticationSec
-                    DesktopLoadSec     = $DesktopLoadSec
-                    TotalLoginSec      = $TotalLoginSec
+                    Hostname          = $Hostname
+                    TargetUser        = $User
+                    VMLastBoot        = $BootTime
+                    VM_BootTimeTaken  = $BootTimeDisplay
+                    SessionState      = $SessionState
+                    DisconnectedAt    = $DisconnectTime
+                    TotalIdleTime     = $IdleDisplay
+                    VMState           = $VMState
+                    LoginStarted      = $StartTime
+                    LogonSucceeded    = $LogonTime
+                    DesktopReady      = $Event.TimeCreated
+                    AuthenticationSec = $AuthenticationSec
+                    DesktopLoadSec    = $DesktopLoadSec
+                    TotalLoginSec     = $TotalLoginSec
                 }) | Format-List
                 Write-Host '------------------------------------------------------------'
                 $StartTime = $null; $LogonTime = $null
@@ -143,11 +144,11 @@ if (-not $SummaryGenerated) {
     Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
+    Write-Host "  Last Boot Time     : $BootTime"
+    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Current State      : $SessionState"
     Write-Host "  Disconnected At    : $DisconnectTime"
     Write-Host "  Total Idle Time    : $IdleDisplay"
-    Write-Host "  Last Boot Time     : $BootTime"
-    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
     Write-Host "[-] NOTICE: User '$User' is listed as $SessionState, but a complete matching logon footprint (Events 41->21->22) does not exist inside this specific boot cycle." -ForegroundColor Yellow
