@@ -36,6 +36,7 @@ $SessionState = $UserSession.State
 if ([string]::IsNullOrWhiteSpace($User)) {
     $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
     $LocalBootTime = Convert-ToLocalTime $BootTime
+    $FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
     $UptimeSpan = (Get-Date) - $BootTime
     $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
     
@@ -47,7 +48,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     Write-Host 'CURRENT VM STATUS' -ForegroundColor Cyan
     Write-Host '============================================================' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
-    Write-Host "  Last Boot Time     : $LocalBootTime (CST)"
+    Write-Host "  Last Boot Time     : $FormattedBootTime"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
@@ -59,6 +60,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
 # --- PROCESS USER EVENT LOG ENTRIES ---
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 $LocalBootTime = Convert-ToLocalTime $BootTime
+$FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
 $UptimeSpan = (Get-Date) - $BootTime
 $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
 
@@ -120,7 +122,7 @@ foreach ($Event in $Events) {
                 ([PSCustomObject]@{
                     Hostname          = $Hostname
                     TargetUser        = $User
-                    VMLastBoot        = "$LocalBootTime (CST)"
+                    VMLastBoot        = $FormattedBootTime
                     VM_BootTimeTaken  = $BootTimeDisplay
                     SessionState      = $SessionState
                     DisconnectedAt    = $LocalDisconnectTime
@@ -144,7 +146,7 @@ if (-not $SummaryGenerated) {
     Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
-    Write-Host "  Last Boot Time     : $LocalBootTime (CST)"
+    Write-Host "  Last Boot Time     : $FormattedBootTime"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Current State      : $SessionState"
     Write-Host "  Disconnected At    : $LocalDisconnectTime"
