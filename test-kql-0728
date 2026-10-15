@@ -1,8 +1,8 @@
 # Get local Hostname
 $Hostname = $env:COMPUTERNAME
 
-# Define the target local timezone for conversion
-$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+# Define the target local timezone for conversion (CST / CDT)
+$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
 
 function Convert-ToLocalTime($UtcTime) {
     if ($null -eq $UtcTime) { return $null }
@@ -47,7 +47,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     Write-Host 'CURRENT VM STATUS' -ForegroundColor Cyan
     Write-Host '============================================================' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
-    Write-Host "  Last Boot Time     : $LocalBootTime (ET)"
+    Write-Host "  Last Boot Time     : $LocalBootTime (CST)"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
@@ -78,7 +78,7 @@ $DisconnectEvent = Get-WinEvent -FilterHashtable @{
 
 if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
     $DisconnectTime = $DisconnectEvent.TimeCreated
-    $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (ET)"
+    $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (CST)"
     $IdleSpan = (Get-Date) - $DisconnectTime
     $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
 } else {
@@ -120,15 +120,15 @@ foreach ($Event in $Events) {
                 ([PSCustomObject]@{
                     Hostname          = $Hostname
                     TargetUser        = $User
-                    VMLastBoot        = "$LocalBootTime (ET)"
+                    VMLastBoot        = "$LocalBootTime (CST)"
                     VM_BootTimeTaken  = $BootTimeDisplay
                     SessionState      = $SessionState
                     DisconnectedAt    = $LocalDisconnectTime
                     TotalIdleTime     = $IdleDisplay
                     VMState           = $VMState
-                    LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (ET)"
-                    LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (ET)"
-                    DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (ET)"
+                    LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (CST)"
+                    LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (CST)"
+                    DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (CST)"
                     AuthenticationSec = $AuthenticationSec
                     DesktopLoadSec    = $DesktopLoadSec
                     TotalLoginSec     = $TotalLoginSec
@@ -144,7 +144,7 @@ if (-not $SummaryGenerated) {
     Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
-    Write-Host "  Last Boot Time     : $LocalBootTime (ET)"
+    Write-Host "  Last Boot Time     : $LocalBootTime (CST)"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Current State      : $SessionState"
     Write-Host "  Disconnected At    : $LocalDisconnectTime"
