@@ -122,7 +122,6 @@ foreach ($Event in $Events) {
                 if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) {
                     $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
                 }
-                # Resilient Check: If a connection falls within 5 minutes of a cold boot, it is verified
                 elseif ($MinutesSinceBoot -lt 5) { 
                     $VMState = 'VM CONFIRMED started due to user connection' 
                 }
