@@ -1,7 +1,22 @@
 $User = "U579652"
 
-# Get VM Boot Time
+# Get VM Hardware Boot Initiation Time
 $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+
+# Calculate Time Taken to Boot the VM (Using Event 6005 - Event Log Service Started)
+$Event6005 = Get-WinEvent -FilterHashtable @{
+    LogName   = 'System'
+    Id        = 6005
+    StartTime = $BootTime.AddMinutes(-1)
+} -MaxEvents 1 -ErrorAction SilentlyContinue
+
+if ($Event6005) {
+    $BootReadyTime = $Event6005.TimeCreated
+    $BootDurationSec = [math]::Round(($BootReadyTime - $BootTime).TotalSeconds, 0)
+    $BootTimeDisplay = "$BootDurationSec Seconds"
+} else {
+    $BootTimeDisplay = "Unable to calculate (Log missing)"
+}
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -36,7 +51,6 @@ foreach ($Event in $Events) {
             $LogonTime = $Event.TimeCreated 
         }
         22 {
-            # Robust check: Ensure events exist AND occurred on the same day to verify it's the same session
             if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
                 $SummaryGenerated = $true
                 $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
@@ -52,10 +66,11 @@ foreach ($Event in $Events) {
                     $VMState = "VM already available before user login"
                 }
 
+                # Removed MinutesSinceBoot property and replaced with VM_BootTimeTaken
                 ([PSCustomObject]@{
                     VMLastBoot        = $BootTime
+                    VM_BootTimeTaken  = $BootTimeDisplay
                     VMState           = $VMState
-                    MinutesSinceBoot  = $MinutesSinceBoot
                     LoginStarted      = $StartTime
                     LogonSucceeded    = $LogonTime
                     DesktopReady      = $Event.TimeCreated
@@ -66,7 +81,6 @@ foreach ($Event in $Events) {
 
                 Write-Host "------------------------------------------------------------"
                 
-                # Clear tracking for the next sequence
                 $StartTime = $null
                 $LogonTime = $null
             }
@@ -74,12 +88,10 @@ foreach ($Event in $Events) {
     }
 }
 
-# If the user hasn't logged in during this boot cycle, clear the confusion and say it clearly!
 if (-not $SummaryGenerated) {
-    $CurrentMinutesSince = [math]::Round(((Get-Date) - $BootTime).TotalMinutes, 1)
     Write-Host "CURRENT VM STATUS:" -ForegroundColor Cyan
     Write-Host "  Last Boot Time     : $BootTime"
-    Write-Host "  Minutes Since Boot : $CurrentMinutesSince"
+    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host ""
     Write-Host "[✓] CONFIRMED: User '$User' has NOT logged into this VM during the current boot cycle." -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Cyan
