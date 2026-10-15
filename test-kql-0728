@@ -1,10 +1,10 @@
-# 🤖 Automatically detect the currently logged-in AVD username (Handles Active/Disconnected state)
+# 🤖 Resilient detection of the currently logged-in user session (Handles variations in qwinsta spacing)
 $User = qwinsta | ForEach-Object {
-    $Fields = $_ -split '\s+'
-    # Look for rows where State is Active ('Active') or Disconnected ('Disc') and extract user
-    if ($Fields[3] -eq 'Active' -or $Fields[2] -eq 'Disc') {
-        if ($Fields[1] -ne 'SYSTEM' -and $Fields[1] -ne 'NETWORK') {
-            $Fields[1] # This captures the real username
+    $Line = $_.Trim()
+    if ($Line -match '^(?<session>[\w\-]+)?\s+(?<user>[a-zA-Z0-9_\-]+)\s+\d+\s+(?<state>Active|Disc)') {
+        $FoundUser = $Matches['user'].Trim()
+        if ($FoundUser -notin @('SYSTEM', 'NETWORK', 'SERVICE', 'USERNAME')) {
+            $FoundUser
         }
     }
 } | Select-Object -First 1
@@ -19,6 +19,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     $Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
     $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { "Unknown" }
 
+    Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "CURRENT VM STATUS" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
@@ -43,6 +44,7 @@ $Event6005 = Get-WinEvent -FilterHashtable @{
 
 $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { "Log Missing" }
 
+Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User" -ForegroundColor Yellow
 Write-Host "============================================================" -ForegroundColor Cyan
