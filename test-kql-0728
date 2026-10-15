@@ -103,4 +103,4 @@ if (-not $SummaryGenerated) {
     Write-Host ""
     Write-Host "[-] NOTICE: User '$User' is connected, but a complete matching logon footprint (Events 41->21->22) does not exist inside this specific boot cycle." -ForegroundColor Yellow
     Write-Host "============================================================" -ForegroundColor Cyan
-}
+} 
