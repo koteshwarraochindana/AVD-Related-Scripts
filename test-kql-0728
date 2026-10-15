@@ -23,7 +23,7 @@ $AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
             }
         }
     }
-} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group[0] } # Remove duplicate session IDs
+} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group } # Remove duplicate session IDs
 
 $UserSession = $AVDSessions | Select-Object -First 1
 $User = $UserSession.Username
@@ -49,7 +49,7 @@ if ([string]::IsNullOrWhiteSpace($User)) {
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
     Write-Host ""
-    Write-Host 'No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
+    Write-Host '[✓] CONFIRMED: No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
     Write-Host '============================================================' -ForegroundColor Cyan
     Exit 0
 }
@@ -68,12 +68,28 @@ $Event6005 = Get-WinEvent -FilterHashtable @{
 
 $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Log Missing' }
 
+# Look for Event ID 24 (Session Disconnected) for this user to extract dynamic disconnect metrics
+$DisconnectEvent = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    Id        = 24
+    StartTime = $BootTime
+} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+
+if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
+    $DisconnectTime = $DisconnectEvent.TimeCreated
+    $IdleSpan = (Get-Date) - $DisconnectTime
+    $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
+} else {
+    $DisconnectTime = "N/A (User is currently Active)"
+    $IdleDisplay = "N/A"
+}
+
 Write-Host ""
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
 Write-Host '============================================================' -ForegroundColor Cyan
 
-# Collect Events for the auto-discovered user string
+# Collect Connection Events for the profile metrics
 $Events = Get-WinEvent -FilterHashtable @{
     LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
     StartTime = $BootTime
@@ -101,18 +117,20 @@ foreach ($Event in $Events) {
                 else { $VMState = 'VM already available before user login' }
 
                 ([PSCustomObject]@{
-                    Hostname          = $Hostname
-                    TargetUser        = $User
-                    SessionState      = $SessionState
-                    VMLastBoot        = $BootTime
-                    VM_BootTimeTaken  = $BootTimeDisplay
-                    VMState           = $VMState
-                    LoginStarted      = $StartTime
-                    LogonSucceeded    = $LogonTime
-                    DesktopReady      = $Event.TimeCreated
-                    AuthenticationSec = $AuthenticationSec
-                    DesktopLoadSec    = $DesktopLoadSec
-                    TotalLoginSec     = $TotalLoginSec
+                    Hostname           = $Hostname
+                    TargetUser         = $User
+                    SessionState       = $SessionState
+                    DisconnectedAt     = $DisconnectTime
+                    TotalIdleTime      = $IdleDisplay
+                    VMLastBoot         = $BootTime
+                    VM_BootTimeTaken   = $BootTimeDisplay
+                    VMState            = $VMState
+                    LoginStarted       = $StartTime
+                    LogonSucceeded     = $LogonTime
+                    DesktopReady       = $Event.TimeCreated
+                    AuthenticationSec  = $AuthenticationSec
+                    DesktopLoadSec     = $DesktopLoadSec
+                    TotalLoginSec      = $TotalLoginSec
                 }) | Format-List
                 Write-Host '------------------------------------------------------------'
                 $StartTime = $null; $LogonTime = $null
@@ -126,6 +144,8 @@ if (-not $SummaryGenerated) {
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
     Write-Host "  Current State      : $SessionState"
+    Write-Host "  Disconnected At    : $DisconnectTime"
+    Write-Host "  Total Idle Time    : $IdleDisplay"
     Write-Host "  Last Boot Time     : $BootTime"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
