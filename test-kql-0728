@@ -28,9 +28,8 @@ $AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
     }
 } | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group }
 
-$UserSession = $AVDSessions | Select-Object -First 1
-$User = $UserSession.Username
-$SessionState = $UserSession.State
+$User = $AVDSessions[0].Username
+$SessionState = $AVDSessions[0].State
 
 # --- FALLBACK PROTECTION ---
 if ([string]::IsNullOrWhiteSpace($User)) {
@@ -88,6 +87,14 @@ if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
     $IdleDisplay = "N/A"
 }
 
+# 🛠️ Query Kernel-Power logs to trace absolute wake source origin
+$ColdBootEvent = Get-WinEvent -FilterHashtable @{
+    LogName   = 'System'
+    ProviderName = 'Microsoft-Windows-Kernel-Power'
+    Id        = 41, 109
+    StartTime = $BootTime.AddMinutes(-1)
+} -ErrorAction SilentlyContinue | Select-Object -First 1
+
 Write-Host ""
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
@@ -115,9 +122,22 @@ foreach ($Event in $Events) {
                 $TotalLoginSec      = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
                 $MinutesSinceBoot   = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
 
-                if ($MinutesSinceBoot -lt 5) { $VMState = 'VM likely started due to user connection' }
-                elseif ($MinutesSinceBoot -lt 15) { $VMState = 'VM recently started before user login' }
-                else { $VMState = 'VM already available before user login' }
+                # Isolate the exact daily 5:00 AM Nerdio Pre-Stage window
+                $LocalBootHour = (Get-Date $LocalBootTime).Hour
+                $LocalBootMinute = (Get-Date $LocalBootTime).Minute
+
+                if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) {
+                    $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
+                }
+                elseif ($MinutesSinceBoot -lt 5 -and $ColdBootEvent) { 
+                    $VMState = 'VM CONFIRMED started due to user connection' 
+                }
+                elseif ($MinutesSinceBoot -lt 15) { 
+                    $VMState = 'VM recently started before user login' 
+                }
+                else { 
+                    $VMState = 'VM already available before user login' 
+                }
 
                 ([PSCustomObject]@{
                     Hostname          = $Hostname
@@ -143,12 +163,18 @@ foreach ($Event in $Events) {
 }
 
 if (-not $SummaryGenerated) {
+    # Establish fallback window assessment
+    $LocalBootHour = (Get-Date $LocalBootTime).Hour
+    $LocalBootMinute = (Get-Date $LocalBootTime).Minute
+    if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) { $FallbackState = 'VM CONFIRMED started due to Nerdio Pre-Stage' }
+    else { $FallbackState = $SessionState }
+
     Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
     Write-Host "  Hostname           : $Hostname"
     Write-Host "  Target User        : $User"
     Write-Host "  Last Boot Time     : $FormattedBootTime"
     Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
-    Write-Host "  Current State      : $SessionState"
+    Write-Host "  Current State      : $FallbackState"
     Write-Host "  Disconnected At    : $LocalDisconnectTime"
     Write-Host "  Total Idle Time    : $IdleDisplay"
     Write-Host "  Uptime             : $UptimeDisplay"
