@@ -7,122 +7,91 @@ $StartTime = (Get-Date).AddHours(-$HoursBack)
 $ComputerName = $env:COMPUTERNAME
 
 Write-Host ""
-Write-Host "====================================================="
-Write-Host "AVD SLOW LOGIN ANALYSIS"
-Write-Host "HOST : $ComputerName"
-Write-Host "LOOKBACK : $HoursBack Hours"
-Write-Host "====================================================="
+Write-Host "=====================================================" -ForegroundColor Cyan
+Write-Host "AVD SLOW LOGIN ANALYSIS" -ForegroundColor Cyan
+Write-Host "HOST     : $ComputerName" -ForegroundColor Cyan
+Write-Host "LOOKBACK : $HoursBack Hours" -ForegroundColor Cyan
+Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ------------------------------------------------------------
 # Collect Terminal Services Events
 # ------------------------------------------------------------
-
 $TSEvents = Get-WinEvent -FilterHashtable @{
     LogName = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
     StartTime = $StartTime
-    Id = 21,22,24,25,41
+    Id = 21,22,41
 } -ErrorAction SilentlyContinue | Sort-Object TimeCreated
 
 $Sessions = @()
-$CurrentSession = $null
+# Fix: Tracking concurrent state via unique Session dictionary
+$SessionTracker = @{} 
 
-foreach ($Event in $TSEvents)
-{
-    switch ($Event.Id)
-    {
+foreach ($Event in $TSEvents) {
+    # Isolate or assign unique instance identifier via operational Event XML properties
+    $SessionId = $Event.Properties[1].Value
+    $User = if ($Event.Message -match 'User:\s*([^\s\\]+)') { $Matches[1] } else { "Unknown" }
+
+    switch ($Event.Id) {
         41 {
-            $CurrentSession = [ordered]@{
+            $SessionTracker[$SessionId] = [ordered]@{
+                User         = $User
                 SessionStart = $Event.TimeCreated
                 AuthSuccess  = $null
                 DesktopReady = $null
             }
         }
-
         21 {
-            if ($CurrentSession)
-            {
-                $CurrentSession.AuthSuccess = $Event.TimeCreated
+            if ($SessionTracker.ContainsKey($SessionId)) {
+                $SessionTracker[$SessionId].AuthSuccess = $Event.TimeCreated
             }
         }
-
         22 {
-            if ($CurrentSession -and
-                $CurrentSession.SessionStart -and
-                $CurrentSession.AuthSuccess)
-            {
+            if ($SessionTracker.ContainsKey($SessionId) -and $SessionTracker[$SessionId].SessionStart -and $SessionTracker[$SessionId].AuthSuccess) {
+                $CurrentSession = $SessionTracker[$SessionId]
                 $CurrentSession.DesktopReady = $Event.TimeCreated
 
-                $AuthSec =
-                    [math]::Round(
-                        ($CurrentSession.AuthSuccess -
-                         $CurrentSession.SessionStart).TotalSeconds,0)
-
-                $DesktopSec =
-                    [math]::Round(
-                        ($CurrentSession.DesktopReady -
-                         $CurrentSession.AuthSuccess).TotalSeconds,0)
-
-                $TotalSec =
-                    [math]::Round(
-                        ($CurrentSession.DesktopReady -
-                         $CurrentSession.SessionStart).TotalSeconds,0)
+                $AuthSec    = [math]::Round(($CurrentSession.AuthSuccess - $CurrentSession.SessionStart).TotalSeconds,0)
+                $DesktopSec = [math]::Round(($CurrentSession.DesktopReady - $CurrentSession.AuthSuccess).TotalSeconds,0)
+                $TotalSec   = [math]::Round(($CurrentSession.DesktopReady - $CurrentSession.SessionStart).TotalSeconds,0)
 
                 $Sessions += [PSCustomObject]@{
                     Hostname          = $ComputerName
+                    Username          = $CurrentSession.User
                     LoginStart        = $CurrentSession.SessionStart
                     AuthenticationSec = $AuthSec
                     DesktopLoadSec    = $DesktopSec
                     TotalLoginSec     = $TotalSec
-                    Severity =
-                        if($TotalSec -gt 120){"CRITICAL"}
-                        elseif($TotalSec -gt 60){"HIGH"}
-                        elseif($TotalSec -gt 30){"WARNING"}
-                        else{"NORMAL"}
+                    Severity          = if($TotalSec -gt 120){"CRITICAL"}
+                                        elseif($TotalSec -gt 60){"HIGH"}
+                                        elseif($TotalSec -gt 30){"WARNING"}
+                                        else{"NORMAL"}
                 }
-
-                $CurrentSession = $null
+                $SessionTracker.Remove($SessionId) | Out-Null
             }
         }
     }
 }
 
 # ------------------------------------------------------------
-# Diagnostics Performance (Winlogon Delays)
+# Optimized Event Log Collections (Using FilterHashtables)
 # ------------------------------------------------------------
-
 $DiagEvents = Get-WinEvent -FilterHashtable @{
     LogName = "Microsoft-Windows-Diagnostics-Performance/Operational"
     StartTime = $StartTime
-} -ErrorAction SilentlyContinue |
-Where-Object {
-    $_.Id -in 100,101,200,400,500
-}
-
-# ------------------------------------------------------------
-# Group Policy Events
-# ------------------------------------------------------------
+    Id = 100,101,200,400,500
+} -ErrorAction SilentlyContinue
 
 $GPEvents = Get-WinEvent -FilterHashtable @{
     LogName = "Microsoft-Windows-GroupPolicy/Operational"
     StartTime = $StartTime
-} -ErrorAction SilentlyContinue |
-Select-Object TimeCreated,Id,LevelDisplayName
+} -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id,LevelDisplayName
 
-# ------------------------------------------------------------
-# FSLogix Events
-# ------------------------------------------------------------
-
-$FSLogixEvents = Get-WinEvent -LogName `
-    "Microsoft-FSLogix-Apps/Operational" `
-    -ErrorAction SilentlyContinue |
-Where-Object {
-    $_.TimeCreated -ge $StartTime
-}
-
-# ------------------------------------------------------------
-# Winlogon Events
-# ------------------------------------------------------------
+# Fix: Implemented native structural Provider filtering for lightning-fast FSLogix loading
+$FSLogixEvents = Get-WinEvent -FilterHashtable @{
+    LogName   = "Microsoft-FSLogix-Apps/Operational"
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue
 
 $WinlogonEvents = Get-WinEvent -FilterHashtable @{
     LogName = "Microsoft-Windows-Winlogon/Operational"
@@ -130,29 +99,20 @@ $WinlogonEvents = Get-WinEvent -FilterHashtable @{
 } -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------
-# Summary
+# Summary Display
 # ------------------------------------------------------------
-
 Write-Host ""
 Write-Host "========== LOGIN PERFORMANCE ==========" -ForegroundColor Cyan
-
-$Sessions |
-Sort-Object LoginStart |
-Format-Table -AutoSize
+$Sessions | Sort-Object LoginStart | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "========== SLOW LOGINS (>30 SEC) ==========" -ForegroundColor Yellow
-
-$Sessions |
-Where-Object {$_.TotalLoginSec -gt 30} |
-Sort-Object TotalLoginSec -Descending |
-Format-Table -AutoSize
+$Sessions | Where-Object {$_.TotalLoginSec -gt 30} | Sort-Object TotalLoginSec -Descending | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "========== SUMMARY ==========" -ForegroundColor Green
-
-$total = $Sessions.Count
-$slow = ($Sessions | Where-Object {$_.TotalLoginSec -gt 30}).Count
+$total    = $Sessions.Count
+$slow     = ($Sessions | Where-Object {$_.TotalLoginSec -gt 30}).Count
 $critical = ($Sessions | Where-Object {$_.TotalLoginSec -gt 120}).Count
 
 Write-Host "Total Login Attempts : $total"
@@ -166,33 +126,16 @@ Write-Host "Diag Events          : $($DiagEvents.Count)"
 # ------------------------------------------------------------
 # Export Files
 # ------------------------------------------------------------
-
 $Folder = "C:\Temp"
+if (!(Test-Path $Folder)) { New-Item -Path $Folder -ItemType Directory -Force | Out-Null }
 
-if (!(Test-Path $Folder))
-{
-    New-Item -Path $Folder -ItemType Directory -Force | Out-Null
-}
+$Sessions | Export-Csv -Path "$Folder\AVD_LoginAnalysis.csv" -NoTypeInformation
+$FSLogixEvents | Select-Object TimeCreated,Id,LevelDisplayName,Message | Export-Csv -Path "$Folder\AVD_FSLogix.csv" -NoTypeInformation
+$GPEvents | Export-Csv -Path "$Folder\AVD_GPO.csv" -NoTypeInformation
 
-$Sessions |
-Export-Csv "$Folder\AVD_LoginAnalysis.csv" `
--NoTypeInformation
-
-$FSLogixEvents |
-Select TimeCreated,Id,LevelDisplayName,Message |
-Export-Csv "$Folder\AVD_FSLogix.csv" `
--NoTypeInformation
-
-$GPEvents |
-Export-Csv "$Folder\AVD_GPO.csv" `
--NoTypeInformation
-
-$WinlogonEvents |
-Select TimeCreated,Id,Message |
-VD_Winlogon.csv" `
--NoTypeInformation
+# Fix: Repaired syntax fragmentation error
+$WinlogonEvents | Select-Object TimeCreated,Id,Message | Export-Csv -Path "$Folder\AVD_Winlogon.csv" -NoTypeInformation
 
 Write-Host ""
-Write-Host "CSV Files Saved To:"
-Write-Host "$Folder"
+Write-Host "CSV Files Saved To: $Folder" -ForegroundColor Green
 Write-Host ""
