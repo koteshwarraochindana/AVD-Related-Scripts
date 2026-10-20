@@ -1,97 +1,30 @@
-   : 263
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : WDDM graphics mode is enabled
 
-TimeCreated  : 10/19/2026 8:12:35 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519700 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
+$Start = Get-Date "10/19/2026 07:45:00"
+$End   = Get-Date "10/19/2026 08:15:00"
 
-TimeCreated  : 10/19/2026 8:12:35 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519750 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
+$Logs = @(
+    "Microsoft-Windows-GroupPolicy/Operational",
+    "Microsoft-Windows-User Profiles Service/Operational",
+    "Microsoft-Windows-Winlogon/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+)
 
-TimeCreated  : 10/19/2026 8:12:35 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519825 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
+foreach ($Log in $Logs) {
+    Write-Host "`n========== $Log ==========" -ForegroundColor Cyan
 
-TimeCreated  : 10/19/2026 8:12:35 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260731700 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:35 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260731750 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:37 AM
-Id           : 261
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Listener rdp-sxs260731800 received a connection
-
-TimeCreated  : 10/19/2026 8:12:38 AM
-Id           : 1149
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Remote Desktop Services: User authentication succeeded:
-               
-               User: 
-               Domain: 
-               Source Network Address: 
-
-TimeCreated  : 10/19/2026 8:12:44 AM
-Id           : 263
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : WDDM graphics mode is enabled
-
-TimeCreated  : 10/19/2026 8:12:44 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519700 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:44 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519750 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:45 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260519825 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:45 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260731700 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:12:45 AM
-Id           : 20523
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Connection from listener rdp-sxs260731750 will have terminal class of 
-               {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated  : 10/19/2026 8:13:10 AM
-Id           : 261
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Listener RDP-Tcp received a connection
-
-TimeCreated  : 10/19/2026 8:13:45 AM
-Id           : 261
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Listener RDP-Tcp received a connection
-
-TimeCreated  : 10/19/2026 8:13:46 AM
-Id           : 261
-ProviderName : Microsoft-Windows-TerminalServices-RemoteConnectionManager
-Message      : Listener RDP-Tcp received a connection
+    try {
+        Get-WinEvent -FilterHashtable @{
+            LogName   = $Log
+            StartTime = $Start
+            EndTime   = $End
+        } -ErrorAction Stop |
+        Sort-Object TimeCreated |
+        Select-Object TimeCreated, Id, LevelDisplayName, Message |
+        Format-List
+    }
+    catch {
+        Write-Host "Log unavailable or no events: $($_.Exception.Message)" `
+            -ForegroundColor Yellow
+    }
+}
