@@ -1,68 +1,70 @@
 
 # ============================================================
-# AVD SLOW LOGIN DIAGNOSTICS - READ ONLY
-# Target user: u312963
+# AVD SINGLE-SESSION SLOW LOGIN DIAGNOSTICS
+# No FSLogix dependency - READ ONLY
 # ============================================================
 
 $User = "u312963"
-$StartTime = [datetime]"2026-10-19 07:45:00"
-$EndTime   = [datetime]"2026-10-19 08:15:00"
 
-$LogsToCheck = @(
+# Confirm VM time zone before interpreting these timestamps.
+$StartTime = Get-Date "10/19/2026 07:45:00"
+$EndTime   = Get-Date "10/19/2026 08:20:00"
+
+$Logs = @(
     "Application",
     "System",
     "Security",
     "Microsoft-Windows-User Profile Service/Operational",
     "Microsoft-Windows-GroupPolicy/Operational",
-    "Microsoft-Windows-AppModel-State/Admin",
-    "Microsoft-FSLogix-Apps/Admin",
-    "Microsoft-FSLogix-Apps/Operational"
+    "Microsoft-Windows-Winlogon/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
 )
 
 Write-Output "============================================================"
-Write-Output "AVD SLOW LOGIN DIAGNOSTICS"
+Write-Output "AVD SINGLE-SESSION LOGIN DIAGNOSTICS"
 Write-Output "Computer : $env:COMPUTERNAME"
 Write-Output "User     : $User"
-Write-Output "Window   : $StartTime to $EndTime"
+Write-Output "From     : $StartTime"
+Write-Output "To       : $EndTime"
 Write-Output "============================================================"
 
-foreach ($LogName in $LogsToCheck) {
+foreach ($Log in $Logs) {
 
-    $LogInfo = Get-WinEvent -ListLog $LogName -ErrorAction SilentlyContinue
+    $LogInfo = Get-WinEvent -ListLog $Log -ErrorAction SilentlyContinue
 
     if (-not $LogInfo) {
+        Write-Output ""
+        Write-Output "Log unavailable: $Log"
         continue
     }
 
     Write-Output ""
-    Write-Output "----- LOG: $LogName -----"
+    Write-Output "===== $Log ====="
 
     $Events = Get-WinEvent -FilterHashtable @{
-        LogName   = $LogName
+        LogName   = $Log
         StartTime = $StartTime
         EndTime   = $EndTime
     } -MaxEvents 500 -ErrorAction SilentlyContinue |
         Sort-Object TimeCreated
 
-    $Matches = @(
-        $Events | Where-Object {
-            $_.Level -in @(1, 2, 3) -or
-            $_.Message -match [regex]::Escape($User) -or
-            $_.ProviderName -match "FSLogix|GroupPolicy|User Profile|AppModel|Winlogon|Kerberos|LsaSrv|DNS"
-        }
-    )
+    $FilteredEvents = $Events | Where-Object {
+        $_.Level -in @(1, 2, 3) -or
+        $_.Message -match [regex]::Escape($User) -or
+        $_.ProviderName -match 'Winlogon|User Profile|GroupPolicy|Kerberos|LsaSrv|Netlogon|DNS'
+    }
 
-    if ($Matches.Count -eq 0) {
-        Write-Output "No matching warning, error, or relevant events found."
+    if (-not $FilteredEvents) {
+        Write-Output "No matching events found."
         continue
     }
 
-    foreach ($Event in $Matches) {
+    foreach ($Event in $FilteredEvents) {
 
-        $Message = ($Event.Message -replace "`r?`n", " ").Trim()
+        $Message = ($Event.Message -replace '\s+', ' ').Trim()
 
-        if ($Message.Length -gt 900) {
-            $Message = $Message.Substring(0, 900) + "..."
+        if ($Message.Length -gt 700) {
+            $Message = $Message.Substring(0, 700) + "..."
         }
 
         Write-Output ("Time     : {0}" -f $Event.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
@@ -74,32 +76,33 @@ foreach ($LogName in $LogsToCheck) {
     }
 }
 
-# FSLogix text logs
-$FSLogixPath = "C:\ProgramData\FSLogix\Logs"
-
 Write-Output ""
-Write-Output "===== FSLOGIX TEXT LOG SEARCH ====="
+Write-Output "===== DOMAIN AND DNS CHECKS ====="
 
-if (Test-Path $FSLogixPath) {
+try {
+    $Domain = (Get-CimInstance Win32_ComputerSystem).Domain
+    Write-Output "Domain: $Domain"
 
-    Get-ChildItem $FSLogixPath -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.LastWriteTime -ge $StartTime.AddHours(-1) -and
-            $_.LastWriteTime -le $EndTime.AddHours(1) -and
-            $_.Extension -in @(".log", ".txt")
-        } |
-        ForEach-Object {
-            Select-String -Path $_.FullName `
-                -Pattern $User, "error", "failed", "timeout", "attach", "loadProfile" `
-                -SimpleMatch:$false -ErrorAction SilentlyContinue |
-                Select-Object -First 30 |
-                ForEach-Object {
-                    Write-Output ("{0}: {1}" -f $_.Path, $_.Line.Trim())
-                }
-        }
+    if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+        Write-Output "Domain controller discovery:"
+        nltest /dsgetdc:$Domain 2>&1
+
+        Write-Output "Secure channel:"
+        nltest /sc_verify:$Domain 2>&1
+    }
+    else {
+        Write-Output "Machine is not domain joined."
+    }
+
+    Write-Output "Configured DNS servers:"
+    Get-DnsClientServerAddress -AddressFamily IPv4 |
+        Where-Object { $_.ServerAddresses } |
+        Format-Table InterfaceAlias, ServerAddresses -AutoSize |
+        Out-String |
+        Write-Output
 }
-else {
-    Write-Output "FSLogix log directory not found."
+catch {
+    Write-Output "Domain/DNS check failed: $($_.Exception.Message)"
 }
 
 Write-Output ""
