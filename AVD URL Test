@@ -1,161 +1,198 @@
-# Get local Hostname
-$Hostname = $env:COMPUTERNAME
+# ============================================================
+# AVD SLOW LOGIN ANALYSIS REPORT - LAST 72 HOURS
+# ============================================================
 
-# Define 72-hour window and timezone setup
-$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
-$Time72HoursAgo = (Get-Date).AddHours(-72)
+$HoursBack = 72
+$StartTime = (Get-Date).AddHours(-$HoursBack)
+$ComputerName = $env:COMPUTERNAME
 
-function Convert-ToLocalTime($UtcTime) {
-    if ($null -eq $UtcTime) { return $null }
-    return [System.TimeZoneInfo]::ConvertTime($UtcTime, $LocalTimeZone)
-}
+Write-Host ""
+Write-Host "====================================================="
+Write-Host "AVD SLOW LOGIN ANALYSIS"
+Write-Host "HOST : $ComputerName"
+Write-Host "LOOKBACK : $HoursBack Hours"
+Write-Host "====================================================="
+Write-Host ""
 
-# --- SYSTEM METRICS (Independent of Users) ---
-$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-$LocalBootTime = Convert-ToLocalTime $BootTime
-$FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
-$UptimeSpan = (Get-Date) - $BootTime
-$UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
-$Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
-$BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Unknown' }
+# ------------------------------------------------------------
+# Collect Terminal Services Events
+# ------------------------------------------------------------
 
-# --- DETECT ALL USERS IN THE LAST 72 HOURS ---
-# Merges current active/disconnected sessions with historical Event Log usernames from the past 72 hrs
-$ActiveUsers = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
-    $SessionId = $_.LogonId
-    if ($_.LogonType -in @(2, 10)) {
-        $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
-        if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) { $UserQuery.Name }
-    }
-}
-$HistoricalUsers = Get-WinEvent -FilterHashtable @{
-    LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-    StartTime = $Time72HoursAgo
-    Id = @(21, 22, 24, 25)
-} -ErrorAction SilentlyContinue | ForEach-Object {
-    if ($_.Message -match 'User:\s*([^\s\\]+)') { $Matches[1] }
-}
-$TargetUsers = ($ActiveUsers + $HistoricalUsers) | Where-Object { $_ } | Select-Object -Unique
+$TSEvents = Get-WinEvent -FilterHashtable @{
+    LogName = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
+    StartTime = $StartTime
+    Id = 21,22,24,25,41
+} -ErrorAction SilentlyContinue | Sort-Object TimeCreated
 
-# --- FALLBACK PROTECTION ---
-if ($TargetUsers.Count -eq 0) {
-    Write-Host ""
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Write-Host 'CURRENT VM STATUS (NO USER ACTIVITY IN LAST 72 HOURS)' -ForegroundColor Cyan
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Write-Host " Hostname           : $Hostname"
-    Write-Host " Last Boot Time     : $FormattedBootTime"
-    Write-Host " VM Boot Time Taken : $BootTimeDisplay"
-    Write-Host " Uptime             : $UptimeDisplay"
-    Write-Host ""
-    Write-Host '[✓] CONFIRMED: No active or historical user sessions detected in the last 72 hours.' -ForegroundColor Green
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Exit 0
-}
+$Sessions = @()
+$CurrentSession = $null
 
-# --- PROCESS SEPARATE REPORT FOR EACH DETECTED USER ---
-foreach ($User in $TargetUsers) {
-    
-    # Determine current transient live state for this specific user
-    $QState = qwinsta $User 2>$null | ForEach-Object {
-        if ($_ -match 'Active') { 'Active' } elseif ($_ -match 'Disc') { 'Disconnected' }
-    } | Select-Object -First 1
-    $SessionState = if ($QState) { $QState } else { 'Offline (Historical)' }
+foreach ($Event in $TSEvents)
+{
+    switch ($Event.Id)
+    {
+        41 {
+            $CurrentSession = [ordered]@{
+                SessionStart = $Event.TimeCreated
+                AuthSuccess  = $null
+                DesktopReady = $null
+            }
+        }
 
-    # Query Disconnect Times
-    $DisconnectEvent = Get-WinEvent -FilterHashtable @{
-        LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-        Id = 24
-        StartTime = $Time72HoursAgo
-    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+        21 {
+            if ($CurrentSession)
+            {
+                $CurrentSession.AuthSuccess = $Event.TimeCreated
+            }
+        }
 
-    if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
-        $DisconnectTime = $DisconnectEvent.TimeCreated
-        $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (CST)"
-        $IdleSpan = (Get-Date) - $DisconnectTime
-        $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
-    } else {
-        $LocalDisconnectTime = if ($SessionState -eq 'Active') { "N/A (User is currently Active)" } else { "N/A (User Session Closed)" }
-        $IdleDisplay = "N/A"
-    }
+        22 {
+            if ($CurrentSession -and
+                $CurrentSession.SessionStart -and
+                $CurrentSession.AuthSuccess)
+            {
+                $CurrentSession.DesktopReady = $Event.TimeCreated
 
-    Write-Host ""
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Write-Host "72-HR AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
-    Write-Host '============================================================' -ForegroundColor Cyan
+                $AuthSec =
+                    [math]::Round(
+                        ($CurrentSession.AuthSuccess -
+                         $CurrentSession.SessionStart).TotalSeconds,0)
 
-    # Pull user tracking events within the 72-hour window
-    $Events = Get-WinEvent -FilterHashtable @{
-        LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-        StartTime = $Time72HoursAgo
-        Id = 21, 22, 41, 42
-    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
+                $DesktopSec =
+                    [math]::Round(
+                        ($CurrentSession.DesktopReady -
+                         $CurrentSession.AuthSuccess).TotalSeconds,0)
 
-    $StartTime = $null
-    $LogonTime = $null
-    $SummaryGenerated = $false
+                $TotalSec =
+                    [math]::Round(
+                        ($CurrentSession.DesktopReady -
+                         $CurrentSession.SessionStart).TotalSeconds,0)
 
-    foreach ($Event in $Events) {
-        switch ($Event.Id) {
-            41 { $StartTime = $Event.TimeCreated }
-            21 { $LogonTime = $Event.TimeCreated }
-            22 {
-                if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
-                    $SummaryGenerated = $true
-                    $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
-                    $DesktopLoadSec = [math]::Round(($Event.TimeCreated - $LogonTime).TotalSeconds, 0)
-                    $TotalLoginSec = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
-                    $MinutesSinceBoot = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
-
-                    # Dynamic Evaluation window setup
-                    $LocalBootHour = (Get-Date $LocalBootTime).Hour
-                    $LocalBootMinute = (Get-Date $LocalBootTime).Minute
-                    
-                    if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10 -and $StartTime -lt $BootTime.AddHours(2)) {
-                        $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
-                    } elseif ($MinutesSinceBoot -ge 0 -and $MinutesSinceBoot -lt 5) {
-                        $VMState = 'VM CONFIRMED started due to user connection'
-                    } elseif ($MinutesSinceBoot -ge 0 -and $MinutesSinceBoot -lt 15) {
-                        $VMState = 'VM recently started before user login'
-                    } else {
-                        $VMState = 'VM already available before user login'
-                    }
-
-                    ([PSCustomObject]@{
-                        Hostname          = $Hostname
-                        TargetUser        = $User
-                        VMLastBoot        = $FormattedBootTime
-                        VM_BootTimeTaken  = $BootTimeDisplay
-                        SessionState      = $SessionState
-                        DisconnectedAt    = $LocalDisconnectTime
-                        TotalIdleTime     = $IdleDisplay
-                        VMState           = $VMState
-                        LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (CST)"
-                        LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (CST)"
-                        DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (CST)"
-                        AuthenticationSec = $AuthenticationSec
-                        DesktopLoadSec    = $DesktopLoadSec
-                        TotalLoginSec     = $TotalLoginSec
-                    }) | Format-List
-                    Write-Host '------------------------------------------------------------'
-                    $StartTime = $null; $LogonTime = $null
+                $Sessions += [PSCustomObject]@{
+                    Hostname          = $ComputerName
+                    LoginStart        = $CurrentSession.SessionStart
+                    AuthenticationSec = $AuthSec
+                    DesktopLoadSec    = $DesktopSec
+                    TotalLoginSec     = $TotalSec
+                    Severity =
+                        if($TotalSec -gt 120){"CRITICAL"}
+                        elseif($TotalSec -gt 60){"HIGH"}
+                        elseif($TotalSec -gt 30){"WARNING"}
+                        else{"NORMAL"}
                 }
+
+                $CurrentSession = $null
             }
         }
     }
-
-    if (-not $SummaryGenerated) {
-        Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
-        Write-Host " Hostname           : $Hostname"
-        Write-Host " Target User        : $User"
-        Write-Host " Last Boot Time     : $FormattedBootTime"
-        Write-Host " VM Boot Time Taken : $BootTimeDisplay"
-        Write-Host " Current State      : $SessionState"
-        Write-Host " Disconnected At    : $LocalDisconnectTime"
-        Write-Host " Total Idle Time    : $IdleDisplay"
-        Write-Host " Uptime             : $UptimeDisplay"
-        Write-Host ""
-        Write-Host "[-] NOTICE: User '$User' has tracking records within the last 72 hours, but a sequential logon footprint (Events 41->21->22) did not conclude inside this time window." -ForegroundColor Yellow
-        Write-Host '============================================================' -ForegroundColor Cyan
-    }
 }
+
+# ------------------------------------------------------------
+# Diagnostics Performance (Winlogon Delays)
+# ------------------------------------------------------------
+
+$DiagEvents = Get-WinEvent -FilterHashtable @{
+    LogName = "Microsoft-Windows-Diagnostics-Performance/Operational"
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Id -in 100,101,200,400,500
+}
+
+# ------------------------------------------------------------
+# Group Policy Events
+# ------------------------------------------------------------
+
+$GPEvents = Get-WinEvent -FilterHashtable @{
+    LogName = "Microsoft-Windows-GroupPolicy/Operational"
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue |
+Select-Object TimeCreated,Id,LevelDisplayName
+
+# ------------------------------------------------------------
+# FSLogix Events
+# ------------------------------------------------------------
+
+$FSLogixEvents = Get-WinEvent -LogName `
+    "Microsoft-FSLogix-Apps/Operational" `
+    -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.TimeCreated -ge $StartTime
+}
+
+# ------------------------------------------------------------
+# Winlogon Events
+# ------------------------------------------------------------
+
+$WinlogonEvents = Get-WinEvent -FilterHashtable @{
+    LogName = "Microsoft-Windows-Winlogon/Operational"
+    StartTime = $StartTime
+} -ErrorAction SilentlyContinue
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "========== LOGIN PERFORMANCE ==========" -ForegroundColor Cyan
+
+$Sessions |
+Sort-Object LoginStart |
+Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "========== SLOW LOGINS (>30 SEC) ==========" -ForegroundColor Yellow
+
+$Sessions |
+Where-Object {$_.TotalLoginSec -gt 30} |
+Sort-Object TotalLoginSec -Descending |
+Format-Table -AutoSize
+
+Write-Host ""
+Write-Host "========== SUMMARY ==========" -ForegroundColor Green
+
+$total = $Sessions.Count
+$slow = ($Sessions | Where-Object {$_.TotalLoginSec -gt 30}).Count
+$critical = ($Sessions | Where-Object {$_.TotalLoginSec -gt 120}).Count
+
+Write-Host "Total Login Attempts : $total"
+Write-Host "Slow Logins (>30s)   : $slow"
+Write-Host "Critical (>120s)     : $critical"
+Write-Host "FSLogix Events       : $($FSLogixEvents.Count)"
+Write-Host "Winlogon Events      : $($WinlogonEvents.Count)"
+Write-Host "GPO Events           : $($GPEvents.Count)"
+Write-Host "Diag Events          : $($DiagEvents.Count)"
+
+# ------------------------------------------------------------
+# Export Files
+# ------------------------------------------------------------
+
+$Folder = "C:\Temp"
+
+if (!(Test-Path $Folder))
+{
+    New-Item -Path $Folder -ItemType Directory -Force | Out-Null
+}
+
+$Sessions |
+Export-Csv "$Folder\AVD_LoginAnalysis.csv" `
+-NoTypeInformation
+
+$FSLogixEvents |
+Select TimeCreated,Id,LevelDisplayName,Message |
+Export-Csv "$Folder\AVD_FSLogix.csv" `
+-NoTypeInformation
+
+$GPEvents |
+Export-Csv "$Folder\AVD_GPO.csv" `
+-NoTypeInformation
+
+$WinlogonEvents |
+Select TimeCreated,Id,Message |
+VD_Winlogon.csv" `
+-NoTypeInformation
+
+Write-Host ""
+Write-Host "CSV Files Saved To:"
+Write-Host "$Folder"
+Write-Host ""
