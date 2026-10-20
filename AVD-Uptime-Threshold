@@ -1,14 +1,922 @@
+PS C:\Users\p579652> # ============================================================
+# AVD AUTHENTICATION INVESTIGATION REPORT
+# Last 72 Hours
+# ============================================================
 
-$Start = [datetime]'2026-10-19 07:50:00'
-$End   = [datetime]'2026-10-19 08:15:00'
+$StartTime = (Get-Date).AddHours(-72)
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "AVD DOMAIN AUTHENTICATION INVESTIGATION" -ForegroundColor Yellow
+Write-Host "Host: $env:COMPUTERNAME"
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ------------------------------------------------------------
+# SYSTEM LOG
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "NETLOGON / DNS / SECURE CHANNEL EVENTS" -ForegroundColor Green
+Write-Host "============================================================"
 
 Get-WinEvent -FilterHashtable @{
-    LogName   = 'System'
-    StartTime = $Start
-    EndTime   = $End
+    LogName='System'
+    StartTime=$StartTime
 } -ErrorAction SilentlyContinue |
 Where-Object {
-    $_.ProviderName -match 'NETLOGON'
+    $_.ProviderName -match 'NETLOGON|DNS|DNS Client Events|GroupPolicy|LSASRV|Time-Service'
 } |
-Select-Object TimeCreated, Id, ProviderName, Message |
+Select-Object `
+TimeCreated,
+ProviderName,
+Id,
+LevelDisplayName,
+@{
+    Name='Message'
+    Expression={
+        $_.Message.Replace("`r"," ").Replace("`n"," ")
+    }
+} |
 Format-List
+
+# ------------------------------------------------------------
+# COMMON NETLOGON EVENTS
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "NETLOGON FAILURES" -ForegroundColor Red
+Write-Host "============================================================"
+
+Get-WinEvent -FilterHashtable @{
+    LogName='System'
+    StartTime=$StartTime
+} -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.ProviderName -eq 'NETLOGON' -and
+    $_.Id -in @(5719,5722,5783,5805)
+} |
+Select TimeCreated,Id,LevelDisplayName,Message |
+Format-List
+
+# ------------------------------------------------------------
+# CURRENT DOMAIN INFO
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "DOMAIN INFORMATION" -ForegroundColor Green
+Write-Host "============================================================"
+
+Write-Host "Computer Name : $env:COMPUTERNAME"
+Write-Host "Domain        : $((Get-CimInstance Win32_ComputerSystem).Domain)"
+Write-Host "Logon Server  : $env:LOGONSERVER"
+
+Write-Host ""
+
+# ------------------------------------------------------------
+# TEST SECURE CHANNEL
+# ------------------------------------------------------------
+
+try {
+
+    $SecureChannel = Test-ComputerSecureChannel -Verbose
+
+    Write-Host "Secure Channel Healthy : $SecureChannel" -ForegroundColor Green
+}
+catch {
+
+    Write-Host "Secure Channel Test Failed" -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ------------------------------------------------------------
+# DISCOVER DOMAIN CONTROLLER
+# ------------------------------------------------------------
+
+Write-Host "CURRENT DOMAIN CONTROLLER" -ForegroundColor Green
+Write-Host "============================================================"
+
+$Domain = (Get-CimInstance Win32_ComputerSystem).Domain
+
+nltest /dsgetdc:$Domain
+
+Write-Host ""
+
+# ------------------------------------------------------------
+# LOGIN EVENTS
+# ------------------------------------------------------------
+
+Write-Host "LOGIN TIMING EVENTS" -ForegroundColor Green
+Write-Host "============================================================"
+
+Get-WinEvent -FilterHashtable @{
+    LogName='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    Id=21,22,24,25,41
+    StartTime=$StartTime
+} -ErrorAction SilentlyContinue |
+Select TimeCreated,Id |
+Sort TimeCreated |
+Format-Table -AutoSize
+
+============================================================
+AVD DOMAIN AUTHENTICATION INVESTIGATION
+Host: CAVW301f
+============================================================
+
+
+NETLOGON / DNS / SECURE CHANNEL EVENTS
+============================================================
+
+
+TimeCreated      : 10/20/2026 6:17:32 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 6:13:24 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123) with reference id 587945482. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 6:13:09 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 6:13:08 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 6:11:11 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 6:10:48 PM
+ProviderName     : LsaSrv
+Id               : 6038
+LevelDisplayName : Warning
+Message          : Microsoft Windows Server has detected that NTLM authentication is presently being used between clients 
+                   and this server. This event occurs once per boot of the server on the first time a client uses NTLM 
+                   with this server.     NTLM is a weaker authentication mechanism. Please check:           Which 
+                   applications are using NTLM authentication?        Are there configuration issues preventing the use of 
+                   stronger authentication such as Kerberos authentication?        If NTLM must be supported, is Extended 
+                   Protection configured?     Details on how to complete these checks can be found at 
+                   http://go.microsoft.com/fwlink/?LinkId=225699.
+
+TimeCreated      : 10/20/2026 6:09:48 PM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+TimeCreated      : 10/20/2026 6:05:39 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/20/2026 6:05:30 PM
+ProviderName     : LsaSrv
+Id               : 6038
+LevelDisplayName : Warning
+Message          : Microsoft Windows Server has detected that NTLM authentication is presently being used between clients 
+                   and this server. This event occurs once per boot of the server on the first time a client uses NTLM 
+                   with this server.     NTLM is a weaker authentication mechanism. Please check:           Which 
+                   applications are using NTLM authentication?        Are there configuration issues preventing the use of 
+                   stronger authentication such as Kerberos authentication?        If NTLM must be supported, is Extended 
+                   Protection configured?     Details on how to complete these checks can be found at 
+                   http://go.microsoft.com/fwlink/?LinkId=225699.
+
+TimeCreated      : 10/20/2026 6:02:52 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc03.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.36:123) with reference id 604722698. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 6:02:37 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc03.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.36:123).
+
+TimeCreated      : 10/20/2026 6:02:36 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc03.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.36:123).
+
+TimeCreated      : 10/20/2026 6:01:14 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 6:00:29 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 6:00:19 PM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+TimeCreated      : 10/20/2026 4:58:17 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/20/2026 4:56:43 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 3:16:43 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc02.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.10:123) with reference id 168515082. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 3:16:29 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc02.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.10:123).
+
+TimeCreated      : 10/20/2026 3:16:27 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc02.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.10:123).
+
+TimeCreated      : 10/20/2026 3:15:12 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 3:14:21 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 3:14:11 PM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+TimeCreated      : 10/20/2026 2:29:30 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 2:00:24 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123) with reference id 151737866. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 2:00:15 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/20/2026 1:55:42 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/20/2026 1:53:28 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc03.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.36:123) with reference id 604722698. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:53:15 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc03.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.36:123).
+
+TimeCreated      : 10/20/2026 1:48:08 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123) with reference id 151737866. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:47:59 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/20/2026 1:42:32 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc02.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.10:123) with reference id 168515082. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:42:30 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc02.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.10:123).
+
+TimeCreated      : 10/20/2026 1:35:36 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123) with reference id 587945482. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:35:27 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 1:28:40 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123) with reference id 151737866. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:28:36 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/20/2026 1:25:17 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 1:23:04 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123) with reference id 587945482. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:22:56 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 1:19:52 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123) with reference id 151737866. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 1:19:51 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/20/2026 1:18:02 PM
+ProviderName     : LsaSrv
+Id               : 6038
+LevelDisplayName : Warning
+Message          : Microsoft Windows Server has detected that NTLM authentication is presently being used between clients 
+                   and this server. This event occurs once per boot of the server on the first time a client uses NTLM 
+                   with this server.     NTLM is a weaker authentication mechanism. Please check:           Which 
+                   applications are using NTLM authentication?        Are there configuration issues preventing the use of 
+                   stronger authentication such as Kerberos authentication?        If NTLM must be supported, is Extended 
+                   Protection configured?     Details on how to complete these checks can be found at 
+                   http://go.microsoft.com/fwlink/?LinkId=225699.
+
+TimeCreated      : 10/20/2026 12:39:33 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 12:10:34 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/20/2026 11:08:14 AM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 10:49:30 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 10:25:30 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/20/2026 8:59:32 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 7:10:47 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123) with reference id 587945482. Current local stratum number is 3.
+
+TimeCreated      : 10/20/2026 7:10:32 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 7:10:31 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/20/2026 7:09:07 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/20/2026 7:08:08 AM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 7:07:54 AM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+TimeCreated      : 10/19/2026 5:25:23 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123) with reference id 151737866. Current local stratum number is 3.
+
+TimeCreated      : 10/19/2026 5:25:08 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/19/2026 5:25:07 PM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc01.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.9:123).
+
+TimeCreated      : 10/19/2026 5:23:41 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 5:22:48 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 5:22:33 PM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+TimeCreated      : 10/19/2026 4:53:29 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/19/2026 4:17:46 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 4:07:24 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 3:19:28 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/19/2026 2:09:29 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 1:45:26 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/19/2026 12:13:11 PM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 12:11:34 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/19/2026 12:11:32 PM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 10:43:17 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1501
+LevelDisplayName : Information
+Message          : The Group Policy settings for the user were processed successfully. There were no changes detected 
+                   since the last successful processing of Group Policy.
+
+TimeCreated      : 10/19/2026 10:21:19 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 8:14:59 AM
+ProviderName     : Microsoft-Windows-GroupPolicy
+Id               : 1502
+LevelDisplayName : Information
+Message          : The Group Policy settings for the computer were processed successfully. New settings from 45 Group 
+                   Policy objects were detected and applied.
+
+TimeCreated      : 10/19/2026 8:12:35 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 35
+LevelDisplayName : Information
+Message          : The time service is now synchronizing the system time with the time source pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123) with reference id 587945482. Current local stratum number is 3.
+
+TimeCreated      : 10/19/2026 8:12:21 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/19/2026 8:12:19 AM
+ProviderName     : Microsoft-Windows-Time-Service
+Id               : 37
+LevelDisplayName : Information
+Message          : The time provider NtpClient is currently receiving valid time data from pazsswifdc04.adhcscint.net 
+                   (ntp.d|0.0.0.0:123->10.86.11.35:123).
+
+TimeCreated      : 10/19/2026 8:08:05 AM
+ProviderName     : NETLOGON
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following:   An internal error occurred.   This may lead to authentication problems. Make sure 
+                   that this computer is connected to the network. If the problem persists, please contact your domain 
+                   administrator.      ADDITIONAL INFO   If this computer is a domain controller for the specified domain, 
+                   it sets up the secure session to the primary domain controller emulator in the specified domain. 
+                   Otherwise, this computer sets up the secure session to any domain controller in the specified domain.
+
+TimeCreated      : 10/18/2026 8:07:38 PM
+ProviderName     : LsaSrv
+Id               : 6156
+LevelDisplayName : Information
+Message          : Credential Guard auto enablement status.    Hardware Requirements for Virtualization Based Security:	1  
+                   Domain Joined:	1  Azure AD Joined:	0   Licensed for Credential Guard:	1  Domain Controller:	0
+
+
+
+
+NETLOGON FAILURES
+============================================================
+
+
+TimeCreated      : 10/20/2026 6:17:32 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 6:00:29 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 3:14:21 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 11:08:14 AM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/20/2026 7:08:08 AM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 5:22:48 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 4:17:46 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 12:13:11 PM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+TimeCreated      : 10/19/2026 8:08:05 AM
+Id               : 5719
+LevelDisplayName : Error
+Message          : This computer was not able to set up a secure session with a domain controller in domain ADHCSCINT due 
+                   to the following: 
+                   An internal error occurred. 
+                   This may lead to authentication problems. Make sure that this computer is connected to the network. If 
+                   the problem persists, please contact your domain administrator.  
+                   
+                   ADDITIONAL INFO 
+                   If this computer is a domain controller for the specified domain, it sets up the secure session to the 
+                   primary domain controller emulator in the specified domain. Otherwise, this computer sets up the secure 
+                   session to any domain controller in the specified domain.
+
+
+
+
+DOMAIN INFORMATION
+============================================================
+Computer Name : CAVW301f
+Domain        : adhcscint.net
+Logon Server  : \\pazsswifdc04
+
+VERBOSE: Performing the operation "Test-ComputerSecureChannel" on target "CAVW301f".
+VERBOSE: The secure channel between the local computer and the domain adhcscint.net is in good condition.
+Secure Channel Healthy : True
+
+CURRENT DOMAIN CONTROLLER
+============================================================
+           DC: \\pazsswifdc04.adhcscint.net
+      Address: \\10.86.11.35
+     Dom Guid: 7d0fd32e-81f9-451d-b746-1881d32b1798
+     Dom Name: adhcscint.net
+  Forest Name: adhcscint.net
+ Dc Site Name: AZS
+Our Site Name: AZS
+        Flags: GC DS LDAP KDC TIMESERV WRITABLE DNS_DC DNS_DOMAIN DNS_FOREST CLOSE_SITE FULL_SECRET WS DS_8 DS_9 DS_10 KEYLI
+ST
+The command completed successfully
+
+LOGIN TIMING EVENTS
+============================================================
+
+TimeCreated           Id
+-----------           --
+10/19/2026 8:52:09 AM 41
+10/19/2026 9:12:07 AM 21
+10/19/2026 9:12:16 AM 22
+10/19/2026 9:12:26 AM 24
+10/19/2026 9:12:30 AM 25
+10/19/2026 9:12:40 AM 24
+10/19/2026 9:12:40 AM 25
+10/19/2026 5:08:13 PM 24
+10/19/2026 5:25:36 PM 41
+10/19/2026 5:26:06 PM 21
+10/19/2026 5:26:12 PM 22
+10/19/2026 6:00:27 PM 24
+10/20/2026 8:39:56 AM 41
+10/20/2026 8:40:25 AM 21
+10/20/2026 8:40:33 AM 22
+10/20/2026 3:01:30 PM 24
+10/20/2026 3:17:40 PM 41
+10/20/2026 3:18:08 PM 21
+10/20/2026 3:18:15 PM 22
+10/20/2026 5:36:38 PM 24
+10/20/2026 6:05:37 PM 41
+10/20/2026 6:05:41 PM 21
+10/20/2026 6:05:46 PM 22
+10/20/2026 6:11:18 PM 41
+10/20/2026 6:11:28 PM 21
+10/20/2026 6:11:47 PM 22
+
+
+
+PS C:\Users\p579652> 
