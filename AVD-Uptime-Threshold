@@ -1,86 +1,27 @@
- 2026-10-19 08:12:44
-Provider : Microsoft-Windows-Winlogon
-Event ID : 811
-Level    : Information
-Message  : The winlogon notification subscriber <TermSrv> began handling the notification event (5).
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:44
-Provider : Microsoft-Windows-Winlogon
-Event ID : 812
-Level    : Information
-Message  : The winlogon notification subscriber <TermSrv> finished handling the notification event (5).
-------------------------------------------------------------
 
-===== Microsoft-Windows-TerminalServices-LocalSessionManager/Operational =====
-Time     : 2026-10-19 07:52:09
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 41
-Level    : Information
-Message  : Begin session arbitration: User: ADHCSCINT\u312963 Session ID: 2
-------------------------------------------------------------
-Time     : 2026-10-19 07:52:09
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 42
-Level    : Information
-Message  : End session arbitration: User: ADHCSCINT\u312963 Session ID: 2
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:07
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 21
-Level    : Information
-Message  : Remote Desktop Services: Session logon succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:16
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 22
-Level    : Information
-Message  : Remote Desktop Services: Shell start notification received: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:26
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 24
-Level    : Information
-Message  : Remote Desktop Services: Session has been disconnected: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:30
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 25
-Level    : Information
-Message  : Remote Desktop Services: Session reconnection succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:40
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 24
-Level    : Information
-Message  : Remote Desktop Services: Session has been disconnected: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
-Time     : 2026-10-19 08:12:40
-Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
-Event ID : 25
-Level    : Information
-Message  : Remote Desktop Services: Session reconnection succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
-------------------------------------------------------------
+$Start = Get-Date "10/19/2026 07:45:00"
+$End   = Get-Date "10/19/2026 08:15:00"
 
-===== DOMAIN AND DNS CHECKS =====
-Domain: adhcscint.net
-Domain controller discovery:
-           DC: \\pazsswifdc04.adhcscint.net
-      Address: \\10.86.11.35
-     Dom Guid: 7d0fd32e-81f9-451d-b746-1881d32b1798
-     Dom Name: adhcscint.net
-  Forest Name: adhcscint.net
- Dc Site Name: AZS
-Our Site Name: AZS
-        Flags: GC DS LDAP KDC TIMESERV WRITABLE DNS_DC DNS_DOMAIN DNS_FOREST CLOSE_SITE FULL_SECRET WS DS_8 DS_9 DS_10 KEYLIST
-The command completed successfully
-Secure channel:
-Flags: 400000b0 HAS_IP  HAS_TIMESERV  Authentication Service: Netlogon
-Trusted DC Name \\pazsswifdc04.adhcscint.net 
-Trusted DC Connection Status Status = 0 0x0 NERR_Success
-Trust Verification Status = 0 0x0 NERR_Success
-The command completed successfully
-Configured DNS servers:
+Write-Output "===== SECURITY LOG: LOGON EVENTS ====="
 
-InterfaceAlias ServerAddresses                                   
--------------- ---------------                                   
-Ethernet 11    {10.86.248.4, 10.97.1.33, 10.97.1.34, 10.83.248.4}
+Get-WinEvent -FilterHashtable @{
+    LogName   = "Security"
+    Id        = 4624, 4625, 4768, 4769, 4771, 4776
+    StartTime = $Start
+    EndTime   = $End
+} -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Message -match "u312963"
+} |
+Select-Object TimeCreated, Id, ProviderName, Message |
+Format-List
+
+Write-Output "===== GROUP POLICY EVENTS ====="
+
+Get-WinEvent -FilterHashtable @{
+    LogName   = "Microsoft-Windows-GroupPolicy/Operational"
+    StartTime = $Start
+    EndTime   = $End
+} -ErrorAction SilentlyContinue |
+Select-Object TimeCreated, Id, LevelDisplayName, Message |
+Format-List
