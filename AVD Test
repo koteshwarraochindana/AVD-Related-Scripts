@@ -1,175 +1,176 @@
-<#
-Azure VM Inventory with Tags (READ-ONLY)
+# Get local Hostname
+$Hostname = $env:COMPUTERNAME
 
-Exports:
-- Subscription Name
-- Subscription ID
-- Resource Group
-- VM Name
-- Separate column for every tag
+# Define the target local timezone for conversion (CST / CDT)
+$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
 
-Output:
-C:\Temp\AzureVM_Tags.csv
-#>
-
-# ==========================================================
-# CONFIG
-# ==========================================================
-
-$TargetSubscriptions = @(
-    "f9c819dc-4e16-4a04-8487-a734dcd880e1",
-    "c59f3913-9612-4704-94f8-4a1d4f695b2f",
-    "750da1a4-85cc-489e-b629-e512e0989c16",
-    "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
-    "df7de03e-1d71-4adf-8fd1-bd5791326a26",
-    "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e",
-    "752e53bf-6605-464f-ab75-bcead037561e",
-    "ffabf3d6-ec1e-4626-b146-ec289cfe71ab",
-    "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
-    "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
-    "5412eea3-1603-414b-9d0f-5c21a191c8f3",
-    "20760d19-cc7b-4363-a17e-8a4ab8b6e9e5",
-    "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
-    "7160cf79-3964-41af-8168-05a588c5f99b",
-    "9ff6edd3-6b39-4d33-8776-56703398260c",
-    "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f"
-)
-
-$OutputCsv = "C:\Temp\AzureVM_Tags.csv"
-
-# ==========================================================
-# MODULES
-# ==========================================================
-
-Import-Module Az.Accounts -ErrorAction Stop
-Import-Module Az.Compute  -ErrorAction Stop
-
-# ==========================================================
-# AUTH
-# ==========================================================
-
-try
-{
-    Connect-AzAccount -ErrorAction Stop | Out-Null
-}
-catch
-{
-    Write-Host "Azure login failed." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    exit
+function Convert-ToLocalTime($UtcTime) {
+    if ($null -eq $UtcTime) { return $null }
+    return [System.TimeZoneInfo]::ConvertTime($UtcTime, $LocalTimeZone)
 }
 
-# ==========================================================
-# COLLECT ALL VMS
-# ==========================================================
+# 🤖 Resilient detection of local user sessions via native CIM mapping
+$AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
+    $SessionId = $_.LogonId
+    if ($_.LogonType -in @(2, 10)) {
+        $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
+        if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) {
+            $QState = qwinsta $UserQuery.Name 2>$null | ForEach-Object {
+                if ($_ -match 'Active') { 'Active' }
+                elseif ($_ -match 'Disc') { 'Disconnected' }
+            } | Select-Object -First 1
 
-Write-Host ""
-Write-Host "Collecting Azure VM inventory..." -ForegroundColor Cyan
-Write-Host ""
-
-$Results = New-Object System.Collections.Generic.List[Object]
-$AllTagNames = New-Object System.Collections.Generic.HashSet[string]
-
-foreach ($SubId in $TargetSubscriptions)
-{
-    Write-Host "Processing Subscription: $SubId" -ForegroundColor Yellow
-
-    try
-    {
-        Set-AzContext -SubscriptionId $SubId -ErrorAction Stop | Out-Null
-
-        $Sub = Get-AzContext -ErrorAction Stop
-
-        Write-Host "  Subscription Name: $($Sub.Subscription.Name)" -ForegroundColor Gray
-
-        $VMs = @(Get-AzVM -ErrorAction Stop)
-
-        foreach ($VM in $VMs)
-        {
-            # Collect unique tag names
-            if ($VM.Tags)
-            {
-                foreach ($TagName in $VM.Tags.Keys)
-                {
-                    $null = $AllTagNames.Add([string]$TagName)
-                }
+            [PSCustomObject]@{
+                Username = $UserQuery.Name
+                State    = if ($QState) { $QState } else { 'Disconnected' }
             }
-
-            $Results.Add(
-                [PSCustomObject]@{
-                    SubscriptionName = $Sub.Subscription.Name
-                    SubscriptionId   = $Sub.Subscription.Id
-                    ResourceGroup    = $VM.ResourceGroupName
-                    VMName           = $VM.Name
-                    Tags             = $VM.Tags
-                }
-            )
         }
+    }
+} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group }
 
-        Write-Host "  Found $($VMs.Count) VMs" -ForegroundColor Green
-    }
-    catch
-    {
-        Write-Host "  FAILED: $SubId" -ForegroundColor Red
-        Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
-    }
+$UserSession = $AVDSessions | Select-Object -First 1
+$User = $UserSession.Username
+$SessionState = $UserSession.State
+
+# --- FALLBACK PROTECTION ---
+if ([string]::IsNullOrWhiteSpace($User)) {
+    $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $LocalBootTime = Convert-ToLocalTime $BootTime
+    $FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
+    $UptimeSpan = (Get-Date) - $BootTime
+    $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
+    
+    $Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
+    $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Unknown' }
 
     Write-Host ""
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host 'CURRENT VM STATUS' -ForegroundColor Cyan
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host "  Hostname           : $Hostname"
+    Write-Host "  Last Boot Time     : $FormattedBootTime"
+    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
+    Write-Host "  Uptime             : $UptimeDisplay"
+    Write-Host ""
+    Write-Host '[✓] CONFIRMED: No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Exit 0
 }
 
-# ==========================================================
-# BUILD EXPORT WITH DYNAMIC TAG COLUMNS
-# ==========================================================
+# --- PROCESS USER EVENT LOG ENTRIES ---
+$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$LocalBootTime = Convert-ToLocalTime $BootTime
+$FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
+$UptimeSpan = (Get-Date) - $BootTime
+$UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
 
-Write-Host "Building export..." -ForegroundColor Cyan
+$Event6005 = Get-WinEvent -FilterHashtable @{
+    LogName   = 'System'
+    Id        = 6005
+    StartTime = $BootTime.AddMinutes(-1)
+} -MaxEvents 1 -ErrorAction SilentlyContinue
 
-$SortedTagNames = @($AllTagNames | Sort-Object)
+$BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Log Missing' }
 
-$ExportData = foreach ($VM in $Results)
-{
-    $Row = [ordered]@{
-        SubscriptionName = $VM.SubscriptionName
-        SubscriptionId   = $VM.SubscriptionId
-        ResourceGroup    = $VM.ResourceGroup
-        VMName           = $VM.VMName
-    }
+$DisconnectEvent = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    Id        = 24
+    StartTime = $BootTime
+} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated -Descending | Select-Object -First 1
 
-    foreach ($TagName in $SortedTagNames)
-    {
-        $Row[$TagName] = $null
-
-        if ($VM.Tags -and $VM.Tags.ContainsKey($TagName))
-        {
-            $Row[$TagName] = $VM.Tags[$TagName]
-        }
-    }
-
-    [PSCustomObject]$Row
+if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
+    $DisconnectTime = $DisconnectEvent.TimeCreated
+    $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (CST)"
+    $IdleSpan = (Get-Date) - $DisconnectTime
+    $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
+} else {
+    $LocalDisconnectTime = "N/A (User is currently Active)"
+    $IdleDisplay = "N/A"
 }
-
-# ==========================================================
-# EXPORT
-# ==========================================================
-
-$Folder = Split-Path $OutputCsv -Parent
-
-if (-not (Test-Path $Folder))
-{
-    New-Item -Path $Folder -ItemType Directory -Force | Out-Null
-}
-
-$ExportData |
-    Sort-Object SubscriptionName, VMName |
-    Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-
-# ==========================================================
-# SUMMARY
-# ==========================================================
 
 Write-Host ""
-Write-Host "==========================================" -ForegroundColor Cyan
-Write-Host "Total Subscriptions : $($TargetSubscriptions.Count)" -ForegroundColor Green
-Write-Host "Total VMs           : $($ExportData.Count)" -ForegroundColor Green
-Write-Host "Total Tags          : $($AllTagNames.Count)" -ForegroundColor Green
-Write-Host "CSV Exported        : $OutputCsv" -ForegroundColor Green
-Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host '============================================================' -ForegroundColor Cyan
+Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
+Write-Host '============================================================' -ForegroundColor Cyan
+
+$Events = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    StartTime = $BootTime
+    Id        = 21, 22, 41, 42
+} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
+
+$StartTime = $null
+$LogonTime = $null
+$SummaryGenerated = $false
+
+foreach ($Event in $Events) {
+    switch ($Event.Id) {
+        41 { $StartTime = $Event.TimeCreated }
+        21 { $LogonTime = $Event.TimeCreated }
+        22 {
+            if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
+                $SummaryGenerated = $true
+                $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
+                $DesktopLoadSec     = [math]::Round(($Event.TimeCreated - $LogonTime).TotalSeconds, 0)
+                $TotalLoginSec      = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
+                $MinutesSinceBoot   = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
+
+                # Isolate the exact daily 5:00 AM Nerdio Pre-Stage window
+                $LocalBootHour = (Get-Date $LocalBootTime).Hour
+                $LocalBootMinute = (Get-Date $LocalBootTime).Minute
+
+                if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) {
+                    $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
+                }
+                elseif ($MinutesSinceBoot -lt 5) { 
+                    $VMState = 'VM CONFIRMED started due to user connection' 
+                }
+                elseif ($MinutesSinceBoot -lt 15) { 
+                    $VMState = 'VM recently started before user login' 
+                }
+                else { 
+                    $VMState = 'VM already available before user login' 
+                }
+
+                ([PSCustomObject]@{
+                    Hostname          = $Hostname
+                    TargetUser        = $User
+                    VMLastBoot        = $FormattedBootTime
+                    VM_BootTimeTaken  = $BootTimeDisplay
+                    SessionState      = $SessionState
+                    DisconnectedAt    = $LocalDisconnectTime
+                    TotalIdleTime     = $IdleDisplay
+                    VMState           = $VMState
+                    LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (CST)"
+                    LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (CST)"
+                    DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (CST)"
+                    AuthenticationSec = $AuthenticationSec
+                    DesktopLoadSec    = $DesktopLoadSec
+                    TotalLoginSec     = $TotalLoginSec
+                }) | Format-List
+                Write-Host '------------------------------------------------------------'
+                $StartTime = $null; $LogonTime = $null
+            }
+        }
+    }
+}
+
+if (-not $SummaryGenerated) {
+    $LocalBootHour = (Get-Date $LocalBootTime).Hour
+    $LocalBootMinute = (Get-Date $LocalBootTime).Minute
+    if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) { $FallbackState = 'VM CONFIRMED started due to Nerdio Pre-Stage' }
+    else { $FallbackState = $SessionState }
+
+    Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
+    Write-Host "  Hostname           : $Hostname"
+    Write-Host "  Target User        : $User"
+    Write-Host "  Last Boot Time     : $FormattedBootTime"
+    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
+    Write-Host "  Current State      : $FallbackState"
+    Write-Host "  Disconnected At    : $LocalDisconnectTime"
+    Write-Host "  Total Idle Time    : $IdleDisplay"
+    Write-Host "  Uptime             : $UptimeDisplay"
+    Write-Host ""
+    Write-Host "[-] NOTICE: User '$User' is listed as $SessionState, but a complete matching logon footprint (Events 41->21->22) does not exist inside this specific boot cycle." -ForegroundColor Yellow
+    Write-Host '============================================================' -ForegroundColor Cyan
+}
