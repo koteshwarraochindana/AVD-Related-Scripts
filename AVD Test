@@ -1,176 +1,63 @@
-# Get local Hostname
-$Hostname = $env:COMPUTERNAME
+============================================================
+AVD AUDIT REPORT FOR DETECTED USER: u312963 (Active)
+============================================================
 
-# Define the target local timezone for conversion (CST / CDT)
-$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
+Hostname           : CAVW301f
+TargetUser         : u312963
+VMLastBoot         : 10/20/2026 2:14:01 PM (CDT)
+VM_BootTimeTaken   : 19 Seconds
+SessionState       : Active
+Uptime             : 0 Hours, 40 Minutes
+DisconnectedAt     : N/A (User is currently Active)
+TotalIdleTime      : N/A
 
-function Convert-ToLocalTime($UtcTime) {
-    if ($null -eq $UtcTime) { return $null }
-    return [System.TimeZoneInfo]::ConvertTime($UtcTime, $LocalTimeZone)
-}
+------------------------------------------------------------
+LOGIN EVENT
+------------------------------------------------------------
+LoginStarted       : 10/19/2026 7:52:09 AM (CDT)
+LogonSucceeded     : 10/19/2026 8:12:07 AM (CDT)
+DesktopReady       : 10/19/2026 8:12:16 AM (CDT)
+AuthenticationSec  : 1198
+DesktopLoadSec     : 9
+TotalLoginSec      : 1206
+Severity           : CRITICAL
+AssignmentComplete : 10/19/2026 7:52:09 AM (CDT)
 
-# 🤖 Resilient detection of local user sessions via native CIM mapping
-$AVDSessions = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
-    $SessionId = $_.LogonId
-    if ($_.LogonType -in @(2, 10)) {
-        $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
-        if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) {
-            $QState = qwinsta $UserQuery.Name 2>$null | ForEach-Object {
-                if ($_ -match 'Active') { 'Active' }
-                elseif ($_ -match 'Disc') { 'Disconnected' }
-            } | Select-Object -First 1
+------------------------------------------------------------
+LOGIN EVENT
+------------------------------------------------------------
+LoginStarted       : 10/19/2026 4:25:36 PM (CDT)
+LogonSucceeded     : 10/19/2026 4:26:06 PM (CDT)
+DesktopReady       : 10/19/2026 4:26:12 PM (CDT)
+AuthenticationSec  : 29
+DesktopLoadSec     : 6
+TotalLoginSec      : 35
+Severity           : WARNING
+AssignmentComplete : 10/19/2026 4:25:36 PM (CDT)
 
-            [PSCustomObject]@{
-                Username = $UserQuery.Name
-                State    = if ($QState) { $QState } else { 'Disconnected' }
-            }
-        }
-    }
-} | Where-Object { $null -ne $_ } | Group-Object Username | ForEach-Object { $_.Group }
+------------------------------------------------------------
+LOGIN EVENT
+------------------------------------------------------------
+LoginStarted       : 10/20/2026 7:39:56 AM (CDT)
+LogonSucceeded     : 10/20/2026 7:40:25 AM (CDT)
+DesktopReady       : 10/20/2026 7:40:33 AM (CDT)
+AuthenticationSec  : 28
+DesktopLoadSec     : 9
+TotalLoginSec      : 37
+Severity           : WARNING
+AssignmentComplete : 10/20/2026 7:39:56 AM (CDT)
 
-$UserSession = $AVDSessions | Select-Object -First 1
-$User = $UserSession.Username
-$SessionState = $UserSession.State
+------------------------------------------------------------
+LOGIN EVENT
+------------------------------------------------------------
+LoginStarted       : 10/20/2026 2:17:40 PM (CDT)
+LogonSucceeded     : 10/20/2026 2:18:08 PM (CDT)
+DesktopReady       : 10/20/2026 2:18:15 PM (CDT)
+AuthenticationSec  : 28
+DesktopLoadSec     : 7
+TotalLoginSec      : 35
+Severity           : WARNING
+AssignmentComplete : 10/20/2026 2:17:40 PM (CDT)
 
-# --- FALLBACK PROTECTION ---
-if ([string]::IsNullOrWhiteSpace($User)) {
-    $BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $LocalBootTime = Convert-ToLocalTime $BootTime
-    $FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
-    $UptimeSpan = (Get-Date) - $BootTime
-    $UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
-    
-    $Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
-    $BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Unknown' }
-
-    Write-Host ""
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Write-Host 'CURRENT VM STATUS' -ForegroundColor Cyan
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Write-Host "  Hostname           : $Hostname"
-    Write-Host "  Last Boot Time     : $FormattedBootTime"
-    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
-    Write-Host "  Uptime             : $UptimeDisplay"
-    Write-Host ""
-    Write-Host '[✓] CONFIRMED: No active or disconnected AVD sessions detected on this machine.' -ForegroundColor Green
-    Write-Host '============================================================' -ForegroundColor Cyan
-    Exit 0
-}
-
-# --- PROCESS USER EVENT LOG ENTRIES ---
-$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-$LocalBootTime = Convert-ToLocalTime $BootTime
-$FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
-$UptimeSpan = (Get-Date) - $BootTime
-$UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
-
-$Event6005 = Get-WinEvent -FilterHashtable @{
-    LogName   = 'System'
-    Id        = 6005
-    StartTime = $BootTime.AddMinutes(-1)
-} -MaxEvents 1 -ErrorAction SilentlyContinue
-
-$BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Log Missing' }
-
-$DisconnectEvent = Get-WinEvent -FilterHashtable @{
-    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-    Id        = 24
-    StartTime = $BootTime
-} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated -Descending | Select-Object -First 1
-
-if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
-    $DisconnectTime = $DisconnectEvent.TimeCreated
-    $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (CST)"
-    $IdleSpan = (Get-Date) - $DisconnectTime
-    $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
-} else {
-    $LocalDisconnectTime = "N/A (User is currently Active)"
-    $IdleDisplay = "N/A"
-}
-
-Write-Host ""
-Write-Host '============================================================' -ForegroundColor Cyan
-Write-Host "AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
-Write-Host '============================================================' -ForegroundColor Cyan
-
-$Events = Get-WinEvent -FilterHashtable @{
-    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-    StartTime = $BootTime
-    Id        = 21, 22, 41, 42
-} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
-
-$StartTime = $null
-$LogonTime = $null
-$SummaryGenerated = $false
-
-foreach ($Event in $Events) {
-    switch ($Event.Id) {
-        41 { $StartTime = $Event.TimeCreated }
-        21 { $LogonTime = $Event.TimeCreated }
-        22 {
-            if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
-                $SummaryGenerated = $true
-                $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
-                $DesktopLoadSec     = [math]::Round(($Event.TimeCreated - $LogonTime).TotalSeconds, 0)
-                $TotalLoginSec      = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
-                $MinutesSinceBoot   = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
-
-                # Isolate the exact daily 5:00 AM Nerdio Pre-Stage window
-                $LocalBootHour = (Get-Date $LocalBootTime).Hour
-                $LocalBootMinute = (Get-Date $LocalBootTime).Minute
-
-                if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) {
-                    $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
-                }
-                elseif ($MinutesSinceBoot -lt 5) { 
-                    $VMState = 'VM CONFIRMED started due to user connection' 
-                }
-                elseif ($MinutesSinceBoot -lt 15) { 
-                    $VMState = 'VM recently started before user login' 
-                }
-                else { 
-                    $VMState = 'VM already available before user login' 
-                }
-
-                ([PSCustomObject]@{
-                    Hostname          = $Hostname
-                    TargetUser        = $User
-                    VMLastBoot        = $FormattedBootTime
-                    VM_BootTimeTaken  = $BootTimeDisplay
-                    SessionState      = $SessionState
-                    DisconnectedAt    = $LocalDisconnectTime
-                    TotalIdleTime     = $IdleDisplay
-                    VMState           = $VMState
-                    LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (CST)"
-                    LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (CST)"
-                    DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (CST)"
-                    AuthenticationSec = $AuthenticationSec
-                    DesktopLoadSec    = $DesktopLoadSec
-                    TotalLoginSec     = $TotalLoginSec
-                }) | Format-List
-                Write-Host '------------------------------------------------------------'
-                $StartTime = $null; $LogonTime = $null
-            }
-        }
-    }
-}
-
-if (-not $SummaryGenerated) {
-    $LocalBootHour = (Get-Date $LocalBootTime).Hour
-    $LocalBootMinute = (Get-Date $LocalBootTime).Minute
-    if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10) { $FallbackState = 'VM CONFIRMED started due to Nerdio Pre-Stage' }
-    else { $FallbackState = $SessionState }
-
-    Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
-    Write-Host "  Hostname           : $Hostname"
-    Write-Host "  Target User        : $User"
-    Write-Host "  Last Boot Time     : $FormattedBootTime"
-    Write-Host "  VM Boot Time Taken : $BootTimeDisplay"
-    Write-Host "  Current State      : $FallbackState"
-    Write-Host "  Disconnected At    : $LocalDisconnectTime"
-    Write-Host "  Total Idle Time    : $IdleDisplay"
-    Write-Host "  Uptime             : $UptimeDisplay"
-    Write-Host ""
-    Write-Host "[-] NOTICE: User '$User' is listed as $SessionState, but a complete matching logon footprint (Events 41->21->22) does not exist inside this specific boot cycle." -ForegroundColor Yellow
-    Write-Host '============================================================' -ForegroundColor Cyan
-}
+============================================================
+AVD AUDIT COMPLETED
