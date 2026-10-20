@@ -1,63 +1,106 @@
-============================================================
-AVD AUDIT REPORT FOR DETECTED USER: u312963 (Active)
-============================================================
 
-Hostname           : CAVW301f
-TargetUser         : u312963
-VMLastBoot         : 10/20/2026 2:14:01 PM (CDT)
-VM_BootTimeTaken   : 19 Seconds
-SessionState       : Active
-Uptime             : 0 Hours, 40 Minutes
-DisconnectedAt     : N/A (User is currently Active)
-TotalIdleTime      : N/A
+# ============================================================
+# AVD SLOW LOGIN DIAGNOSTICS - READ ONLY
+# Target user: u312963
+# ============================================================
 
-------------------------------------------------------------
-LOGIN EVENT
-------------------------------------------------------------
-LoginStarted       : 10/19/2026 7:52:09 AM (CDT)
-LogonSucceeded     : 10/19/2026 8:12:07 AM (CDT)
-DesktopReady       : 10/19/2026 8:12:16 AM (CDT)
-AuthenticationSec  : 1198
-DesktopLoadSec     : 9
-TotalLoginSec      : 1206
-Severity           : CRITICAL
-AssignmentComplete : 10/19/2026 7:52:09 AM (CDT)
+$User = "u312963"
+$StartTime = [datetime]"2026-10-19 07:45:00"
+$EndTime   = [datetime]"2026-10-19 08:15:00"
 
-------------------------------------------------------------
-LOGIN EVENT
-------------------------------------------------------------
-LoginStarted       : 10/19/2026 4:25:36 PM (CDT)
-LogonSucceeded     : 10/19/2026 4:26:06 PM (CDT)
-DesktopReady       : 10/19/2026 4:26:12 PM (CDT)
-AuthenticationSec  : 29
-DesktopLoadSec     : 6
-TotalLoginSec      : 35
-Severity           : WARNING
-AssignmentComplete : 10/19/2026 4:25:36 PM (CDT)
+$LogsToCheck = @(
+    "Application",
+    "System",
+    "Security",
+    "Microsoft-Windows-User Profile Service/Operational",
+    "Microsoft-Windows-GroupPolicy/Operational",
+    "Microsoft-Windows-AppModel-State/Admin",
+    "Microsoft-FSLogix-Apps/Admin",
+    "Microsoft-FSLogix-Apps/Operational"
+)
 
-------------------------------------------------------------
-LOGIN EVENT
-------------------------------------------------------------
-LoginStarted       : 10/20/2026 7:39:56 AM (CDT)
-LogonSucceeded     : 10/20/2026 7:40:25 AM (CDT)
-DesktopReady       : 10/20/2026 7:40:33 AM (CDT)
-AuthenticationSec  : 28
-DesktopLoadSec     : 9
-TotalLoginSec      : 37
-Severity           : WARNING
-AssignmentComplete : 10/20/2026 7:39:56 AM (CDT)
+Write-Output "============================================================"
+Write-Output "AVD SLOW LOGIN DIAGNOSTICS"
+Write-Output "Computer : $env:COMPUTERNAME"
+Write-Output "User     : $User"
+Write-Output "Window   : $StartTime to $EndTime"
+Write-Output "============================================================"
 
-------------------------------------------------------------
-LOGIN EVENT
-------------------------------------------------------------
-LoginStarted       : 10/20/2026 2:17:40 PM (CDT)
-LogonSucceeded     : 10/20/2026 2:18:08 PM (CDT)
-DesktopReady       : 10/20/2026 2:18:15 PM (CDT)
-AuthenticationSec  : 28
-DesktopLoadSec     : 7
-TotalLoginSec      : 35
-Severity           : WARNING
-AssignmentComplete : 10/20/2026 2:17:40 PM (CDT)
+foreach ($LogName in $LogsToCheck) {
 
-============================================================
-AVD AUDIT COMPLETED
+    $LogInfo = Get-WinEvent -ListLog $LogName -ErrorAction SilentlyContinue
+
+    if (-not $LogInfo) {
+        continue
+    }
+
+    Write-Output ""
+    Write-Output "----- LOG: $LogName -----"
+
+    $Events = Get-WinEvent -FilterHashtable @{
+        LogName   = $LogName
+        StartTime = $StartTime
+        EndTime   = $EndTime
+    } -MaxEvents 500 -ErrorAction SilentlyContinue |
+        Sort-Object TimeCreated
+
+    $Matches = @(
+        $Events | Where-Object {
+            $_.Level -in @(1, 2, 3) -or
+            $_.Message -match [regex]::Escape($User) -or
+            $_.ProviderName -match "FSLogix|GroupPolicy|User Profile|AppModel|Winlogon|Kerberos|LsaSrv|DNS"
+        }
+    )
+
+    if ($Matches.Count -eq 0) {
+        Write-Output "No matching warning, error, or relevant events found."
+        continue
+    }
+
+    foreach ($Event in $Matches) {
+
+        $Message = ($Event.Message -replace "`r?`n", " ").Trim()
+
+        if ($Message.Length -gt 900) {
+            $Message = $Message.Substring(0, 900) + "..."
+        }
+
+        Write-Output ("Time     : {0}" -f $Event.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss"))
+        Write-Output ("Provider : {0}" -f $Event.ProviderName)
+        Write-Output ("Event ID : {0}" -f $Event.Id)
+        Write-Output ("Level    : {0}" -f $Event.LevelDisplayName)
+        Write-Output ("Message  : {0}" -f $Message)
+        Write-Output "------------------------------------------------------------"
+    }
+}
+
+# FSLogix text logs
+$FSLogixPath = "C:\ProgramData\FSLogix\Logs"
+
+Write-Output ""
+Write-Output "===== FSLOGIX TEXT LOG SEARCH ====="
+
+if (Test-Path $FSLogixPath) {
+
+    Get-ChildItem $FSLogixPath -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -ge $StartTime.AddHours(-1) -and
+            $_.LastWriteTime -le $EndTime.AddHours(1) -and
+            $_.Extension -in @(".log", ".txt")
+        } |
+        ForEach-Object {
+            Select-String -Path $_.FullName `
+                -Pattern $User, "error", "failed", "timeout", "attach", "loadProfile" `
+                -SimpleMatch:$false -ErrorAction SilentlyContinue |
+                Select-Object -First 30 |
+                ForEach-Object {
+                    Write-Output ("{0}: {1}" -f $_.Path, $_.Line.Trim())
+                }
+        }
+}
+else {
+    Write-Output "FSLogix log directory not found."
+}
+
+Write-Output ""
+Write-Output "===== DIAGNOSTICS COMPLETED ====="
