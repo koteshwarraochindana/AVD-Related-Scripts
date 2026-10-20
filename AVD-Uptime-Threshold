@@ -1,115 +1,12 @@
 
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:16
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:19
-Event ID: 261
-Level: Information
-Message: Listener rdp-sxs260731800 received a connection
-----------------------------------------
-Time: 10/19/2026 08:12:20
-Event ID: 1149
-Level: Information
-Message: Remote Desktop Services: User authentication succeeded:
+$Start = Get-Date "10/19/2026 07:50:00"
+$End   = Get-Date "10/19/2026 08:13:00"
 
-User: 
-Domain: 
-Source Network Address: 
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 263
-Level: Information
-Message: WDDM graphics mode is enabled
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519825 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:35
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:37
-Event ID: 261
-Level: Information
-Message: Listener rdp-sxs260731800 received a connection
-----------------------------------------
-Time: 10/19/2026 08:12:38
-Event ID: 1149
-Level: Information
-Message: Remote Desktop Services: User authentication succeeded:
-
-User: 
-Domain: 
-Source Network Address: 
-----------------------------------------
-Time: 10/19/2026 08:12:44
-Event ID: 263
-Level: Information
-Message: WDDM graphics mode is enabled
-----------------------------------------
-Time: 10/19/2026 08:12:44
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:44
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:45
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260519825 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:45
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:12:45
-Event ID: 20523
-Level: Information
-Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
-----------------------------------------
-Time: 10/19/2026 08:13:10
-Event ID: 261
-Level: Information
-Message: Listener RDP-Tcp received a connection
-----------------------------------------
-Time: 10/19/2026 08:13:45
-Event ID: 261
-Level: Information
-Message: Listener RDP-Tcp received a connection
-----------------------------------------
-Time: 10/19/2026 08:13:46
-Event ID: 261
-Level: Information
-Message: Listener RDP-Tcp received a connection
-----------------------------------------
-
-Report collection completed.
+Get-WinEvent -FilterHashtable @{
+    LogName   = "Microsoft-Windows-GroupPolicy/Operational"
+    StartTime = $Start
+    EndTime   = $End
+} -ErrorAction SilentlyContinue |
+Sort-Object TimeCreated |
+Select-Object TimeCreated, Id, LevelDisplayName, Message |
+Format-List
