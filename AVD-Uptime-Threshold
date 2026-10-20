@@ -1,30 +1,107 @@
+n was created, i.e. the account that was logged on.
 
-$Start = Get-Date "10/19/2026 07:50:00"
-$End   = Get-Date "10/19/2026 08:13:00"
+The network fields indicate where a remote logon request originated. Workstation name is not always available and may be left blank in some cases.
 
-Write-Output "Checking Security log for user u312963..."
+The impersonation level field indicates the extent to which a process in the logon session can impersonate.
 
-try {
-    $Events = @(
-        Get-WinEvent -FilterHashtable @{
-            LogName   = "Security"
-            Id        = 4624,4625,4648,4768,4769,4771,4776
-            StartTime = $Start
-            EndTime   = $End
-        } -ErrorAction Stop |
-        Where-Object { $_.Message -match "u312963" } |
-        Sort-Object TimeCreated
-    )
+The authentication information fields provide detailed information about this specific logon request.
+	- Logon GUID is a unique identifier that can be used to correlate this event with a KDC event.
+	- Transited services indicate which intermediate services have participated in this logon request.
+	- Package name indicates which sub-protocol was used among the NTLM protocols.
+	- Key length indicates the length of the generated session key. This will be 0 if no session key was requested.
+----------------------------------------
 
-    Write-Output "Matching events found: $($Events.Count)"
+Time: 10/19/2026 08:12:43
+Event ID: 4648
+Message: A logon was attempted using explicit credentials.
 
-    foreach ($Event in $Events) {
-        Write-Output "`nTime: $($Event.TimeCreated)"
-        Write-Output "Event ID: $($Event.Id)"
-        Write-Output "Message: $($Event.Message)"
-        Write-Output "----------------------------------------"
-    }
-}
-catch {
-    Write-Output "Security log query: $($_.Exception.Message)"
-}
+Subject:
+	Security ID:		S-1-5-18
+	Account Name:		CAVW301f$
+	Account Domain:		ADHCSCINT
+	Logon ID:		0x3E7
+	Logon GUID:		{00000000-0000-0000-0000-000000000000}
+
+Account Whose Credentials Were Used:
+	Account Name:		u312963
+	Account Domain:		ADHCSCINT
+	Logon GUID:		{770a09d3-1d83-d8e4-b01a-1e2f5fc8f918}
+
+Target Server:
+	Target Server Name:	localhost
+	Additional Information:	localhost
+
+Process Information:
+	Process ID:		0x96c
+	Process Name:		C:\Windows\System32\svchost.exe
+
+Network Information:
+	Network Address:	0.0.0.0
+	Port:			0
+
+This event is generated when a process attempts to log on an account by explicitly specifying that account's credentials.  This most commonly occurs in batch-type configurations such as scheduled tasks, or when using the RUNAS command.
+----------------------------------------
+
+Time: 10/19/2026 08:12:43
+Event ID: 4624
+Message: An account was successfully logged on.
+
+Subject:
+	Security ID:		S-1-5-18
+	Account Name:		CAVW301f$
+	Account Domain:		ADHCSCINT
+	Logon ID:		0x3E7
+
+Logon Information:
+	Logon Type:		7
+	Restricted Admin Mode:	-
+	Remote Credential Guard:	-
+	Virtual Account:		No
+	Elevated Token:		No
+
+Impersonation Level:		Impersonation
+
+New Logon:
+	Security ID:		S-1-5-21-442726818-2160565561-3997648070-511905
+	Account Name:		u312963
+	Account Domain:		ADHCSCINT
+	Logon ID:		0x1548E5A
+	Linked Logon ID:		0x0
+	Network Account Name:	-
+	Network Account Domain:	-
+	Logon GUID:		{770a09d3-1d83-d8e4-b01a-1e2f5fc8f918}
+
+Process Information:
+	Process ID:		0x96c
+	Process Name:		C:\Windows\System32\svchost.exe
+
+Network Information:
+	Workstation Name:	CAVW301f
+	Source Network Address:	0.0.0.0
+	Source Port:		0
+
+Detailed Authentication Information:
+	Logon Process:		User32 
+	Authentication Package:	Negotiate
+	Transited Services:	-
+	Package Name (NTLM only):	-
+	Key Length:		0
+
+This event is generated when a logon session is created. It is generated on the computer that was accessed.
+
+The subject fields indicate the account on the local system which requested the logon. This is most commonly a service such as the Server service, or a local process such as Winlogon.exe or Services.exe.
+
+The logon type field indicates the kind of logon that occurred. The most common types are 2 (interactive) and 3 (network).
+
+The New Logon fields indicate the account for whom the new logon was created, i.e. the account that was logged on.
+
+The network fields indicate where a remote logon request originated. Workstation name is not always available and may be left blank in some cases.
+
+The impersonation level field indicates the extent to which a process in the logon session can impersonate.
+
+The authentication information fields provide detailed information about this specific logon request.
+	- Logon GUID is a unique identifier that can be used to correlate this event with a KDC event.
+	- Transited services indicate which intermediate services have participated in this logon request.
+	- Package name indicates which sub-protocol was used among the NTLM protocols.
+	- Key length indicates the length of the generated session key. This will be 0 if no session key was requested.
+----------------------------------------
