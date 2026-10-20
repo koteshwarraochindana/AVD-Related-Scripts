@@ -1,12 +1,32 @@
 
-$Start = Get-Date "10/19/2026 07:50:00"
-$End   = Get-Date "10/19/2026 08:13:00"
+$Log = "Microsoft-Windows-GroupPolicy/Operational"
 
-Get-WinEvent -FilterHashtable @{
-    LogName   = "Microsoft-Windows-GroupPolicy/Operational"
-    StartTime = $Start
-    EndTime   = $End
-} -ErrorAction SilentlyContinue |
-Sort-Object TimeCreated |
-Select-Object TimeCreated, Id, LevelDisplayName, Message |
-Format-List
+Write-Output "Checking Group Policy log..."
+
+try {
+    $Info = Get-WinEvent -ListLog $Log -ErrorAction Stop
+    Write-Output "Log exists: $($Info.LogName)"
+    Write-Output "Log enabled: $($Info.IsEnabled)"
+
+    $Start = Get-Date "10/19/2026 07:50:00"
+    $End   = Get-Date "10/19/2026 08:13:00"
+
+    $Events = @(
+        Get-WinEvent -FilterHashtable @{
+            LogName   = $Log
+            StartTime = $Start
+            EndTime   = $End
+        } -ErrorAction Stop
+    )
+
+    Write-Output "Events found: $($Events.Count)"
+
+    foreach ($Event in $Events) {
+        Write-Output "$($Event.TimeCreated) | ID $($Event.Id) | $($Event.LevelDisplayName)"
+        Write-Output $Event.Message
+        Write-Output "----------------------------------------"
+    }
+}
+catch {
+    Write-Output "CHECK FAILED: $($_.Exception.Message)"
+}
