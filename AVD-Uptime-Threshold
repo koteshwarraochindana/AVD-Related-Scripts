@@ -1,129 +1,86 @@
-# ============================================================
-# AVD SLOW LOGIN ANALYSIS REPORT - LAST 72 HOURS
-# ============================================================
+ 2026-10-19 08:12:44
+Provider : Microsoft-Windows-Winlogon
+Event ID : 811
+Level    : Information
+Message  : The winlogon notification subscriber <TermSrv> began handling the notification event (5).
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:44
+Provider : Microsoft-Windows-Winlogon
+Event ID : 812
+Level    : Information
+Message  : The winlogon notification subscriber <TermSrv> finished handling the notification event (5).
+------------------------------------------------------------
 
-$HoursBack = 72
-$StartTime = (Get-Date).AddHours(-$HoursBack)
-$ComputerName = $env:COMPUTERNAME
+===== Microsoft-Windows-TerminalServices-LocalSessionManager/Operational =====
+Time     : 2026-10-19 07:52:09
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 41
+Level    : Information
+Message  : Begin session arbitration: User: ADHCSCINT\u312963 Session ID: 2
+------------------------------------------------------------
+Time     : 2026-10-19 07:52:09
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 42
+Level    : Information
+Message  : End session arbitration: User: ADHCSCINT\u312963 Session ID: 2
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:07
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 21
+Level    : Information
+Message  : Remote Desktop Services: Session logon succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:16
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 22
+Level    : Information
+Message  : Remote Desktop Services: Shell start notification received: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:26
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 24
+Level    : Information
+Message  : Remote Desktop Services: Session has been disconnected: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:30
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 25
+Level    : Information
+Message  : Remote Desktop Services: Session reconnection succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:40
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 24
+Level    : Information
+Message  : Remote Desktop Services: Session has been disconnected: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
+Time     : 2026-10-19 08:12:40
+Provider : Microsoft-Windows-TerminalServices-LocalSessionManager
+Event ID : 25
+Level    : Information
+Message  : Remote Desktop Services: Session reconnection succeeded: User: ADHCSCINT\u312963 Session ID: 2 Source Network Address:
+------------------------------------------------------------
 
-Write-Host ""
-Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host "AVD SLOW LOGIN ANALYSIS (SINGLE SESSION)" -ForegroundColor Cyan
-Write-Host "HOST     : $ComputerName" -ForegroundColor Cyan
-Write-Host "LOOKBACK : $HoursBack Hours" -ForegroundColor Cyan
-Write-Host "=====================================================" -ForegroundColor Cyan
-Write-Host ""
+===== DOMAIN AND DNS CHECKS =====
+Domain: adhcscint.net
+Domain controller discovery:
+           DC: \\pazsswifdc04.adhcscint.net
+      Address: \\10.86.11.35
+     Dom Guid: 7d0fd32e-81f9-451d-b746-1881d32b1798
+     Dom Name: adhcscint.net
+  Forest Name: adhcscint.net
+ Dc Site Name: AZS
+Our Site Name: AZS
+        Flags: GC DS LDAP KDC TIMESERV WRITABLE DNS_DC DNS_DOMAIN DNS_FOREST CLOSE_SITE FULL_SECRET WS DS_8 DS_9 DS_10 KEYLIST
+The command completed successfully
+Secure channel:
+Flags: 400000b0 HAS_IP  HAS_TIMESERV  Authentication Service: Netlogon
+Trusted DC Name \\pazsswifdc04.adhcscint.net 
+Trusted DC Connection Status Status = 0 0x0 NERR_Success
+Trust Verification Status = 0 0x0 NERR_Success
+The command completed successfully
+Configured DNS servers:
 
-# ------------------------------------------------------------
-# Collect Terminal Services Events
-# ------------------------------------------------------------
-$TSEvents = Get-WinEvent -FilterHashtable @{
-    LogName = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"
-    StartTime = $StartTime
-    Id = 21,22,41
-} -ErrorAction SilentlyContinue | Sort-Object TimeCreated
-
-$Sessions = @()
-$SessionTracker = @{} 
-
-foreach ($Event in $TSEvents) {
-    $SessionId = $Event.Properties.Value
-    $User = if ($Event.Message -match 'User:\s*([^\s\\]+)') { $Matches[1] } else { "Unknown" }
-
-    switch ($Event.Id) {
-        41 {
-            $SessionTracker[$SessionId] = [ordered]@{
-                User         = $User
-                SessionStart = $Event.TimeCreated
-                AuthSuccess  = $null
-                DesktopReady = $null
-            }
-        }
-        21 {
-            if ($SessionTracker.ContainsKey($SessionId)) {
-                $SessionTracker[$SessionId].AuthSuccess = $Event.TimeCreated
-            }
-        }
-        22 {
-            if ($SessionTracker.ContainsKey($SessionId) -and $SessionTracker[$SessionId].SessionStart -and $SessionTracker[$SessionId].AuthSuccess) {
-                $CurrentSession = $SessionTracker[$SessionId]
-                $CurrentSession.DesktopReady = $Event.TimeCreated
-
-                $AuthSec    = [math]::Round(($CurrentSession.AuthSuccess - $CurrentSession.SessionStart).TotalSeconds,0)
-                $DesktopSec = [math]::Round(($CurrentSession.DesktopReady - $CurrentSession.AuthSuccess).TotalSeconds,0)
-                $TotalSec   = [math]::Round(($CurrentSession.DesktopReady - $CurrentSession.SessionStart).TotalSeconds,0)
-
-                $Sessions += [PSCustomObject]@{
-                    Hostname          = $ComputerName
-                    Username          = $CurrentSession.User
-                    LoginStart        = $CurrentSession.SessionStart
-                    AuthenticationSec = $AuthSec
-                    DesktopLoadSec    = $DesktopSec
-                    TotalLoginSec     = $TotalSec
-                    Severity          = if($TotalSec -gt 120){"CRITICAL"}
-                                        elseif($TotalSec -gt 60){"HIGH"}
-                                        elseif($TotalSec -gt 30){"WARNING"}
-                                        else{"NORMAL"}
-                }
-                $SessionTracker.Remove($SessionId) | Out-Null
-            }
-        }
-    }
-}
-
-# ------------------------------------------------------------
-# Optimized Event Log Collections 
-# ------------------------------------------------------------
-$DiagEvents = Get-WinEvent -FilterHashtable @{
-    LogName = "Microsoft-Windows-Diagnostics-Performance/Operational"
-    StartTime = $StartTime
-    Id = 100,101,200,400,500
-} -ErrorAction SilentlyContinue
-
-$GPEvents = Get-WinEvent -FilterHashtable @{
-    LogName = "Microsoft-Windows-GroupPolicy/Operational"
-    StartTime = $StartTime
-} -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id,LevelDisplayName
-
-$WinlogonEvents = Get-WinEvent -FilterHashtable @{
-    LogName = "Microsoft-Windows-Winlogon/Operational"
-    StartTime = $StartTime
-} -ErrorAction SilentlyContinue
-
-# ------------------------------------------------------------
-# Summary Display
-# ------------------------------------------------------------
-Write-Host ""
-Write-Host "========== LOGIN PERFORMANCE ==========" -ForegroundColor Cyan
-$Sessions | Sort-Object LoginStart | Format-Table -AutoSize
-
-Write-Host ""
-Write-Host "========== SLOW LOGINS (>30 SEC) ==========" -ForegroundColor Yellow
-$Sessions | Where-Object {$_.TotalLoginSec -gt 30} | Sort-Object TotalLoginSec -Descending | Format-Table -AutoSize
-
-Write-Host ""
-Write-Host "========== SUMMARY ==========" -ForegroundColor Green
-$total    = $Sessions.Count
-$slow     = ($Sessions | Where-Object {$_.TotalLoginSec -gt 30}).Count
-$critical = ($Sessions | Where-Object {$_.TotalLoginSec -gt 120}).Count
-
-Write-Host "Total Login Attempts : $total"
-Write-Host "Slow Logins (>30s)   : $slow"
-Write-Host "Critical (>120s)     : $critical"
-Write-Host "Winlogon Events      : $($WinlogonEvents.Count)"
-Write-Host "GPO Events           : $($GPEvents.Count)"
-Write-Host "Diag Events          : $($DiagEvents.Count)"
-
-# ------------------------------------------------------------
-# Export Files
-# ------------------------------------------------------------
-$Folder = "C:\Temp"
-if (!(Test-Path $Folder)) { New-Item -Path $Folder -ItemType Directory -Force | Out-Null }
-
-$Sessions | Export-Csv -Path "$Folder\AVD_LoginAnalysis.csv" -NoTypeInformation
-$GPEvents | Export-Csv -Path "$Folder\AVD_GPO.csv" -NoTypeInformation
-$WinlogonEvents | Select-Object TimeCreated,Id,Message | Export-Csv -Path "$Folder\AVD_Winlogon.csv" -NoTypeInformation
-
-Write-Host ""
-Write-Host "CSV Files Saved To: $Folder" -ForegroundColor Green
-Write-Host ""
+InterfaceAlias ServerAddresses                                   
+-------------- ---------------                                   
+Ethernet 11    {10.86.248.4, 10.97.1.33, 10.97.1.34, 10.83.248.4}
