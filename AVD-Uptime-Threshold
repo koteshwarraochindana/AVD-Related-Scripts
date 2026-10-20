@@ -1,71 +1,115 @@
 
-# AVD Slow Login - Azure Run Command
-# Displays results directly in Run Command output
-# Also saves a local copy on the VM
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:16
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:19
+Event ID: 261
+Level: Information
+Message: Listener rdp-sxs260731800 received a connection
+----------------------------------------
+Time: 10/19/2026 08:12:20
+Event ID: 1149
+Level: Information
+Message: Remote Desktop Services: User authentication succeeded:
 
-$Start = Get-Date "10/19/2026 07:45:00"
-$End   = Get-Date "10/19/2026 08:15:00"
-$Out   = "C:\Windows\Temp\AVD_SlowLogin_Report.txt"
+User: 
+Domain: 
+Source Network Address: 
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 263
+Level: Information
+Message: WDDM graphics mode is enabled
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519825 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:35
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:37
+Event ID: 261
+Level: Information
+Message: Listener rdp-sxs260731800 received a connection
+----------------------------------------
+Time: 10/19/2026 08:12:38
+Event ID: 1149
+Level: Information
+Message: Remote Desktop Services: User authentication succeeded:
 
-$Logs = @(
-    "Microsoft-Windows-GroupPolicy/Operational",
-    "Microsoft-Windows-User Profiles Service/Operational",
-    "Microsoft-Windows-Winlogon/Operational",
-    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
-    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
-)
+User: 
+Domain: 
+Source Network Address: 
+----------------------------------------
+Time: 10/19/2026 08:12:44
+Event ID: 263
+Level: Information
+Message: WDDM graphics mode is enabled
+----------------------------------------
+Time: 10/19/2026 08:12:44
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:44
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:45
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260519825 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:45
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731700 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:12:45
+Event ID: 20523
+Level: Information
+Message: Connection from listener rdp-sxs260731750 will have terminal class of {24656d38-a446-45d2-a0b9-7599bedb0044}
+----------------------------------------
+Time: 10/19/2026 08:13:10
+Event ID: 261
+Level: Information
+Message: Listener RDP-Tcp received a connection
+----------------------------------------
+Time: 10/19/2026 08:13:45
+Event ID: 261
+Level: Information
+Message: Listener RDP-Tcp received a connection
+----------------------------------------
+Time: 10/19/2026 08:13:46
+Event ID: 261
+Level: Information
+Message: Listener RDP-Tcp received a connection
+----------------------------------------
 
-$Report = [System.Collections.Generic.List[string]]::new()
-
-$Report.Add("AVD SLOW LOGIN REPORT")
-$Report.Add("VM: $env:COMPUTERNAME")
-$Report.Add("Time range: $Start to $End")
-$Report.Add("")
-
-foreach ($Log in $Logs) {
-    $Report.Add("========== $Log ==========")
-
-    try {
-        $Events = @(
-            Get-WinEvent -FilterHashtable @{
-                LogName   = $Log
-                StartTime = $Start
-                EndTime   = $End
-            } -ErrorAction Stop |
-            Sort-Object TimeCreated
-        )
-
-        if ($Events.Count -eq 0) {
-            $Report.Add("No events found.")
-        }
-        else {
-            foreach ($Event in $Events) {
-                $Report.Add("Time: $($Event.TimeCreated)")
-                $Report.Add("Event ID: $($Event.Id)")
-                $Report.Add("Level: $($Event.LevelDisplayName)")
-                $Report.Add("Message: $($Event.Message)")
-                $Report.Add("----------------------------------------")
-            }
-        }
-    }
-    catch {
-        $Report.Add("Unable to read log: $($_.Exception.Message)")
-    }
-
-    $Report.Add("")
-}
-
-# Save locally
-try {
-    $Report | Out-File -FilePath $Out -Width 300 -Encoding UTF8
-}
-catch {
-    Write-Output "WARNING: Could not save local report: $($_.Exception.Message)"
-}
-
-# Print results directly to Azure Run Command output
-foreach ($Line in $Report) {
-    Write-Output $Line
-}
-
-Write-Output "Report collection completed."
+Report collection completed.
