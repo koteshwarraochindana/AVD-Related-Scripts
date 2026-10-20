@@ -1,80 +1,161 @@
-# ==============================================================================
-# SCRIPT: Bulk Power-On or Restart Session Hosts (No Tags Applied)
-# PREREQUISITES: A CSV with headers: VMName, ResourceGroupName, SubscriptionId
-# ==============================================================================
+# Get local Hostname
+$Hostname = $env:COMPUTERNAME
 
-# 1. Update this path to the location of your target CSV file
-$CSVPath = "C:\temp\targets.csv"
+# Define 72-hour window and timezone setup
+$LocalTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
+$Time72HoursAgo = (Get-Date).AddHours(-72)
 
-# Verify the CSV exists before running
-if (-not (Test-Path -Path $CSVPath)) {
-    Write-Error "CRITICAL: The CSV file could not be found at $CSVPath."
-    return
+function Convert-ToLocalTime($UtcTime) {
+    if ($null -eq $UtcTime) { return $null }
+    return [System.TimeZoneInfo]::ConvertTime($UtcTime, $LocalTimeZone)
 }
 
-# 2. Import the CSV data rows
-$TargetVMs = Import-Csv -Path $CSVPath
+# --- SYSTEM METRICS (Independent of Users) ---
+$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$LocalBootTime = Convert-ToLocalTime $BootTime
+$FormattedBootTime = (Get-Date $LocalBootTime -Format "MM/dd/yyyy h:mm:ss tt") + " (CST)"
+$UptimeSpan = (Get-Date) - $BootTime
+$UptimeDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($UptimeSpan.TotalHours), $UptimeSpan.Minutes
+$Event6005 = Get-WinEvent -FilterHashtable @{LogName='System'; Id=6005; StartTime=$BootTime.AddMinutes(-1)} -MaxEvents 1 -ErrorAction SilentlyContinue
+$BootTimeDisplay = if ($Event6005) { "$([math]::Round(($Event6005.TimeCreated - $BootTime).TotalSeconds, 0)) Seconds" } else { 'Unknown' }
 
-Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " [START] Powering On / Restarting $($TargetVMs.Count) VMs" -ForegroundColor Cyan
-Write-Host "==================================================================" -ForegroundColor Cyan
+# --- DETECT ALL USERS IN THE LAST 72 HOURS ---
+# Merges current active/disconnected sessions with historical Event Log usernames from the past 72 hrs
+$ActiveUsers = Get-CimInstance -ClassName Win32_LogonSession | ForEach-Object {
+    $SessionId = $_.LogonId
+    if ($_.LogonType -in @(2, 10)) {
+        $UserQuery = Get-CimInstance -Query "Associators of {Win32_LogonSession.LogonId='$SessionId'} Where AssocClass=Win32_LoggedOnUser" -ErrorAction SilentlyContinue
+        if ($UserQuery -and $UserQuery.Name -notin @('SYSTEM', 'NETWORK SERVICE', 'LOCAL SERVICE', 'Administrator')) { $UserQuery.Name }
+    }
+}
+$HistoricalUsers = Get-WinEvent -FilterHashtable @{
+    LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    StartTime = $Time72HoursAgo
+    Id = @(21, 22, 24, 25)
+} -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($_.Message -match 'User:\s*([^\s\\]+)') { $Matches[1] }
+}
+$TargetUsers = ($ActiveUsers + $HistoricalUsers) | Where-Object { $_ } | Select-Object -Unique
 
-# Track loop counters
-$SuccessCount = 0
-$FailureCount = 0
+# --- FALLBACK PROTECTION ---
+if ($TargetUsers.Count -eq 0) {
+    Write-Host ""
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host 'CURRENT VM STATUS (NO USER ACTIVITY IN LAST 72 HOURS)' -ForegroundColor Cyan
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host " Hostname           : $Hostname"
+    Write-Host " Last Boot Time     : $FormattedBootTime"
+    Write-Host " VM Boot Time Taken : $BootTimeDisplay"
+    Write-Host " Uptime             : $UptimeDisplay"
+    Write-Host ""
+    Write-Host '[✓] CONFIRMED: No active or historical user sessions detected in the last 72 hours.' -ForegroundColor Green
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Exit 0
+}
 
-# 3. Sequential Execution Loop
-foreach ($Row in $TargetVMs) {
-    $VMName = $Row.VMName
-    $RGName = $Row.ResourceGroupName
-    $SubId  = $Row.SubscriptionId
+# --- PROCESS SEPARATE REPORT FOR EACH DETECTED USER ---
+foreach ($User in $TargetUsers) {
     
-    Write-Host "------------------------------------------------------------------" -ForegroundColor Gray
-    Write-Host "Targeting Host: $VMName" -ForegroundColor Yellow
+    # Determine current transient live state for this specific user
+    $QState = qwinsta $User 2>$null | ForEach-Object {
+        if ($_ -match 'Active') { 'Active' } elseif ($_ -match 'Disc') { 'Disconnected' }
+    } | Select-Object -First 1
+    $SessionState = if ($QState) { $QState } else { 'Offline (Historical)' }
 
-    # Catch empty or malformed rows instantly
-    if ([string]::IsNullOrWhiteSpace($VMName) -or [string]::IsNullOrWhiteSpace($RGName) -or [string]::IsNullOrWhiteSpace($SubId)) {
-        Write-Host "[SKIP] Row has missing values. Check your CSV layout." -ForegroundColor Cyan
-        $FailureCount++
-        continue
+    # Query Disconnect Times
+    $DisconnectEvent = Get-WinEvent -FilterHashtable @{
+        LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+        Id = 24
+        StartTime = $Time72HoursAgo
+    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+
+    if ($SessionState -eq 'Disconnected' -and $DisconnectEvent) {
+        $DisconnectTime = $DisconnectEvent.TimeCreated
+        $LocalDisconnectTime = (Convert-ToLocalTime $DisconnectTime).ToString() + " (CST)"
+        $IdleSpan = (Get-Date) - $DisconnectTime
+        $IdleDisplay = "{0} Hours, {1} Minutes" -f [math]::Floor($IdleSpan.TotalHours), $IdleSpan.Minutes
+    } else {
+        $LocalDisconnectTime = if ($SessionState -eq 'Active') { "N/A (User is currently Active)" } else { "N/A (User Session Closed)" }
+        $IdleDisplay = "N/A"
     }
 
-    try {
-        # STEP A: Switch Azure Context immediately to the current VM's subscription
-        Set-AzContext -SubscriptionId $SubId | Out-Null
-        
-        # STEP B: Check the live power state of the VM
-        $VMStatus = Get-AzVM -ResourceGroupName $RGName -Name $VMName -Status -ErrorAction Stop
-        $PowerState = ($VMStatus.Statuses | Where-Object Code -like "PowerState/*").Code
-        
-        # STEP C: Evaluate state and take action
-        if ($PowerState -eq "PowerState/running") {
-            # VM is already on -> Restart it
-            Restart-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
-            Write-Host "[SUCCESS] Host is active. Graceful restart signal dispatched." -ForegroundColor Green
+    Write-Host ""
+    Write-Host '============================================================' -ForegroundColor Cyan
+    Write-Host "72-HR AVD AUDIT REPORT FOR DETECTED USER: $User ($SessionState)" -ForegroundColor Yellow
+    Write-Host '============================================================' -ForegroundColor Cyan
+
+    # Pull user tracking events within the 72-hour window
+    $Events = Get-WinEvent -FilterHashtable @{
+        LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+        StartTime = $Time72HoursAgo
+        Id = 21, 22, 41, 42
+    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match $User } | Sort-Object TimeCreated
+
+    $StartTime = $null
+    $LogonTime = $null
+    $SummaryGenerated = $false
+
+    foreach ($Event in $Events) {
+        switch ($Event.Id) {
+            41 { $StartTime = $Event.TimeCreated }
+            21 { $LogonTime = $Event.TimeCreated }
+            22 {
+                if ($StartTime -and $LogonTime -and ($StartTime.Date -eq $Event.TimeCreated.Date)) {
+                    $SummaryGenerated = $true
+                    $AuthenticationSec = [math]::Round(($LogonTime - $StartTime).TotalSeconds, 0)
+                    $DesktopLoadSec = [math]::Round(($Event.TimeCreated - $LogonTime).TotalSeconds, 0)
+                    $TotalLoginSec = [math]::Round(($Event.TimeCreated - $StartTime).TotalSeconds, 0)
+                    $MinutesSinceBoot = [math]::Round(($StartTime - $BootTime).TotalMinutes, 1)
+
+                    # Dynamic Evaluation window setup
+                    $LocalBootHour = (Get-Date $LocalBootTime).Hour
+                    $LocalBootMinute = (Get-Date $LocalBootTime).Minute
+                    
+                    if ($LocalBootHour -eq 5 -and $LocalBootMinute -le 10 -and $StartTime -lt $BootTime.AddHours(2)) {
+                        $VMState = 'VM CONFIRMED started due to Nerdio Pre-Stage'
+                    } elseif ($MinutesSinceBoot -ge 0 -and $MinutesSinceBoot -lt 5) {
+                        $VMState = 'VM CONFIRMED started due to user connection'
+                    } elseif ($MinutesSinceBoot -ge 0 -and $MinutesSinceBoot -lt 15) {
+                        $VMState = 'VM recently started before user login'
+                    } else {
+                        $VMState = 'VM already available before user login'
+                    }
+
+                    ([PSCustomObject]@{
+                        Hostname          = $Hostname
+                        TargetUser        = $User
+                        VMLastBoot        = $FormattedBootTime
+                        VM_BootTimeTaken  = $BootTimeDisplay
+                        SessionState      = $SessionState
+                        DisconnectedAt    = $LocalDisconnectTime
+                        TotalIdleTime     = $IdleDisplay
+                        VMState           = $VMState
+                        LoginStarted      = (Convert-ToLocalTime $StartTime).ToString() + " (CST)"
+                        LogonSucceeded    = (Convert-ToLocalTime $LogonTime).ToString() + " (CST)"
+                        DesktopReady      = (Convert-ToLocalTime $Event.TimeCreated).ToString() + " (CST)"
+                        AuthenticationSec = $AuthenticationSec
+                        DesktopLoadSec    = $DesktopLoadSec
+                        TotalLoginSec     = $TotalLoginSec
+                    }) | Format-List
+                    Write-Host '------------------------------------------------------------'
+                    $StartTime = $null; $LogonTime = $null
+                }
+            }
         }
-        else {
-            # VM is stopped/deallocated -> Power it on
-            Start-AzVM -ResourceGroupName $RGName -Name $VMName -NoWait -ErrorAction Stop | Out-Null
-            Write-Host "[SUCCESS] Host is down. Power-on signal dispatched." -ForegroundColor Green
-        }
-        
-        $SuccessCount++
-    } 
-    catch {
-        Write-Host "[FAILURE] Could not execute commands for host $VMName." -ForegroundColor Red
-        Write-Host "REASON: $_" -ForegroundColor Red
-        $FailureCount++
+    }
+
+    if (-not $SummaryGenerated) {
+        Write-Host 'CURRENT VM STATUS:' -ForegroundColor Cyan
+        Write-Host " Hostname           : $Hostname"
+        Write-Host " Target User        : $User"
+        Write-Host " Last Boot Time     : $FormattedBootTime"
+        Write-Host " VM Boot Time Taken : $BootTimeDisplay"
+        Write-Host " Current State      : $SessionState"
+        Write-Host " Disconnected At    : $LocalDisconnectTime"
+        Write-Host " Total Idle Time    : $IdleDisplay"
+        Write-Host " Uptime             : $UptimeDisplay"
+        Write-Host ""
+        Write-Host "[-] NOTICE: User '$User' has tracking records within the last 72 hours, but a sequential logon footprint (Events 41->21->22) did not conclude inside this time window." -ForegroundColor Yellow
+        Write-Host '============================================================' -ForegroundColor Cyan
     }
 }
-
-# Determine reporting color safely using PS 5.1 compatible standard IF block
-$FinalColor = "Green"
-if ($FailureCount -gt 0) { $FinalColor = "Red" }
-
-# 4. Final Run Execution Summary Report
-Write-Host "==================================================================" -ForegroundColor Cyan
-Write-Host " [FINISHED] Automated Workflow Completed!" -ForegroundColor Cyan
-Write-Host " Successful Executions: $SuccessCount" -ForegroundColor Green
-Write-Host " Failed/Skipped Rows:   $FailureCount" -ForegroundColor $FinalColor
-Write-Host "==================================================================" -ForegroundColor Cyan
