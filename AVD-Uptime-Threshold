@@ -1,85 +1,57 @@
-        
-               The impersonation level field indicates the extent to which a process in the logon session can 
-               impersonate.
-               
-               The authentication information fields provide detailed information about this specific logon request.
-               	- Logon GUID is a unique identifier that can be used to correlate this event with a KDC event.
-               	- Transited services indicate which intermediate services have participated in this logon request.
-               	- Package name indicates which sub-protocol was used among the NTLM protocols.
-               	- Key length indicates the length of the generated session key. This will be 0 if no session key was 
-               requested.
 
-TimeCreated  : 10/19/2026 7:51:18 AM
-Id           : 4624
-ProviderName : Microsoft-Windows-Security-Auditing
-Message      : An account was successfully logged on.
-               
-               Subject:
-               	Security ID:		S-1-0-0
-               	Account Name:		-
-               	Account Domain:		-
-               	Logon ID:		0x0
-               
-               Logon Information:
-               	Logon Type:		3
-               	Restricted Admin Mode:	-
-               	Remote Credential Guard:	-
-               	Virtual Account:		No
-               	Elevated Token:		No
-               
-               Impersonation Level:		Impersonation
-               
-               New Logon:
-               	Security ID:		S-1-5-21-442726818-2160565561-3997648070-511905
-               	Account Name:		u312963
-               	Account Domain:		ADHCSCINT.NET
-               	Logon ID:		0x10DCA44
-               	Linked Logon ID:		0x0
-               	Network Account Name:	-
-               	Network Account Domain:	-
-               	Logon GUID:		{bf23d73c-015d-4c87-7126-e0cb6c48c3da}
-               
-               Process Information:
-               	Process ID:		0x0
-               	Process Name:		-
-               
-               Network Information:
-               	Workstation Name:	-
-               	Source Network Address:	-
-               	Source Port:		-
-               
-               Detailed Authentication Information:
-               	Logon Process:		Kerberos
-               	Authentication Package:	Kerberos
-               	Transited Services:	-
-               	Package Name (NTLM only):	-
-               	Key Length:		0
-               
-               This event is generated when a logon session is created. It is generated on the computer that was 
-               accessed.
-               
-               The subject fields indicate the account on the local system which requested the logon. This is most 
-               commonly a service such as the Server service, or a local process such as Winlogon.exe or Services.exe.
-               
-               The logon type field indicates the kind of logon that occurred. The most common types are 2 
-               (interactive) and 3 (network).
-               
-               The New Logon fields indicate the account for whom the new logon was created, i.e. the account that was 
-               logged on.
-               
-               The network fields indicate where a remote logon request originated. Workstation name is not always 
-               available and may be left blank in some cases.
-               
-               The impersonation level field indicates the extent to which a process in the logon session can 
-               impersonate.
-               
-               The authentication information fields provide detailed information about this specific logon request.
-               	- Logon GUID is a unique identifier that can be used to correlate this event with a KDC event.
-               	- Transited services indicate which intermediate services have participated in this logon request.
-               	- Package name indicates which sub-protocol was used among the NTLM protocols.
-               	- Key length indicates the length of the generated session key. This will be 0 if no session key was 
-               requested.
+# AVD slow-login investigation - read only
+$Start = Get-Date "10/19/2026 07:45:00"
+$End   = Get-Date "10/19/2026 08:15:00"
+$User  = "u312963"
 
+$Logs = @(
+    @{
+        Name = "SECURITY - Authentication"
+        Log  = "Security"
+        IDs  = @(4624,4625,4768,4769,4771,4776)
+    },
+    @{
+        Name = "GROUP POLICY"
+        Log  = "Microsoft-Windows-GroupPolicy/Operational"
+        IDs  = $null
+    },
+    @{
+        Name = "USER PROFILE SERVICE"
+        Log  = "Microsoft-Windows-User Profiles Service/Operational"
+        IDs  = $null
+    },
+    @{
+        Name = "TERMINAL SERVICES - REMOTE CONNECTION"
+        Log  = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+        IDs  = $null
+    }
+)
 
+foreach ($Item in $Logs) {
+    Write-Host "`n========== $($Item.Name) ==========" -ForegroundColor Cyan
 
-===== GROUP POLICY EVENTS =====
+    try {
+        $Filter = @{
+            LogName   = $Item.Log
+            StartTime = $Start
+            EndTime   = $End
+        }
+
+        if ($Item.IDs) {
+            $Filter.Id = $Item.IDs
+        }
+
+        Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop |
+            Where-Object {
+                $_.Message -match [regex]::Escape($User) -or
+                $Item.Name -ne "SECURITY - Authentication"
+            } |
+            Sort-Object TimeCreated |
+            Select-Object TimeCreated, Id, ProviderName, Message |
+            Format-List
+    }
+    catch {
+        Write-Host "Could not read this log: $($_.Exception.Message)" `
+            -ForegroundColor Yellow
+    }
+}
