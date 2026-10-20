@@ -1,32 +1,30 @@
 
-$Log = "Microsoft-Windows-GroupPolicy/Operational"
+$Start = Get-Date "10/19/2026 07:50:00"
+$End   = Get-Date "10/19/2026 08:13:00"
 
-Write-Output "Checking Group Policy log..."
+Write-Output "Checking Security log for user u312963..."
 
 try {
-    $Info = Get-WinEvent -ListLog $Log -ErrorAction Stop
-    Write-Output "Log exists: $($Info.LogName)"
-    Write-Output "Log enabled: $($Info.IsEnabled)"
-
-    $Start = Get-Date "10/19/2026 07:50:00"
-    $End   = Get-Date "10/19/2026 08:13:00"
-
     $Events = @(
         Get-WinEvent -FilterHashtable @{
-            LogName   = $Log
+            LogName   = "Security"
+            Id        = 4624,4625,4648,4768,4769,4771,4776
             StartTime = $Start
             EndTime   = $End
-        } -ErrorAction Stop
+        } -ErrorAction Stop |
+        Where-Object { $_.Message -match "u312963" } |
+        Sort-Object TimeCreated
     )
 
-    Write-Output "Events found: $($Events.Count)"
+    Write-Output "Matching events found: $($Events.Count)"
 
     foreach ($Event in $Events) {
-        Write-Output "$($Event.TimeCreated) | ID $($Event.Id) | $($Event.LevelDisplayName)"
-        Write-Output $Event.Message
+        Write-Output "`nTime: $($Event.TimeCreated)"
+        Write-Output "Event ID: $($Event.Id)"
+        Write-Output "Message: $($Event.Message)"
         Write-Output "----------------------------------------"
     }
 }
 catch {
-    Write-Output "CHECK FAILED: $($_.Exception.Message)"
+    Write-Output "Security log query: $($_.Exception.Message)"
 }
