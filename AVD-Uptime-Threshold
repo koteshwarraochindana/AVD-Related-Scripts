@@ -1,112 +1,71 @@
-9/2026 8:12:19 AM
-Id               : 261
-LevelDisplayName : Information
-Message          : Listener rdp-sxs260731800 received a connection
 
-TimeCreated      : 10/19/2026 8:12:20 AM
-Id               : 1149
-LevelDisplayName : Information
-Message          : Remote Desktop Services: User authentication succeeded:
-                   
-                   User: 
-                   Domain: 
-                   Source Network Address: 
+# AVD Slow Login - Azure Run Command
+# Displays results directly in Run Command output
+# Also saves a local copy on the VM
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 263
-LevelDisplayName : Information
-Message          : WDDM graphics mode is enabled
+$Start = Get-Date "10/19/2026 07:45:00"
+$End   = Get-Date "10/19/2026 08:15:00"
+$Out   = "C:\Windows\Temp\AVD_SlowLogin_Report.txt"
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519700 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+$Logs = @(
+    "Microsoft-Windows-GroupPolicy/Operational",
+    "Microsoft-Windows-User Profiles Service/Operational",
+    "Microsoft-Windows-Winlogon/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+)
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519750 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+$Report = [System.Collections.Generic.List[string]]::new()
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519825 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+$Report.Add("AVD SLOW LOGIN REPORT")
+$Report.Add("VM: $env:COMPUTERNAME")
+$Report.Add("Time range: $Start to $End")
+$Report.Add("")
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260731700 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+foreach ($Log in $Logs) {
+    $Report.Add("========== $Log ==========")
 
-TimeCreated      : 10/19/2026 8:12:35 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260731750 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+    try {
+        $Events = @(
+            Get-WinEvent -FilterHashtable @{
+                LogName   = $Log
+                StartTime = $Start
+                EndTime   = $End
+            } -ErrorAction Stop |
+            Sort-Object TimeCreated
+        )
 
-TimeCreated      : 10/19/2026 8:12:37 AM
-Id               : 261
-LevelDisplayName : Information
-Message          : Listener rdp-sxs260731800 received a connection
+        if ($Events.Count -eq 0) {
+            $Report.Add("No events found.")
+        }
+        else {
+            foreach ($Event in $Events) {
+                $Report.Add("Time: $($Event.TimeCreated)")
+                $Report.Add("Event ID: $($Event.Id)")
+                $Report.Add("Level: $($Event.LevelDisplayName)")
+                $Report.Add("Message: $($Event.Message)")
+                $Report.Add("----------------------------------------")
+            }
+        }
+    }
+    catch {
+        $Report.Add("Unable to read log: $($_.Exception.Message)")
+    }
 
-TimeCreated      : 10/19/2026 8:12:38 AM
-Id               : 1149
-LevelDisplayName : Information
-Message          : Remote Desktop Services: User authentication succeeded:
-                   
-                   User: 
-                   Domain: 
-                   Source Network Address: 
+    $Report.Add("")
+}
 
-TimeCreated      : 10/19/2026 8:12:44 AM
-Id               : 263
-LevelDisplayName : Information
-Message          : WDDM graphics mode is enabled
+# Save locally
+try {
+    $Report | Out-File -FilePath $Out -Width 300 -Encoding UTF8
+}
+catch {
+    Write-Output "WARNING: Could not save local report: $($_.Exception.Message)"
+}
 
-TimeCreated      : 10/19/2026 8:12:44 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519700 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
+# Print results directly to Azure Run Command output
+foreach ($Line in $Report) {
+    Write-Output $Line
+}
 
-TimeCreated      : 10/19/2026 8:12:44 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519750 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated      : 10/19/2026 8:12:45 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260519825 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated      : 10/19/2026 8:12:45 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260731700 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated      : 10/19/2026 8:12:45 AM
-Id               : 20523
-LevelDisplayName : Information
-Message          : Connection from listener rdp-sxs260731750 will have terminal class of 
-                   {24656d38-a446-45d2-a0b9-7599bedb0044}
-
-TimeCreated      : 10/19/2026 8:13:10 AM
-Id               : 261
-LevelDisplayName : Information
-Message          : Listener RDP-Tcp received a connection
-
-TimeCreated      : 10/19/2026 8:13:45 AM
-Id               : 261
-LevelDisplayName : Information
-Message          : Listener RDP-Tcp received a connection
-
-TimeCreated      : 10/19/2026 8:13:46 AM
-Id               : 261
-LevelDisplayName : Information
-Message          : Listener RDP-Tcp received a connection
+Write-Output "Report collection completed."
