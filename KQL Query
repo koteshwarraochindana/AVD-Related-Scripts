@@ -1,200 +1,92 @@
-# ==================================================================================== #
-# AVD Restart Investigation Script - Azure Run Command (Hardened Core v3)              #
-# ==================================================================================== #
+Friday, user (U304997) disconnected at 11:00 PM, but the reboot didn't happen until 12:06 AM (1 hour and 6 minutes later).
 
-$DaysToCheck = 7
-$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
-$Hostname = $env:COMPUTERNAME
+   >>> Pre-Restart Session Activity (5-Hour Window):
+   Time (CST)      EventID  User            Action          Disconnect Reason
+   ----------      -------  ----            ------          -----------------
+   11:00:34 PM     40       N/A             Handshake       Code 20
+   11:00:42 PM     24       U304997         Disconnect      N/A
 
-$Output = New-Object System.Text.StringBuilder
-[void]$Output.AppendLine("====================================================")
-[void]$Output.AppendLine(" Generating AVD Reboot Report for Host: $Hostname ")
-[void]$Output.AppendLine(" Timezone Target: Central Standard Time (CST)       ")
-[void]$Output.AppendLine(" Investigation Window: 5 Hours Prior to Each Reboot ")
-[void]$Output.AppendLine("====================================================")
-[void]$Output.AppendLine("")
+Event ID         : 1074
+Restart Type     : [String]Planned Restart
+Time (CST)       : 09:59:20 AM
+Last Active Usr  : [String]N/A
+Session State    : [String]No Activity Found
+Initiated By     : [String]NT AUTHORITY\SYSTEM
+Shutdown Comment : [String]Calling CleanShutdown by wvchelper
 
-for ($i = 0; $i -lt $DaysToCheck; $i++) {
-    
-    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
-    $TargetDayName = $TargetDayCST.ToString("dddd")
-    $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
-    
-    [void]$Output.AppendLine("----------------------------------------------------")
-    [void]$Output.AppendLine(" PROCESSING: $TargetDayName ($TargetDateString)")
-    [void]$Output.AppendLine("----------------------------------------------------")
+EXECUTIVE ANALYSIS SUMMARY:
+- On Friday, a reboot happened at 09:59 AM, but no user activity was recorded in the 5 hours prior.
 
-    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
-    $DayEndUTC   = $DayStartUTC.AddDays(1)
 
-    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
-        LogName   = 'System'
-        Id        = 1074, 6008, 41
-        StartTime = $DayStartUTC
-    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
 
-    if ($RestartEvents.Count -eq 0) {
-        [void]$Output.AppendLine(" -> No restart events recorded on this day.`n")
-        continue
-    }
+----------------------------------------------------
+ PROCESSING: Thursday (10/22/2026)
+----------------------------------------------------
+Event ID         : 1074
+Restart Type     : [String]Planned Restart
+Time (CST)       : 03:05:27 AM
+Last Active Usr  : [String]U304997
+Session State    : [String]Disconnected
+Initiated By     : [String]NT AUTHORITY\SYSTEM
+Shutdown Comment : [String]Calling CleanShutdown by wvchelper
 
-    foreach ($RestartEvent in $RestartEvents) {
-        $RestartTime    = $RestartEvent.TimeCreated
-        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
+EXECUTIVE ANALYSIS SUMMARY:
+- On Thursday, user (U304997) disconnected at 02:00 AM, but the reboot didn't happen until 03:05 AM (1 hour and 5 minutes later).
 
-        $RestartType = switch ($RestartEvent.Id) {
-            1074 { "Planned Restart" }
-            41   { "System Crash / Power Failure" }
-            6008 { "Unexpected Shutdown" }
-            default { "Unknown" }
-        }
+   >>> Pre-Restart Session Activity (5-Hour Window):
+   Time (CST)      EventID  User            Action          Disconnect Reason
+   ----------      -------  ----            ------          -----------------
+   12:00:05 AM     40       N/A             Handshake       Code 20
+   12:00:14 AM     24       U304997         Disconnect      N/A
+   12:03:12 AM     40       N/A             Handshake       Code 25
+   12:03:14 AM     25       U304997         Reconnect       N/A
+   02:00:02 AM     40       N/A             Handshake       Code 20
+   02:00:04 AM     24       U304997         Disconnect      N/A
 
-        $StartTimeLimit = $RestartTime.AddHours(-5)
-        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-            Id        = 21, 24, 25, 39, 40
-            StartTime = $StartTimeLimit
-        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
+Event ID         : 1074
+Restart Type     : [String]Planned Restart
+Time (CST)       : 10:40:01 AM
+Last Active Usr  : [String]N/A
+Session State    : [String]No Activity Found
+Initiated By     : [String]NT AUTHORITY\SYSTEM
+Shutdown Comment : [String]Calling CleanShutdown by wvchelper
 
-        # Extract final user activity name safely
-        $LastSessionEvent = $null
-        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
-            if ($SessionEvents[$j].Message -like "*User:*") {
-                $LastSessionEvent = $SessionEvents[$j]
-                break
-            }
-        }
+EXECUTIVE ANALYSIS SUMMARY:
+- On Thursday, a reboot happened at 10:40 AM, but no user activity was recorded in the 5 hours prior.
 
-        $UserState        = "No Activity Found"
-        $UserName         = "N/A"
-        $NarrativeText    = ""
 
-        if ($LastSessionEvent) {
-            $UserState = switch ($LastSessionEvent.Id) {
-                21 { "Active (Logged In)" }
-                24 { "Disconnected" }
-                25 { "Reconnected / Active" }
-                39 { "Disconnected By System" }
-                40 { "Connection Handshake" }
-            }
-            
-            # Robust extraction block to safely parse usernames out of multi-line layouts
-            $MsgLines = $LastSessionEvent.Message -split "`n"
-            foreach ($Line in $MsgLines) {
-                if ($Line -like "*User:*") {
-                    $RawUserElement = (($Line -split "User:"))[-1].Trim().Split(" ")[0].Split(",")[0]
-                    if ($RawUserElement -like "*\*") { 
-                        $UserName = ($RawUserElement -split "\\")[-1].Trim()
-                    } else {
-                        $UserName = $RawUserElement.Trim()
-                    }
-                    break
-                }
-            }
 
-            $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
-            $TimeDiff = $RestartTimeCST - $LastUserTimeCST
-            
-            $DurationString = ""
-            if ($TimeDiff.Hours -gt 0) {
-                if ($TimeDiff.Hours -gt 1) { $DurationString = "$($TimeDiff.Hours) hours and " } else { $DurationString = "$($TimeDiff.Hours) hour and " }
-            }
-            if ($TimeDiff.Minutes -gt 1) { $DurationString += "$($TimeDiff.Minutes) minutes later" } else { $DurationString += "$($TimeDiff.Minutes) minute later" }
+----------------------------------------------------
+ PROCESSING: Wednesday (10/21/2026)
+----------------------------------------------------
+Event ID         : 1074
+Restart Type     : [String]Planned Restart
+Time (CST)       : 01:41:27 AM
+Last Active Usr  : [String]U304997
+Session State    : [String]Disconnected
+Initiated By     : [String]NT AUTHORITY\SYSTEM
+Shutdown Comment : [String]Calling CleanShutdown by wvchelper
 
-            $ActionVerb = switch ($LastSessionEvent.Id) {
-                21 { "logged in" }
-                24 { "disconnected" }
-                25 { "reconnected" }
-                39 { "was disconnected by the system" }
-                40 { "disconnected (handshake)" }
-                default { "had activity" }
-            }
+EXECUTIVE ANALYSIS SUMMARY:
+- On Wednesday, user (U304997) disconnected at 12:32 AM, but the reboot didn't happen until 01:41 AM (1 hour and 8 minutes later).
 
-            $NarrativeText = "- On $TargetDayName, user ($UserName) $ActionVerb at $($LastUserTimeCST.ToString('hh:mm tt')), but the reboot didn't happen until $($RestartTimeCST.ToString('hh:mm tt')) ($DurationString)."
-        } else {
-            $NarrativeText = "- On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
-        }
+   >>> Pre-Restart Session Activity (5-Hour Window):
+   Time (CST)      EventID  User            Action          Disconnect Reason
+   ----------      -------  ----            ------          -----------------
+   12:00:06 AM     40       N/A             Handshake       Code 20
+   12:00:14 AM     24       U304997         Disconnect      N/A
+   12:03:23 AM     40       N/A             Handshake       Code 25
+   12:03:25 AM     25       U304997         Reconnect       N/A
+   12:32:27 AM     40       N/A             Handshake       Code 20
+   12:32:28 AM     24       U304997         Disconnect      N/A
 
-        # Safe explicit extraction loops for initiator parameters
-        $InitiatedBy = "N/A"
-        $Comment     = "N/A"
-        $RawLines = $RestartEvent.Message -split "`n"
+Event ID         : 1074
+Restart Type     : [String]Planned Restart
+Time (CST)       : 11:33:10 AM
+Last Active Usr  : [String]N/A
+Session State    : [String]No Activity Found
+Initiated By     : [String]NT AUTHORITY\SYSTEM
+Shutdown Comment : [String]Calling CleanShutdown by wvchelper
 
-        foreach ($L in $RawLines) {
-            if ($L -like "*on behalf of user*") { 
-                $InitiatedBy = (($L -split "on behalf of user"))[-1].Split("for")[0].Trim() 
-            }
-            if ($L -like "*Comment:*") { 
-                $Comment = ($L -split "Comment:")[-1].Trim() 
-            }
-        }
-
-        # Format everything to clean strings explicitly
-        [void]$Output.AppendLine("Event ID         : $($RestartEvent.Id)")
-        [void]$Output.AppendLine("Restart Type     : [String]$RestartType")
-        [void]$Output.AppendLine("Time (CST)       : $($RestartTimeCST.ToString('hh:mm:ss tt'))")
-        [void]$Output.AppendLine("Last Active Usr  : [String]$UserName")
-        [void]$Output.AppendLine("Session State    : [String]$UserState")
-        [void]$Output.AppendLine("Initiated By     : [String]$InitiatedBy")
-        [void]$Output.AppendLine("Shutdown Comment : [String]$Comment")
-        [void]$Output.AppendLine("")
-        [void]$Output.AppendLine("EXECUTIVE ANALYSIS SUMMARY:")
-        [void]$Output.AppendLine($NarrativeText)
-        [void]$Output.AppendLine("")
-
-        if ($SessionEvents.Count -gt 0) {
-            [void]$Output.AppendLine("   >>> Pre-Restart Session Activity (5-Hour Window):")
-            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "Time (CST)", "EventID", "User", "Action", "Disconnect Reason") )
-            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "----------", "-------", "----", "------", "-----------------") )
-            
-            foreach ($Event in $SessionEvents) {
-                $LineUser = "N/A"
-                $EventLines = $Event.Message -split "`n"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*User:*") {
-                        $RawLineUser = (($EL -split "User:"))[-1].Trim().Split(" ")[0].Split(",")[0]
-                        if ($RawLineUser -like "*\*") { 
-                            $LineUser = ($RawLineUser -split "\\")[-1].Trim() 
-                        } else {
-                            $LineUser = $RawLineUser.Trim()
-                        }
-                        break
-                    }
-                }
-                
-                $Reason = "N/A"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*reason code*") {
-                        $CodeDigits = ""
-                        foreach ($Char in $EL.ToCharArray()) { if ([char]::IsDigit($Char)) { $CodeDigits += $Char } }
-                        if ($CodeDigits -ne "") {
-                            $Reason = switch ([int]$CodeDigits) {
-                                0  { "Normal Logoff/Disconnect" }
-                                5  { "Network Timeout/Closed Client" }
-                                11 { "Idle Timeout GPO" }
-                                12 { "Disconnected Session Timeout GPO" }
-                                default { "Code $CodeDigits" }
-                            }
-                        }
-                        break
-                    }
-                }
-                
-                $ActionName = switch ($Event.Id) {
-                    21 { "Logon" }
-                    24 { "Disconnect" }
-                    25 { "Reconnect" }
-                    39 { "Sys-Disconnect" }
-                    40 { "Handshake" }
-                }
-
-                $EventTimeCST = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
-                [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", $EventTimeCST, $Event.Id, [string]$LineUser, [string]$ActionName, [string]$Reason) )
-            }
-        }
-        [void]$Output.AppendLine("")
-    }
-    [void]$Output.AppendLine("")
-}
-
-Write-Output $Output.ToString()
+EXECUTIVE ANALYSIS SUMMARY:
+- On Wednesday, a reboot happened at 11:33 AM, but no user activity was recorded in the 5 hours prior.
