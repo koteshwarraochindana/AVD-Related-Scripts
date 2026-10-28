@@ -1,210 +1,359 @@
-# ==================================================================================== #
-# AVD Restart Investigation Script - Hardened Production Run Command Version           #
-# ==================================================================================== #
+# ====================================================================================
+# AVD Restart Investigation - Workstation PowerShell 5.1 Version
+# Collects remote Windows event logs using Get-WinEvent -ComputerName (no Azure Run Command).
+# Input CSV supports: VMName, ComputerName, or the existing SubscriptionId,ResourceGroup,VMName format.
+# ====================================================================================
 
-$DaysToCheck = 7
-$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
-$Hostname = $env:COMPUTERNAME
+[CmdletBinding()]
+param(
+    [string]$InputCsv = 'C:\Temp\AVD_TargetVMs.csv',
+    [int]$DaysToCheck = 7,
+    [int]$SessionLookbackHours = 5,
+    [string]$OutputFolder = 'C:\Temp'
+)
 
-$Output = New-Object System.Text.StringBuilder
-[void]$Output.AppendLine("====================================================")
-[void]$Output.AppendLine(" Generating AVD Reboot Report for Host: $Hostname ")
-[void]$Output.AppendLine(" Timezone Target: Central Standard Time (CST)       ")
-[void]$Output.AppendLine(" Investigation Window: 5 Hours Prior to Each Reboot ")
-[void]$Output.AppendLine("====================================================")
-[void]$Output.AppendLine("")
+$ErrorActionPreference = 'Stop'
+$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+$RunStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$EventCsv = Join-Path $OutputFolder "AVD_Restart_Investigation_Events_$RunStamp.csv"
+$TimelineCsv = Join-Path $OutputFolder "AVD_Restart_Investigation_SessionTimeline_$RunStamp.csv"
+$StatusCsv = Join-Path $OutputFolder "AVD_Restart_Investigation_VMStatus_$RunStamp.csv"
+$ReportTxt = Join-Path $OutputFolder "AVD_Restart_Investigation_Report_$RunStamp.txt"
 
-for ($i = 0; $i -lt $DaysToCheck; $i++) {
-    
-    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
-    $TargetDayName = $TargetDayCST.ToString("dddd")
-    $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
-    
-    [void]$Output.AppendLine("----------------------------------------------------")
-    [void]$Output.AppendLine(" PROCESSING: $TargetDayName ($TargetDateString)")
-    [void]$Output.AppendLine("----------------------------------------------------")
+if (-not (Test-Path -LiteralPath $InputCsv)) {
+    throw "Input CSV not found: $InputCsv"
+}
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
 
-    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
-    $DayEndUTC   = $DayStartUTC.AddDays(1)
+$Targets = @(Import-Csv -LiteralPath $InputCsv)
+if ($Targets.Count -eq 0) { throw "Input CSV contains no target rows: $InputCsv" }
 
-    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
-        LogName   = 'System'
-        Id        = 1074, 6008, 41
-        StartTime = $DayStartUTC
-    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
+$TargetNames = foreach ($row in $Targets) {
+    $name = $null
+    if ($row.PSObject.Properties.Name -contains 'VMName' -and -not [string]::IsNullOrWhiteSpace($row.VMName)) {
+        $name = $row.VMName
+    } elseif ($row.PSObject.Properties.Name -contains 'ComputerName' -and -not [string]::IsNullOrWhiteSpace($row.ComputerName)) {
+        $name = $row.ComputerName
+    } elseif ($row.PSObject.Properties.Name -contains 'HostName' -and -not [string]::IsNullOrWhiteSpace($row.HostName)) {
+        $name = $row.HostName
+    }
+    if ($name) { $name.Trim() }
+}
+$TargetNames = @($TargetNames | Where-Object { $_ } | Sort-Object -Unique)
+if ($TargetNames.Count -eq 0) {
+    throw 'No target names found. CSV must contain a VMName, ComputerName, or HostName column.'
+}
 
+$EventRows = New-Object System.Collections.Generic.List[object]
+$TimelineRows = New-Object System.Collections.Generic.List[object]
+$StatusRows = New-Object System.Collections.Generic.List[object]
+$Report = New-Object System.Text.StringBuilder
+$WindowStart = (Get-Date).AddDays(-$DaysToCheck)
+
+function Convert-ToCentralTime {
+    param([datetime]$DateTimeValue)
+    # Get-WinEvent exposes TimeCreated as a DateTime. Convert it to UTC first, then to Central.
+    $utc = $DateTimeValue.ToUniversalTime()
+    return [System.TimeZoneInfo]::ConvertTimeFromUtc($utc, $CSTZone)
+}
+
+function Get-UserFromEventMessage {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return 'N/A' }
+    foreach ($line in ($Message -split "`r?`n")) {
+        if ($line -match 'User:\s*(.+)') {
+            $raw = ($Matches[1].Trim() -split '[,\s]')[0].Trim()
+            if ($raw -match '\\') { $raw = ($raw -split '\\')[-1] }
+            if ($raw) { return $raw }
+        }
+    }
+    return 'N/A'
+}
+
+function Get-ReasonFromEventMessage {
+    param([string]$Message)
+    if ($Message -match '(?i)reason code\s*[:=]?\s*(\d+)') {
+        $code = [int]$Matches[1]
+        switch ($code) {
+            0  { return 'Normal Logoff / Disconnect' }
+            5  { return 'Network Timeout / Closed Client' }
+            11 { return 'Idle Timeout GPO Policy' }
+            12 { return 'Disconnected Session GPO Timeout' }
+            default { return "Code $code" }
+        }
+    }
+    return 'N/A'
+}
+
+function Get-ActionName {
+    param([int]$EventId)
+    switch ($EventId) {
+        21 { 'Logon' }
+        24 { 'Disconnect' }
+        25 { 'Reconnect' }
+        39 { 'Sys-Disconnect' }
+        40 { 'Handshake' }
+        default { "Event $EventId" }
+    }
+}
+
+[void]$Report.AppendLine('AVD RESTART INVESTIGATION REPORT')
+[void]$Report.AppendLine("Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+[void]$Report.AppendLine("Window: last $DaysToCheck days; session lookback: $SessionLookbackHours hours; displayed times: Central Time")
+[void]$Report.AppendLine("Targets: $($TargetNames.Count)")
+[void]$Report.AppendLine(('=' * 100))
+
+foreach ($Computer in $TargetNames) {
+    Write-Host "[$Computer] Collecting restart and session events..." -ForegroundColor Cyan
+    $RestartEvents = @()
+    $SessionEvents = @()
+    $collectionError = $null
+    $sessionLogError = $null
+
+    try {
+        # Remote Event Log access (RPC/Event Log service); this does not use Azure Run Command or WinRM.
+        try {
+            $RestartEvents = @(Get-WinEvent -ComputerName $Computer -FilterHashtable @{
+                LogName = 'System'
+                Id = 1074, 6008, 41
+                StartTime = $WindowStart
+            } -ErrorAction Stop | Sort-Object TimeCreated -Descending)
+        } catch {
+            if ($_.Exception.Message -match '(?i)no events were found|no events found') {
+                $RestartEvents = @()
+            } else { throw }
+        }
+
+        try {
+            $SessionEvents = @(Get-WinEvent -ComputerName $Computer -FilterHashtable @{
+                LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+                Id = 21, 24, 25, 39, 40
+                StartTime = $WindowStart.AddHours(-$SessionLookbackHours)
+            } -ErrorAction Stop | Sort-Object TimeCreated)
+        } catch {
+            # A disabled or inaccessible session log should not discard restart events.
+            if ($_.Exception.Message -match '(?i)no events were found|no events found') {
+                $SessionEvents = @()
+            } else {
+                $sessionLogError = $_.Exception.Message
+                $SessionEvents = @()
+            }
+        }
+    } catch {
+        $collectionError = $_.Exception.Message
+    }
+
+    if ($collectionError) {
+        $StatusRows.Add([pscustomobject]@{
+            ComputerName = $Computer; CollectionStatus = 'Failed'; RestartEventCount = 0
+            SessionEventCount = 0; WindowStart = $WindowStart; WindowEnd = (Get-Date)
+            Details = $collectionError
+        })
+        [void]$Report.AppendLine("`r`nHOST: $Computer`r`nCOLLECTION FAILED: $collectionError`r`n")
+        Write-Warning "[$Computer] Collection failed: $collectionError"
+        continue
+    }
+
+    $StatusText = if ($RestartEvents.Count -gt 0) { 'Success - Restart Events Found' } else { 'Success - No Restart Events Found' }
+    if ($sessionLogError) { $StatusText += '; Session Log Unavailable' }
+    $StatusRows.Add([pscustomobject]@{
+        ComputerName = $Computer; CollectionStatus = $StatusText; RestartEventCount = $RestartEvents.Count
+        SessionEventCount = $SessionEvents.Count; WindowStart = $WindowStart; WindowEnd = (Get-Date)
+        Details = $(if ($sessionLogError) { $sessionLogError } else { '' })
+    })
+
+    [void]$Report.AppendLine("`r`nHOST: $Computer")
+    [void]$Report.AppendLine("Restart events found: $($RestartEvents.Count)")
     if ($RestartEvents.Count -eq 0) {
-        [void]$Output.AppendLine(" -> No restart events recorded on this day.`n")
+        [void]$Report.AppendLine('No restart/shutdown events (1074, 6008, 41) were recorded in the selected window.')
         continue
     }
 
     foreach ($RestartEvent in $RestartEvents) {
-        $RestartTime    = $RestartEvent.TimeCreated
-        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
-
+        $RestartTimeCST = Convert-ToCentralTime -DateTimeValue $RestartEvent.TimeCreated
         $RestartType = switch ($RestartEvent.Id) {
-            1074 { "Planned Restart" }
-            41   { "System Crash / Power Failure" }
-            6008 { "Unexpected Shutdown" }
-            default { "Unknown" }
+            1074 { 'Planned Restart / Shutdown' }
+            41   { 'System Crash / Power Failure' }
+            6008 { 'Unexpected Shutdown' }
+            default { 'Unknown' }
         }
+        $StartTimeLimit = $RestartEvent.TimeCreated.AddHours(-$SessionLookbackHours)
+        $PriorSessionEvents = @($SessionEvents | Where-Object {
+            $_.TimeCreated -ge $StartTimeLimit -and $_.TimeCreated -le $RestartEvent.TimeCreated
+        } | Sort-Object TimeCreated)
 
-        $StartTimeLimit = $RestartTime.AddHours(-5)
-        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-            Id        = 21, 24, 25, 39, 40
-            StartTime = $StartTimeLimit
-        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
-
-        # 1. Safely locate the last logged user identity
         $LastSessionEvent = $null
-        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
-            if ($SessionEvents[$j].Message -like "*User:*") {
-                $LastSessionEvent = $SessionEvents[$j]
+        for ($j = $PriorSessionEvents.Count - 1; $j -ge 0; $j--) {
+            if ($PriorSessionEvents[$j].Message -match '(?i)User:') {
+                $LastSessionEvent = $PriorSessionEvents[$j]
                 break
             }
         }
 
-        $UserState        = "No Activity Found"
-        $UserName         = "N/A"
-        $NarrativeText    = ""
-
+        $UserName = 'N/A'
+        $UserState = 'No Activity Found'
+        $NarrativeText = ''
+        $LastUserTimeCST = $null
+        $MinutesBeforeRestart = $null
         if ($LastSessionEvent) {
+            $UserName = Get-UserFromEventMessage -Message $LastSessionEvent.Message
             $UserState = switch ($LastSessionEvent.Id) {
-                21 { "Active (Logged In)" }
-                24 { "Disconnected" }
-                25 { "Reconnected / Active" }
-                39 { "Disconnected By System" }
-                40 { "Connection Handshake" }
+                21 { 'Active (Logged In)' }
+                24 { 'Disconnected' }
+                25 { 'Reconnected / Active' }
+                39 { 'Disconnected By System' }
+                40 { 'Connection Handshake' }
+                default { 'Activity Found' }
             }
-            
-            # Robust extraction block to safely isolate single strings from arrays
-            $MsgLines = $LastSessionEvent.Message -split "`n"
-            foreach ($Line in $MsgLines) {
-                if ($Line -like "*User:*") {
-                    $Parts = $Line -split "User:"
-                    if ($Parts.Count -gt 1) {
-                        $RawUser = $Parts[1].Trim().Split(" ")[0].Split(",")[0].Trim()
-                        if ($RawUser -like "*\*") {
-                            $UserParts = $RawUser -split "\\"
-                            $UserName = $UserParts[$UserParts.Count - 1].Trim()
-                        } else {
-                            $UserName = $RawUser
-                        }
-                    }
-                    break
-                }
-            }
-
-            $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
-            $TimeDiff = $RestartTimeCST - $LastUserTimeCST
-            
-            $DurationString = ""
-            if ($TimeDiff.Hours -gt 0) {
-                if ($TimeDiff.Hours -gt 1) { $DurationString = "$($TimeDiff.Hours) hours and " } else { $DurationString = "$($TimeDiff.Hours) hour and " }
-            }
-            if ($TimeDiff.Minutes -gt 1) { $DurationString += "$($TimeDiff.Minutes) minutes later" } else { $DurationString += "$($TimeDiff.Minutes) minute later" }
-
+            $LastUserTimeCST = Convert-ToCentralTime -DateTimeValue $LastSessionEvent.TimeCreated
+            $MinutesBeforeRestart = [math]::Round(($RestartEvent.TimeCreated - $LastSessionEvent.TimeCreated).TotalMinutes, 1)
             $ActionVerb = switch ($LastSessionEvent.Id) {
-                21 { "logged in" }
-                24 { "disconnected" }
-                25 { "reconnected" }
-                39 { "was disconnected by the system" }
-                40 { "disconnected (handshake)" }
-                default { "had activity" }
+                21 { 'logged in' }
+                24 { 'disconnected' }
+                25 { 'reconnected' }
+                39 { 'was disconnected by the system' }
+                40 { 'had a connection handshake' }
+                default { 'had activity' }
             }
-
-            $NarrativeText = "- On $TargetDayName, user ($UserName) $ActionVerb at $($LastUserTimeCST.ToString('hh:mm tt')), but the reboot didn't happen until $($RestartTimeCST.ToString('hh:mm tt')) ($DurationString)."
+            $NarrativeText = "User '$UserName' $ActionVerb at $($LastUserTimeCST.ToString('yyyy-MM-dd hh:mm:ss tt')) Central Time; restart/shutdown event recorded $MinutesBeforeRestart minutes later."
         } else {
-            $NarrativeText = "- On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
+            $NarrativeText = "A restart/shutdown event occurred at $($RestartTimeCST.ToString('yyyy-MM-dd hh:mm:ss tt')) Central Time, but no user-bearing session event was found in the $SessionLookbackHours hours before it."
         }
 
-        # Safe explicit extraction loops for initiator parameters
-        $InitiatedBy = "N/A"
-        $Comment     = "N/A"
-        $RawLines = $RestartEvent.Message -split "`n"
-
-        foreach ($L in $RawLines) {
-            if ($L -like "*on behalf of user*") { 
-                $Parts = $L -split "on behalf of user"
-                if ($Parts.Count -gt 1) {
-                    $SubParts = $Parts[1] -split "for"
-                    $InitiatedBy = $SubParts[0].Trim()
-                }
-            }
-            if ($L -like "*Comment:*") { 
-                $Parts = $L -split "Comment:"
-                if ($Parts.Count -gt 1) {
-                    $Comment = $Parts[1].Trim()
-                }
+        $InitiatedBy = 'N/A'
+        $Comment = 'N/A'
+        if ($RestartEvent.Message) {
+            foreach ($line in ($RestartEvent.Message -split "`r?`n")) {
+                if ($line -match '(?i)on behalf of user\s+(.+?)\s+for\s+') { $InitiatedBy = $Matches[1].Trim() }
+                if ($line -match '(?i)Comment:\s*(.*)') { $Comment = $Matches[1].Trim() }
             }
         }
 
-        [void]$Output.AppendLine("Event ID         : $($RestartEvent.Id)")
-        [void]$Output.AppendLine("Restart Type     : $RestartType")
-        [void]$Output.AppendLine("Time (CST)       : $($RestartTimeCST.ToString('hh:mm:ss tt'))")
-        [void]$Output.AppendLine("Last Active Usr  : $UserName")
-        [void]$Output.AppendLine("Session State    : $UserState")
-        [void]$Output.AppendLine("Initiated By     : $InitiatedBy")
-        [void]$Output.AppendLine("Shutdown Comment : $Comment")
-        [void]$Output.AppendLine("")
-        [void]$Output.AppendLine("EXECUTIVE ANALYSIS SUMMARY:")
-        [void]$Output.AppendLine($NarrativeText)
-        [void]$Output.AppendLine("")
+        # Evidence-based diagnostic interpretation. This identifies what the event supports,
+        # not an unproven root cause.
+        $DiagnosticFinding = ''
+        $Evidence = ''
+        $RecommendedChecks = ''
+        $AnalysisConfidence = 'Limited - event-log evidence only'
+        switch ($RestartEvent.Id) {
+            1074 {
+                $DiagnosticFinding = 'A planned shutdown or restart was requested by a process/account.'
+                if ($InitiatedBy -ne 'N/A') {
+                    $Evidence = "Event 1074 records the initiating account/process context as '$InitiatedBy'."
+                } else {
+                    $Evidence = 'Event 1074 records a planned shutdown/restart, but the initiating account could not be extracted from the event message.'
+                }
+                if ($Comment -ne 'N/A') { $Evidence += " Recorded comment: '$Comment'." }
+                $RecommendedChecks = 'Validate the recorded process/account and timestamp against Windows Update, maintenance/orchestration jobs, scheduled tasks, deployment tooling, and administrative activity.'
+            }
+            6008 {
+                $DiagnosticFinding = 'Windows reports that the previous shutdown was unexpected; Event 6008 alone does not identify the cause.'
+                $Evidence = 'System log Event 6008 indicates the prior shutdown was not recorded as a clean, expected shutdown.'
+                $RecommendedChecks = 'Check nearby System events before and after the reported shutdown time, especially Event 41, BugCheck 1001, disk/storage/controller errors, power events, and Azure platform/host maintenance or VM health records.'
+            }
+            41 {
+                $DiagnosticFinding = 'Windows detected that the system restarted without a clean shutdown; this event alone does not prove whether the cause was a crash, power interruption, hang, or forced reset.'
+                $Evidence = 'System log Event 41 records an unclean restart. Inspect the complete event XML/message for BugcheckCode and related parameters before attributing a cause.'
+                $RecommendedChecks = 'Inspect Event 41 XML for BugcheckCode; correlate BugCheck 1001, dump files, WHEA/storage errors, and Azure VM host/platform events at the same timestamp.'
+            }
+        }
+        if ($LastSessionEvent) {
+            $Evidence += " Last user-bearing session event was ID $($LastSessionEvent.Id) ($UserState) for '$UserName', $MinutesBeforeRestart minute(s) before the restart event."
+            if ($LastSessionEvent.Id -in @(24,39)) {
+                $DiagnosticFinding += ' The last recorded session event indicates disconnection; this does not by itself mean the user initiated or caused the restart.'
+                $RecommendedChecks += ' Confirm whether the user had another active session and review surrounding session events; a disconnect event alone is not proof of a restart cause.'
+            } elseif ($LastSessionEvent.Id -in @(21,25)) {
+                $DiagnosticFinding += ' The last recorded session event indicates logon/reconnection activity before the restart; timing alone does not prove the session caused it.'
+            }
+        } else {
+            $Evidence += " No user-bearing session event was found in the $SessionLookbackHours-hour lookback window."
+            $RecommendedChecks += ' Verify that the LocalSessionManager Operational log was enabled and accessible, and consider checking a wider lookback window.'
+        }
+        $NarrativeText = "$DiagnosticFinding Evidence: $Evidence Recommended checks: $RecommendedChecks"
 
-        if ($SessionEvents.Count -gt 0) {
-            [void]$Output.AppendLine("   >>> Pre-Restart Session Activity (5-Hour Window):")
-            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "Time (CST)", "EventID", "User", "Action", "Disconnect Reason") )
-            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "----------", "-------", "----", "------", "-----------------") )
-            
-            foreach ($Event in $SessionEvents) {
-                $LineUser = "N/A"
-                $EventLines = $Event.Message -split "`n"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*User:*") {
-                        $Parts = $EL -split "User:"
-                        if ($Parts.Count -gt 1) {
-                            $RawLineUser = $Parts[1].Trim().Split(" ")[0].Split(",")[0].Trim()
-                            if ($RawLineUser -like "*\*") { 
-                                $UserParts = $RawLineUser -split "\\"
-                                $LineUser = $UserParts[$UserParts.Count - 1].Trim() 
-                            } else {
-                                $LineUser = $RawLineUser
-                            }
-                        }
-                        break
-                    }
-                }
-                
-                # Fixed Target Reason Code Parsing Logic
-                $Reason = "N/A"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*reason code*") {
-                        $Parts = $EL -split "reason code"
-                        if ($Parts.Count -gt 1) {
-                            $CodeDigits = ""
-                            foreach ($Char in $Parts[1].ToCharArray()) { 
-                                if ([char]::IsDigit($Char)) { $CodeDigits += $Char } 
-                            }
-                            if ($CodeDigits -ne "") {
-                                $Reason = switch ([int]$CodeDigits) {
-                                    0  { "Normal Logoff / Disconnect" }
-                                    5  { "Network Timeout / Closed Client" }
-                                    11 { "Idle Timeout GPO Policy" }
-                                    12 { "Disconnected Session GPO Timeout" }
-                                    default { "Code $CodeDigits" }
-                                }
-                            }
-                        }
-                        break
-                    }
-                }
-                
-                $ActionName = switch ($Event.Id) {
-                    21 { "Logon" }
-                    24 { "Disconnect" }
-                    25 { "Reconnect" }
-                    39 { "Sys-Disconnect" }
-                    40 { "Handshake" }
-                }
+        $EventRows.Add([pscustomobject]@{
+            ComputerName = $Computer
+            EventId = $RestartEvent.Id
+            RestartType = $RestartType
+            EventTimeCentral = $RestartTimeCST.ToString('yyyy-MM-dd HH:mm:ss')
+            LastActiveUser = $UserName
+            SessionState = $UserState
+            LastSessionEventId = $(if ($LastSessionEvent) { $LastSessionEvent.Id } else { $null })
+            LastSessionEventTimeCentral = $(if ($LastUserTimeCST) { $LastUserTimeCST.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+            MinutesFromLastSessionEventToRestart = $MinutesBeforeRestart
+            InitiatedBy = $InitiatedBy
+            ShutdownComment = $Comment
+            DiagnosticFinding = $DiagnosticFinding
+            Evidence = $Evidence
+            RecommendedChecks = $RecommendedChecks
+            AnalysisConfidence = $AnalysisConfidence
+            ExecutiveAnalysis = $NarrativeText
+            SessionEventsInLookback = $PriorSessionEvents.Count
+        })
 
+        [void]$Report.AppendLine('')
+        [void]$Report.AppendLine("Event ID         : $($RestartEvent.Id)")
+        [void]$Report.AppendLine("Restart Type     : $RestartType")
+        [void]$Report.AppendLine("Time (Central)   : $($RestartTimeCST.ToString('yyyy-MM-dd hh:mm:ss tt'))")
+        [void]$Report.AppendLine("Last Active User : $UserName")
+        [void]$Report.AppendLine("Session State    : $UserState")
+        [void]$Report.AppendLine("Initiated By     : $InitiatedBy")
+        [void]$Report.AppendLine("Shutdown Comment : $Comment")
+        [void]$Report.AppendLine('DIAGNOSTIC ANALYSIS:')
+        [void]$Report.AppendLine("Finding          : $DiagnosticFinding")
+        [void]$Report.AppendLine("Evidence         : $Evidence")
+        [void]$Report.AppendLine("Recommended Checks: $RecommendedChecks")
+        [void]$Report.AppendLine("Confidence       : $AnalysisConfidence")
+        [void]$Report.AppendLine('Pre-restart session timeline:')
+
+        if ($PriorSessionEvents.Count -eq 0) {
+            [void]$Report.AppendLine('  No session events found in the lookback window.')
+        } else {
+            foreach ($SessionEvent in $PriorSessionEvents) {
+                $SessionTimeCST = Convert-ToCentralTime -DateTimeValue $SessionEvent.TimeCreated
+                $LineUser = Get-UserFromEventMessage -Message $SessionEvent.Message
+                $ActionName = Get-ActionName -EventId $SessionEvent.Id
+                $Reason = Get-ReasonFromEventMessage -Message $SessionEvent.Message
+                $TimelineRows.Add([pscustomobject]@{
+                    ComputerName = $Computer
+                    RestartEventId = $RestartEvent.Id
+                    RestartTimeCentral = $RestartTimeCST.ToString('yyyy-MM-dd HH:mm:ss')
+                    SessionEventId = $SessionEvent.Id
+                    SessionAction = $ActionName
+                    SessionEventTimeCentral = $SessionTimeCST.ToString('yyyy-MM-dd HH:mm:ss')
+                    UserName = $LineUser
+                    DisconnectReason = $Reason
+                    MinutesBeforeRestart = [math]::Round(($RestartEvent.TimeCreated - $SessionEvent.TimeCreated).TotalMinutes, 1)
+                    EventMessage = ($SessionEvent.Message -replace '[\r\n]+', ' ').Trim()
+                })
+                [void]$Report.AppendLine(('  {0} | Event {1} | User: {2} | Action: {3} | Reason: {4}' -f $SessionTimeCST.ToString('yyyy-MM-dd hh:mm:ss tt'), $SessionEvent.Id, $LineUser, $ActionName, $Reason))
+            }
+        }
+    }
+}
+
+# Always write the three CSVs, including headers when there are no matching records.
+if ($EventRows.Count -gt 0) { $EventRows | Export-Csv -LiteralPath $EventCsv -NoTypeInformation -Encoding UTF8 }
+else { 'ComputerName,EventId,RestartType,EventTimeCentral,LastActiveUser,SessionState,LastSessionEventId,LastSessionEventTimeCentral,MinutesFromLastSessionEventToRestart,InitiatedBy,ShutdownComment,DiagnosticFinding,Evidence,RecommendedChecks,AnalysisConfidence,ExecutiveAnalysis,SessionEventsInLookback' | Set-Content -LiteralPath $EventCsv -Encoding UTF8 }
+
+if ($TimelineRows.Count -gt 0) { $TimelineRows | Export-Csv -LiteralPath $TimelineCsv -NoTypeInformation -Encoding UTF8 }
+else { 'ComputerName,RestartEventId,RestartTimeCentral,SessionEventId,SessionAction,SessionEventTimeCentral,UserName,DisconnectReason,MinutesBeforeRestart,EventMessage' | Set-Content -LiteralPath $TimelineCsv -Encoding UTF8 }
+
+if ($StatusRows.Count -gt 0) { $StatusRows | Export-Csv -LiteralPath $StatusCsv -NoTypeInformation -Encoding UTF8 }
+else { 'ComputerName,CollectionStatus,RestartEventCount,SessionEventCount,WindowStart,WindowEnd,Details' | Set-Content -LiteralPath $StatusCsv -Encoding UTF8 }
+
+[void]$Report.AppendLine("`r`nOUTPUT FILES")
+[void]$Report.AppendLine("Event details CSV : $EventCsv")
+[void]$Report.AppendLine("Session timeline : $TimelineCsv")
+[void]$Report.AppendLine("Per-VM status CSV: $StatusCsv")
+$Report.ToString() | Set-Content -LiteralPath $ReportTxt -Encoding UTF8
+
+Write-Host ''
+Write-Host 'AVD restart investigation completed.' -ForegroundColor Green
+Write-Host "Event details : $EventCsv"
+Write-Host "Session log   : $TimelineCsv"
+Write-Host "VM status     : $StatusCsv"
+Write-Host "Text report   : $ReportTxt"
+Write-Host 'Note: remote event-log access must be enabled and your account must have permission on the target VMs.' -ForegroundColor Yellow
