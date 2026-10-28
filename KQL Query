@@ -1,17 +1,19 @@
 # ==================================================================================== #
-# AVD Restart Investigation Script - Hardened Core Production Version (PS 5.1 & 7+)    #
+# AVD Restart Investigation Script - Optimized for Azure Run Command                  #
 # ==================================================================================== #
 
 $DaysToCheck = 7
 $CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
 $Hostname = $env:COMPUTERNAME
 
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host " Generating AVD Reboot Report for Host: $Hostname " -ForegroundColor Green
-Write-Host " Timezone Target: Central Standard Time (CST)       " -ForegroundColor Green
-Write-Host " Investigation Window: 5 Hours Prior to Each Reboot " -ForegroundColor Green
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host ""
+# We use a string builder to aggregate all output safely for the Azure log collector
+$Output = New-Object System.Text.StringBuilder
+[void]$Output.AppendLine("====================================================")
+[void]$Output.AppendLine(" Generating AVD Reboot Report for Host: $Hostname ")
+[void]$Output.AppendLine(" Timezone Target: Central Standard Time (CST)       ")
+[void]$Output.AppendLine(" Investigation Window: 5 Hours Prior to Each Reboot ")
+[void]$Output.AppendLine("====================================================")
+[void]$Output.AppendLine("")
 
 for ($i = 0; $i -lt $DaysToCheck; $i++) {
     
@@ -19,14 +21,13 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
     $TargetDayName = $TargetDayCST.ToString("dddd")
     $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
     
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    Write-Host " PROCESSING: $TargetDayName ($TargetDateString)" -ForegroundColor Yellow
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
+    [void]$Output.AppendLine("----------------------------------------------------")
+    [void]$Output.AppendLine(" PROCESSING: $TargetDayName ($TargetDateString)")
+    [void]$Output.AppendLine("----------------------------------------------------")
 
     $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
     $DayEndUTC   = $DayStartUTC.AddDays(1)
 
-    # 1. Safely gather reboot events into a strict array format
     $RestartEvents = @(Get-WinEvent -FilterHashtable @{
         LogName   = 'System'
         Id        = 1074, 6008, 41
@@ -34,11 +35,10 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
     } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
 
     if ($RestartEvents.Count -eq 0) {
-        Write-Host " -> No restart events recorded on this day.`n" -ForegroundColor Gray
+        [void]$Output.AppendLine(" -> No restart events recorded on this day.`n")
         continue
     }
 
-    # 2. Process each reboot
     foreach ($RestartEvent in $RestartEvents) {
         $RestartTime    = $RestartEvent.TimeCreated
         $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
@@ -50,7 +50,6 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             default { "Unknown" }
         }
 
-        # 3. Securely gather pre-reboot terminal session transitions
         $StartTimeLimit = $RestartTime.AddHours(-5)
         $SessionEvents = @(Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
@@ -58,7 +57,6 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             StartTime = $StartTimeLimit
         } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
 
-        # 4. Extract final interactive identity signature safely
         $LastSessionEvent = $null
         for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
             if ($SessionEvents[$j].Message -like "*User:*") {
@@ -80,7 +78,6 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 40 { "Connection Handshake" }
             }
             
-            # Legacy-safe string split parsing
             $MsgLines = $LastSessionEvent.Message -split "`n"
             foreach ($Line in $MsgLines) {
                 if ($Line -like "*User:*") {
@@ -92,26 +89,14 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 }
             }
 
-            # 5. Build executive timing delta metrics (Flat structure, no ternary operators)
             $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
             $TimeDiff = $RestartTimeCST - $LastUserTimeCST
             
             $DurationString = ""
             if ($TimeDiff.Hours -gt 0) {
-                $Hrs = $TimeDiff.Hours
-                if ($Hrs -gt 1) {
-                    $DurationString = "$Hrs hours and "
-                } else {
-                    $DurationString = "$Hrs hour and "
-                }
+                if ($TimeDiff.Hours -gt 1) { $DurationString = "$($TimeDiff.Hours) hours and " } else { $DurationString = "$($TimeDiff.Hours) hour and " }
             }
-            
-            $Mins = $TimeDiff.Minutes
-            if ($Mins -gt 1) {
-                $DurationString = $DurationString + "$Mins minutes later"
-            } else {
-                $DurationString = $DurationString + "$Mins minute later"
-            }
+            if ($TimeDiff.Minutes -gt 1) { $DurationString += "$($TimeDiff.Minutes) minutes later" } else { $DurationString += "$($TimeDiff.Minutes) minute later" }
 
             $ActionVerb = switch ($LastSessionEvent.Id) {
                 21 { "logged in" }
@@ -127,41 +112,32 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             $NarrativeText = "• On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
         }
 
-        # 6. Safe explicit extraction loops for initiator parameters
         $InitiatedBy = "N/A"
         $Comment     = "N/A"
         $RawLines = $RestartEvent.Message -split "`n"
 
         foreach ($L in $RawLines) {
-            if ($L -like "*on behalf of user*") {
-                $InitiatedBy = (($L -split "on behalf of user")).Split("for").Trim()
-            }
-            if ($L -like "*Comment:*") {
-                $Comment = ($L -split "Comment:").Trim()
-            }
+            if ($L -like "*on behalf of user*") { $InitiatedBy = (($L -split "on behalf of user")).Split("for").Trim() }
+            if ($L -like "*Comment:*") { $Comment = ($L -split "Comment:").Trim() }
         }
 
-        # Render explicit summary layout blocks
-        $Summary = [PSCustomObject]@{
-            "Event ID"        = $RestartEvent.Id
-            "Restart Type"    = $RestartType
-            "Time (CST)"      = $RestartTimeCST.ToString("hh:mm:ss tt")
-            "Last Active Usr" = $UserName
-            "Session State"   = $UserState
-            "Initiated By"    = $InitiatedBy
-            "Shutdown Comment"= $Comment
-        }
-        $Summary | Format-List
-        
-        Write-Host "💡 EXECUTIVE ANALYSIS SUMMARY:" -ForegroundColor Yellow
-        Write-Host $NarrativeText -ForegroundColor White
-        Write-Host ""
+        [void]$Output.AppendLine("Event ID         : $($RestartEvent.Id)")
+        [void]$Output.AppendLine("Restart Type     : $RestartType")
+        [void]$Output.AppendLine("Time (CST)       : $($RestartTimeCST.ToString('hh:mm:ss tt'))")
+        [void]$Output.AppendLine("Last Active Usr  : $UserName")
+        [void]$Output.AppendLine("Session State    : $UserState")
+        [void]$Output.AppendLine("Initiated By     : $InitiatedBy")
+        [void]$Output.AppendLine("Shutdown Comment : $Comment")
+        [void]$Output.AppendLine("")
+        [void]$Output.AppendLine("💡 EXECUTIVE ANALYSIS SUMMARY:")
+        [void]$Output.AppendLine($NarrativeText)
+        [void]$Output.AppendLine("")
 
-        # 7. Render sequential chronological table mapping
         if ($SessionEvents.Count -gt 0) {
-            Write-Host "   >>> Pre-Restart Session Activity (5-Hour Window):" -ForegroundColor Cyan
-            
-            $TimelineTable = New-Object System.Collections.Generic.List[PSCustomObject]
+            [void]$Output.AppendLine("   >>> Pre-Restart Session Activity (5-Hour Window):")
+            # Clear text-aligned padding format to bypass Azure's table truncation limits
+            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "Time (CST)", "EventID", "User", "Action", "Disconnect Reason") )
+            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "----------", "-------", "----", "------", "-----------------") )
             
             foreach ($Event in $SessionEvents) {
                 $LineUser = "N/A"
@@ -169,9 +145,7 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 foreach ($EL in $EventLines) {
                     if ($EL -like "*User:*") {
                         $LineUser = (($EL -split "User:")).Trim().Split(" ").Split(",")
-                        if ($LineUser -like "*\*") { 
-                            $LineUser = ($LineUser -split "\\") 
-                        }
+                        if ($LineUser -like "*\*") { $LineUser = ($LineUser -split "\\") }
                         break
                     }
                 }
@@ -180,9 +154,7 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 foreach ($EL in $EventLines) {
                     if ($EL -like "*reason code*") {
                         $CodeDigits = ""
-                        foreach ($Char in $EL.ToCharArray()) {
-                            if ([char]::IsDigit($Char)) { $CodeDigits += $Char }
-                        }
+                        foreach ($Char in $EL.ToCharArray()) { if ([char]::IsDigit($Char)) { $CodeDigits += $Char } }
                         if ($CodeDigits -ne "") {
                             $Reason = switch ([int]$CodeDigits) {
                                 0  { "Normal Logoff/Disconnect" }
@@ -204,17 +176,14 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                     40 { "Handshake" }
                 }
 
-                $TimelineTable.Add([PSCustomObject]@{
-                    "Time (CST)"        = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
-                    "EventID"           = $Event.Id
-                    "User"              = $LineUser
-                    "Action"            = $ActionName
-                    "Disconnect Reason" = $Reason
-                })
+                $EventTimeCST = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
+                [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", $EventTimeCST, $Event.Id, $LineUser, $ActionName, $Reason) )
             }
-            
-            $TimelineTable | Format-Table -AutoSize
         }
+        [void]$Output.AppendLine("")
     }
-    Write-Host ""
+    [void]$Output.AppendLine("")
 }
+
+# Return the entire compiled text block straight to Azure Run Command's output stream
+Write-Output $Output.ToString()
