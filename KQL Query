@@ -1,13 +1,102 @@
-Get-WinEvent -LogName System | 
-Where-Object {$_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient"} | 
-Select-Object TimeCreated, Id, LevelDisplayName, Message -First 5 
+# =====================================================
+# AVD Restart Investigation Script
+# =====================================================
 
+$DaysToCheck = 7
+$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
+$Hostname = $env:COMPUTERNAME
 
+Write-Host "Hostname: $Hostname"
+Write-Host ""
 
-Get-WinEvent -LogName System | 
-Where-Object { 
-    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and 
-    $_.Id -eq 20 
-} | 
-Select-Object TimeCreated, Message | 
-Format-List 
+# Get latest reboot-related event
+$RestartEvent = Get-WinEvent -FilterHashtable @{
+    LogName = 'System'
+    Id      = 1074,6008,41
+    StartTime = (Get-Date).AddDays(-$DaysToCheck)
+} | Sort-Object TimeCreated -Descending | Select-Object -First 1
+
+if (!$RestartEvent) {
+    Write-Host "No restart events found."
+    return
+}
+
+$RestartTime = $RestartEvent.TimeCreated
+$RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime,$CSTZone)
+
+# Determine Restart Type
+$RestartType = switch ($RestartEvent.Id) {
+    1074 {"Planned Restart"}
+    41   {"System Crash / Power Failure"}
+    6008 {"Unexpected Shutdown"}
+    default {"Unknown"}
+}
+
+# Look at session activity 2 hours before reboot
+$SessionEvents = Get-WinEvent -FilterHashtable @{
+    LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    StartTime = $RestartTime.AddHours(-2)
+    EndTime   = $RestartTime
+} | Where-Object {$_.Id -in 21,24,25,39,40} |
+Sort-Object TimeCreated
+
+# Determine last user activity before reboot
+$LastSessionEvent = $SessionEvents | Select-Object -Last 1
+
+$UserState = "Unknown"
+$UserName = "Unknown"
+
+if ($LastSessionEvent) {
+
+    switch ($LastSessionEvent.Id) {
+        21 {$UserState = "Active (Logged In)"}
+        24 {$UserState = "Disconnected"}
+        25 {$UserState = "Reconnected / Active"}
+        39 {$UserState = "Disconnected By System"}
+        40 {$UserState = "Reconnected Existing Session"}
+    }
+
+    if ($LastSessionEvent.Message -match "\\([\w\.-]+)") {
+        $UserName = $Matches[1]
+    }
+}
+
+# Extract initiator if Event 1074
+$InitiatedBy = "N/A"
+$Comment = "N/A"
+
+if ($RestartEvent.Id -eq 1074) {
+
+    if ($RestartEvent.Message -match "on behalf of user (.+?) for") {
+        $InitiatedBy = $Matches[1].Trim()
+    }
+
+    if ($RestartEvent.Message -match "Comment:\s*(.*)") {
+        $Comment = $Matches[1].Trim()
+    }
+}
+
+# Output Summary
+[PSCustomObject]@{
+    Hostname          = $Hostname
+    RestartTime_CST   = $RestartTimeCST
+    RestartType       = $RestartType
+    UserStatus        = $UserState
+    UserName          = $UserName
+    InitiatedBy       = $InitiatedBy
+    ShutdownComment   = $Comment
+}
+
+Write-Host ""
+Write-Host "===== Session Activity Before Restart =====" -ForegroundColor Cyan
+
+$SessionEvents |
+Select-Object `
+    @{N='Time(CST)';E={[System.TimeZoneInfo]::ConvertTime($_.TimeCreated,$CSTZone)}},
+    Id,
+    Message |
+Format-Table -Wrap -AutoSize
+
+Write-Host ""
+Write-Host "===== Restart Event Details =====" -ForegroundColor Cyan
+$RestartEvent.Message
