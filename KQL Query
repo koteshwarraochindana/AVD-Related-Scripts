@@ -1,18 +1,210 @@
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script13.ps1:159 char:48
-+             foreach ($Event in $SessionEvents) {
-+                                                ~
-Missing closing '}' in statement block or type definition.
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script13.ps1:154 char:41
-+         if ($SessionEvents.Count -gt 0) {
-+                                         ~
-Missing closing '}' in statement block or type definition.
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script13.ps1:41 char:47
-+     foreach ($RestartEvent in $RestartEvents) {
-+                                               ~
-Missing closing '}' in statement block or type definition.
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script13.ps1:17 char:41
-+ for ($i = 0; $i -lt $DaysToCheck; $i++) {
-+                                         ~
-Missing closing '}' in statement block or type definition.
-    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
-    + FullyQualifiedErrorId : MissingEndCurlyBrace
+# ==================================================================================== #
+# AVD Restart Investigation Script - Hardened Production Run Command Version           #
+# ==================================================================================== #
+
+$DaysToCheck = 7
+$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
+$Hostname = $env:COMPUTERNAME
+
+$Output = New-Object System.Text.StringBuilder
+[void]$Output.AppendLine("====================================================")
+[void]$Output.AppendLine(" Generating AVD Reboot Report for Host: $Hostname ")
+[void]$Output.AppendLine(" Timezone Target: Central Standard Time (CST)       ")
+[void]$Output.AppendLine(" Investigation Window: 5 Hours Prior to Each Reboot ")
+[void]$Output.AppendLine("====================================================")
+[void]$Output.AppendLine("")
+
+for ($i = 0; $i -lt $DaysToCheck; $i++) {
+    
+    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
+    $TargetDayName = $TargetDayCST.ToString("dddd")
+    $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
+    
+    [void]$Output.AppendLine("----------------------------------------------------")
+    [void]$Output.AppendLine(" PROCESSING: $TargetDayName ($TargetDateString)")
+    [void]$Output.AppendLine("----------------------------------------------------")
+
+    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
+    $DayEndUTC   = $DayStartUTC.AddDays(1)
+
+    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
+        LogName   = 'System'
+        Id        = 1074, 6008, 41
+        StartTime = $DayStartUTC
+    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
+
+    if ($RestartEvents.Count -eq 0) {
+        [void]$Output.AppendLine(" -> No restart events recorded on this day.`n")
+        continue
+    }
+
+    foreach ($RestartEvent in $RestartEvents) {
+        $RestartTime    = $RestartEvent.TimeCreated
+        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
+
+        $RestartType = switch ($RestartEvent.Id) {
+            1074 { "Planned Restart" }
+            41   { "System Crash / Power Failure" }
+            6008 { "Unexpected Shutdown" }
+            default { "Unknown" }
+        }
+
+        $StartTimeLimit = $RestartTime.AddHours(-5)
+        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+            Id        = 21, 24, 25, 39, 40
+            StartTime = $StartTimeLimit
+        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
+
+        # 1. Safely locate the last logged user identity
+        $LastSessionEvent = $null
+        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
+            if ($SessionEvents[$j].Message -like "*User:*") {
+                $LastSessionEvent = $SessionEvents[$j]
+                break
+            }
+        }
+
+        $UserState        = "No Activity Found"
+        $UserName         = "N/A"
+        $NarrativeText    = ""
+
+        if ($LastSessionEvent) {
+            $UserState = switch ($LastSessionEvent.Id) {
+                21 { "Active (Logged In)" }
+                24 { "Disconnected" }
+                25 { "Reconnected / Active" }
+                39 { "Disconnected By System" }
+                40 { "Connection Handshake" }
+            }
+            
+            # Robust extraction block to safely isolate single strings from arrays
+            $MsgLines = $LastSessionEvent.Message -split "`n"
+            foreach ($Line in $MsgLines) {
+                if ($Line -like "*User:*") {
+                    $Parts = $Line -split "User:"
+                    if ($Parts.Count -gt 1) {
+                        $RawUser = $Parts[1].Trim().Split(" ")[0].Split(",")[0].Trim()
+                        if ($RawUser -like "*\*") {
+                            $UserParts = $RawUser -split "\\"
+                            $UserName = $UserParts[$UserParts.Count - 1].Trim()
+                        } else {
+                            $UserName = $RawUser
+                        }
+                    }
+                    break
+                }
+            }
+
+            $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
+            $TimeDiff = $RestartTimeCST - $LastUserTimeCST
+            
+            $DurationString = ""
+            if ($TimeDiff.Hours -gt 0) {
+                if ($TimeDiff.Hours -gt 1) { $DurationString = "$($TimeDiff.Hours) hours and " } else { $DurationString = "$($TimeDiff.Hours) hour and " }
+            }
+            if ($TimeDiff.Minutes -gt 1) { $DurationString += "$($TimeDiff.Minutes) minutes later" } else { $DurationString += "$($TimeDiff.Minutes) minute later" }
+
+            $ActionVerb = switch ($LastSessionEvent.Id) {
+                21 { "logged in" }
+                24 { "disconnected" }
+                25 { "reconnected" }
+                39 { "was disconnected by the system" }
+                40 { "disconnected (handshake)" }
+                default { "had activity" }
+            }
+
+            $NarrativeText = "- On $TargetDayName, user ($UserName) $ActionVerb at $($LastUserTimeCST.ToString('hh:mm tt')), but the reboot didn't happen until $($RestartTimeCST.ToString('hh:mm tt')) ($DurationString)."
+        } else {
+            $NarrativeText = "- On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
+        }
+
+        # Safe explicit extraction loops for initiator parameters
+        $InitiatedBy = "N/A"
+        $Comment     = "N/A"
+        $RawLines = $RestartEvent.Message -split "`n"
+
+        foreach ($L in $RawLines) {
+            if ($L -like "*on behalf of user*") { 
+                $Parts = $L -split "on behalf of user"
+                if ($Parts.Count -gt 1) {
+                    $SubParts = $Parts[1] -split "for"
+                    $InitiatedBy = $SubParts[0].Trim()
+                }
+            }
+            if ($L -like "*Comment:*") { 
+                $Parts = $L -split "Comment:"
+                if ($Parts.Count -gt 1) {
+                    $Comment = $Parts[1].Trim()
+                }
+            }
+        }
+
+        [void]$Output.AppendLine("Event ID         : $($RestartEvent.Id)")
+        [void]$Output.AppendLine("Restart Type     : $RestartType")
+        [void]$Output.AppendLine("Time (CST)       : $($RestartTimeCST.ToString('hh:mm:ss tt'))")
+        [void]$Output.AppendLine("Last Active Usr  : $UserName")
+        [void]$Output.AppendLine("Session State    : $UserState")
+        [void]$Output.AppendLine("Initiated By     : $InitiatedBy")
+        [void]$Output.AppendLine("Shutdown Comment : $Comment")
+        [void]$Output.AppendLine("")
+        [void]$Output.AppendLine("EXECUTIVE ANALYSIS SUMMARY:")
+        [void]$Output.AppendLine($NarrativeText)
+        [void]$Output.AppendLine("")
+
+        if ($SessionEvents.Count -gt 0) {
+            [void]$Output.AppendLine("   >>> Pre-Restart Session Activity (5-Hour Window):")
+            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "Time (CST)", "EventID", "User", "Action", "Disconnect Reason") )
+            [void]$Output.AppendLine( [string]::Format("   {0,-15} {1,-8} {2,-15} {3,-15} {4}", "----------", "-------", "----", "------", "-----------------") )
+            
+            foreach ($Event in $SessionEvents) {
+                $LineUser = "N/A"
+                $EventLines = $Event.Message -split "`n"
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*User:*") {
+                        $Parts = $EL -split "User:"
+                        if ($Parts.Count -gt 1) {
+                            $RawLineUser = $Parts[1].Trim().Split(" ")[0].Split(",")[0].Trim()
+                            if ($RawLineUser -like "*\*") { 
+                                $UserParts = $RawLineUser -split "\\"
+                                $LineUser = $UserParts[$UserParts.Count - 1].Trim() 
+                            } else {
+                                $LineUser = $RawLineUser
+                            }
+                        }
+                        break
+                    }
+                }
+                
+                # Fixed Target Reason Code Parsing Logic
+                $Reason = "N/A"
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*reason code*") {
+                        $Parts = $EL -split "reason code"
+                        if ($Parts.Count -gt 1) {
+                            $CodeDigits = ""
+                            foreach ($Char in $Parts[1].ToCharArray()) { 
+                                if ([char]::IsDigit($Char)) { $CodeDigits += $Char } 
+                            }
+                            if ($CodeDigits -ne "") {
+                                $Reason = switch ([int]$CodeDigits) {
+                                    0  { "Normal Logoff / Disconnect" }
+                                    5  { "Network Timeout / Closed Client" }
+                                    11 { "Idle Timeout GPO Policy" }
+                                    12 { "Disconnected Session GPO Timeout" }
+                                    default { "Code $CodeDigits" }
+                                }
+                            }
+                        }
+                        break
+                    }
+                }
+                
+                $ActionName = switch ($Event.Id) {
+                    21 { "Logon" }
+                    24 { "Disconnect" }
+                    25 { "Reconnect" }
+                    39 { "Sys-Disconnect" }
+                    40 { "Handshake" }
+                }
+
