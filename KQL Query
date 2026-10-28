@@ -1,158 +1,220 @@
-PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1
-====================================================
- Generating AVD Reboot Report for Host: PAVW4d50 
- Timezone Target: Central Standard Time (CST)       
- Investigation Window: 5 Hours Prior to Each Reboot 
-====================================================
+# ==================================================================================== #
+# AVD Restart Investigation Script - Hardened Core Production Version (PS 5.1 & 7+)    #
+# ==================================================================================== #
 
-----------------------------------------------------
- PROCESSING: Tuesday (10/27/2026)
-----------------------------------------------------
- -> No restart events recorded on this day.
+$DaysToCheck = 7
+$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
+$Hostname = $env:COMPUTERNAME
 
-----------------------------------------------------
- PROCESSING: Monday (10/26/2026)
-----------------------------------------------------
- -> No restart events recorded on this day.
+Write-Host "====================================================" -ForegroundColor Green
+Write-Host " Generating AVD Reboot Report for Host: $Hostname " -ForegroundColor Green
+Write-Host " Timezone Target: Central Standard Time (CST)       " -ForegroundColor Green
+Write-Host " Investigation Window: 5 Hours Prior to Each Reboot " -ForegroundColor Green
+Write-Host "====================================================" -ForegroundColor Green
+Write-Host ""
 
-----------------------------------------------------
- PROCESSING: Sunday (10/25/2026)
-----------------------------------------------------
+for ($i = 0; $i -lt $DaysToCheck; $i++) {
+    
+    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
+    $TargetDayName = $TargetDayCST.ToString("dddd")
+    $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
+    
+    Write-Host "----------------------------------------------------" -ForegroundColor Gray
+    Write-Host " PROCESSING: $TargetDayName ($TargetDateString)" -ForegroundColor Yellow
+    Write-Host "----------------------------------------------------" -ForegroundColor Gray
 
+    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
+    $DayEndUTC   = $DayStartUTC.AddDays(1)
 
-Event ID         : 1074
-Restart Type     : Planned Restart
-Time (CST)       : 09:12:53 PM
-Last Active Usr  : U579652
-Session State    : Reconnected / Active
-Initiated By     : ADHCSCINT\U579652
-Shutdown Comment : 
+    # 1. Safely gather reboot events into a strict array format
+    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
+        LogName   = 'System'
+        Id        = 1074, 6008, 41
+        StartTime = $DayStartUTC
+    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
 
+    if ($RestartEvents.Count -eq 0) {
+        Write-Host " -> No restart events recorded on this day.`n" -ForegroundColor Gray
+        continue
+    }
 
+    # 2. Process each reboot
+    foreach ($RestartEvent in $RestartEvents) {
+        $RestartTime    = $RestartEvent.TimeCreated
+        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
 
-💡 EXECUTIVE ANALYSIS SUMMARY:
-• On Sunday, user (U579652) reconnected at 06:12 PM, but the reboot didn't happen until 09:12 PM (3 hours and 0 minute later).
+        $RestartType = switch ($RestartEvent.Id) {
+            1074 { "Planned Restart" }
+            41   { "System Crash / Power Failure" }
+            6008 { "Unexpected Shutdown" }
+            default { "Unknown" }
+        }
 
-   >>> Pre-Restart Session Activity (5-Hour Window):
+        # 3. Securely gather pre-reboot terminal session transitions
+        $StartTimeLimit = $RestartTime.AddHours(-5)
+        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+            Id        = 21, 24, 25, 39, 40
+            StartTime = $StartTimeLimit
+        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
 
-Time (CST)  EventID User    Action    Disconnect Reason
-----------  ------- ----    ------    -----------------
-06:12:15 PM      40 N/A     Handshake Code 25          
-06:12:19 PM      25 U579652 Reconnect N/A              
+        # 4. Extract final interactive identity signature safely
+        $LastSessionEvent = $null
+        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
+            if ($SessionEvents[$j].Message -like "*User:*") {
+                $LastSessionEvent = $SessionEvents[$j]
+                break
+            }
+        }
 
+        $UserState        = "No Activity Found"
+        $UserName         = "N/A"
+        $NarrativeText    = ""
 
+        if ($LastSessionEvent) {
+            $UserState = switch ($LastSessionEvent.Id) {
+                21 { "Active (Logged In)" }
+                24 { "Disconnected" }
+                25 { "Reconnected / Active" }
+                39 { "Disconnected By System" }
+                40 { "Connection Handshake" }
+            }
+            
+            # Legacy-safe string split parsing
+            $MsgLines = $LastSessionEvent.Message -split "`n"
+            foreach ($Line in $MsgLines) {
+                if ($Line -like "*User:*") {
+                    $UserName = (($Line -split "User:")).Trim().Split(" ").Split(",")
+                    if ($UserName -like "*\*") { 
+                        $UserName = ($UserName -split "\\")
+                    }
+                    break
+                }
+            }
 
-----------------------------------------------------
- PROCESSING: Saturday (10/24/2026)
-----------------------------------------------------
- -> No restart events recorded on this day.
+            # 5. Build executive timing delta metrics (Flat structure, no ternary operators)
+            $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
+            $TimeDiff = $RestartTimeCST - $LastUserTimeCST
+            
+            $DurationString = ""
+            if ($TimeDiff.Hours -gt 0) {
+                $Hrs = $TimeDiff.Hours
+                if ($Hrs -gt 1) {
+                    $DurationString = "$Hrs hours and "
+                } else {
+                    $DurationString = "$Hrs hour and "
+                }
+            }
+            
+            $Mins = $TimeDiff.Minutes
+            if ($Mins -gt 1) {
+                $DurationString = $DurationString + "$Mins minutes later"
+            } else {
+                $DurationString = $DurationString + "$Mins minute later"
+            }
 
-----------------------------------------------------
- PROCESSING: Friday (10/23/2026)
-----------------------------------------------------
+            $ActionVerb = switch ($LastSessionEvent.Id) {
+                21 { "logged in" }
+                24 { "disconnected" }
+                25 { "reconnected" }
+                39 { "was disconnected by the system" }
+                40 { "disconnected (handshake)" }
+                default { "had activity" }
+            }
 
+            $NarrativeText = "• On $TargetDayName, user ($UserName) $ActionVerb at $($LastUserTimeCST.ToString('hh:mm tt')), but the reboot didn't happen until $($RestartTimeCST.ToString('hh:mm tt')) ($DurationString)."
+        } else {
+            $NarrativeText = "• On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
+        }
 
-Event ID         : 1074
-Restart Type     : Planned Restart
-Time (CST)       : 05:17:45 PM
-Last Active Usr  : U579652
-Session State    : Active (Logged In)
-Initiated By     : ADHCSCINT\U579652
-Shutdown Comment : 
+        # 6. Safe explicit extraction loops for initiator parameters
+        $InitiatedBy = "N/A"
+        $Comment     = "N/A"
+        $RawLines = $RestartEvent.Message -split "`n"
 
+        foreach ($L in $RawLines) {
+            if ($L -like "*on behalf of user*") {
+                $InitiatedBy = (($L -split "on behalf of user")).Split("for").Trim()
+            }
+            if ($L -like "*Comment:*") {
+                $Comment = ($L -split "Comment:").Trim()
+            }
+        }
 
+        # Render explicit summary layout blocks
+        $Summary = [PSCustomObject]@{
+            "Event ID"        = $RestartEvent.Id
+            "Restart Type"    = $RestartType
+            "Time (CST)"      = $RestartTimeCST.ToString("hh:mm:ss tt")
+            "Last Active Usr" = $UserName
+            "Session State"   = $UserState
+            "Initiated By"    = $InitiatedBy
+            "Shutdown Comment"= $Comment
+        }
+        $Summary | Format-List
+        
+        Write-Host "💡 EXECUTIVE ANALYSIS SUMMARY:" -ForegroundColor Yellow
+        Write-Host $NarrativeText -ForegroundColor White
+        Write-Host ""
 
-💡 EXECUTIVE ANALYSIS SUMMARY:
-• On Friday, user (U579652) logged in at 05:08 PM, but the reboot didn't happen until 05:17 PM (8 minutes later).
+        # 7. Render sequential chronological table mapping
+        if ($SessionEvents.Count -gt 0) {
+            Write-Host "   >>> Pre-Restart Session Activity (5-Hour Window):" -ForegroundColor Cyan
+            
+            $TimelineTable = New-Object System.Collections.Generic.List[PSCustomObject]
+            
+            foreach ($Event in $SessionEvents) {
+                $LineUser = "N/A"
+                $EventLines = $Event.Message -split "`n"
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*User:*") {
+                        $LineUser = (($EL -split "User:")).Trim().Split(" ").Split(",")
+                        if ($LineUser -like "*\*") { 
+                            $LineUser = ($LineUser -split "\\") 
+                        }
+                        break
+                    }
+                }
+                
+                $Reason = "N/A"
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*reason code*") {
+                        $CodeDigits = ""
+                        foreach ($Char in $EL.ToCharArray()) {
+                            if ([char]::IsDigit($Char)) { $CodeDigits += $Char }
+                        }
+                        if ($CodeDigits -ne "") {
+                            $Reason = switch ([int]$CodeDigits) {
+                                0  { "Normal Logoff/Disconnect" }
+                                5  { "Network Timeout/Closed Client" }
+                                11 { "Idle Timeout GPO" }
+                                12 { "Disconnected Session Timeout GPO" }
+                                default { "Code $CodeDigits" }
+                            }
+                        }
+                        break
+                    }
+                }
+                
+                $ActionName = switch ($Event.Id) {
+                    21 { "Logon" }
+                    24 { "Disconnect" }
+                    25 { "Reconnect" }
+                    39 { "Sys-Disconnect" }
+                    40 { "Handshake" }
+                }
 
-   >>> Pre-Restart Session Activity (5-Hour Window):
-
-Time (CST)  EventID User    Action     Disconnect Reason
-----------  ------- ----    ------     -----------------
-01:48:28 PM      40 N/A     Handshake  Code 20          
-01:48:36 PM      24 U579652 Disconnect N/A              
-01:53:33 PM      40 N/A     Handshake  Code 25          
-01:53:36 PM      25 U579652 Reconnect  N/A              
-02:38:00 PM      40 N/A     Handshake  Code 20          
-02:38:04 PM      24 U579652 Disconnect N/A              
-02:38:08 PM      40 N/A     Handshake  Code 25          
-02:38:11 PM      25 U579652 Reconnect  N/A              
-02:44:33 PM      40 N/A     Handshake  Code 20          
-02:44:41 PM      24 U579652 Disconnect N/A              
-02:44:46 PM      40 N/A     Handshake  Code 40          
-02:44:47 PM      40 N/A     Handshake  Code 25          
-02:44:50 PM      25 U579652 Reconnect  N/A              
-03:21:54 PM      40 N/A     Handshake  Code 20          
-03:22:03 PM      24 U579652 Disconnect N/A              
-04:21:54 PM      40 N/A     Handshake  Code 25          
-04:21:57 PM      25 U579652 Reconnect  N/A              
-04:30:03 PM      40 N/A     Handshake  Code 20          
-04:30:11 PM      24 U579652 Disconnect N/A              
-04:30:35 PM      40 N/A     Handshake  Code 25          
-04:30:38 PM      25 U579652 Reconnect  N/A              
-04:33:37 PM      40 N/A     Handshake  Code 226         
-04:33:38 PM      24 U579652 Disconnect N/A              
-04:37:10 PM      21 U579652 Logon      N/A              
-05:05:35 PM      40 N/A     Handshake  Code 226         
-05:05:35 PM      24 U579652 Disconnect N/A              
-05:08:51 PM      21 U579652 Logon      N/A              
-
-
-
-
-Event ID         : 1074
-Restart Type     : Planned Restart
-Time (CST)       : 05:05:21 PM
-Last Active Usr  : U579652
-Session State    : Active (Logged In)
-Initiated By     : ADHCSCINT\U579652
-Shutdown Comment : 
-
-
-
-💡 EXECUTIVE ANALYSIS SUMMARY:
-• On Friday, user (U579652) logged in at 04:37 PM, but the reboot didn't happen until 05:05 PM (28 minutes later).
-
-   >>> Pre-Restart Session Activity (5-Hour Window):
-
-Time (CST)  EventID User    Action     Disconnect Reason
-----------  ------- ----    ------     -----------------
-01:48:28 PM      40 N/A     Handshake  Code 20          
-01:48:36 PM      24 U579652 Disconnect N/A              
-01:53:33 PM      40 N/A     Handshake  Code 25          
-01:53:36 PM      25 U579652 Reconnect  N/A              
-02:38:00 PM      40 N/A     Handshake  Code 20          
-02:38:04 PM      24 U579652 Disconnect N/A              
-02:38:08 PM      40 N/A     Handshake  Code 25          
-02:38:11 PM      25 U579652 Reconnect  N/A              
-02:44:33 PM      40 N/A     Handshake  Code 20          
-02:44:41 PM      24 U579652 Disconnect N/A              
-02:44:46 PM      40 N/A     Handshake  Code 40          
-02:44:47 PM      40 N/A     Handshake  Code 25          
-02:44:50 PM      25 U579652 Reconnect  N/A              
-03:21:54 PM      40 N/A     Handshake  Code 20          
-03:22:03 PM      24 U579652 Disconnect N/A              
-04:21:54 PM      40 N/A     Handshake  Code 25          
-04:21:57 PM      25 U579652 Reconnect  N/A              
-04:30:03 PM      40 N/A     Handshake  Code 20          
-04:30:11 PM      24 U579652 Disconnect N/A              
-04:30:35 PM      40 N/A     Handshake  Code 25          
-04:30:38 PM      25 U579652 Reconnect  N/A              
-04:33:37 PM      40 N/A     Handshake  Code 226         
-04:33:38 PM      24 U579652 Disconnect N/A              
-04:37:10 PM      21 U579652 Logon      N/A              
-
-
-
-----------------------------------------------------
- PROCESSING: Thursday (10/22/2026)
-----------------------------------------------------
- -> No restart events recorded on this day.
-
-----------------------------------------------------
- PROCESSING: Wednesday (10/21/2026)
-----------------------------------------------------
- -> No restart events recorded on this day.
-
-
-PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> 
+                $TimelineTable.Add([PSCustomObject]@{
+                    "Time (CST)"        = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
+                    "EventID"           = $Event.Id
+                    "User"              = $LineUser
+                    "Action"            = $ActionName
+                    "Disconnect Reason" = $Reason
+                })
+            }
+            
+            $TimelineTable | Format-Table -AutoSize
+        }
+    }
+    Write-Host ""
+}
