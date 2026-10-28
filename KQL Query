@@ -1,5 +1,5 @@
 # ==================================================================================== #
-# AVD Restart Investigation Script - Production Version (PS 5.1 & 7+ Compatible)       #
+# AVD Restart Investigation Script - Hardened Core Production Version (PS 5.1 & 7+)    #
 # ==================================================================================== #
 
 $DaysToCheck = 7
@@ -26,7 +26,7 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
     $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
     $DayEndUTC   = $DayStartUTC.AddDays(1)
 
-    # 1. Fetch reboot events
+    # 1. Safely gather reboot events into a strict array format
     $RestartEvents = @(Get-WinEvent -FilterHashtable @{
         LogName   = 'System'
         Id        = 1074, 6008, 41
@@ -50,7 +50,7 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             default { "Unknown" }
         }
 
-        # 3. Gather session activity 5 hours before reboot
+        # 3. Securely gather pre-reboot terminal session transitions
         $StartTimeLimit = $RestartTime.AddHours(-5)
         $SessionEvents = @(Get-WinEvent -FilterHashtable @{
             LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
@@ -58,8 +58,15 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             StartTime = $StartTimeLimit
         } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
 
-        # 4. Determine last user activity details
-        $LastSessionEvent = $SessionEvents | Where-Object { $_.Message -match "User:\s*([^\s,]+)" } | Select-Object -Last 1
+        # 4. Extract final interactive identity signature safely without regex leakage
+        $LastSessionEvent = $null
+        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
+            if ($SessionEvents[$j].Message -like "*User:*") {
+                $LastSessionEvent = $SessionEvents[$j]
+                break
+            }
+        }
+
         $UserState        = "No Activity Found"
         $UserName         = "N/A"
         $NarrativeText    = ""
@@ -72,12 +79,18 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 39 { "Disconnected By System" }
                 40 { "Connection Handshake" }
             }
-            if ($LastSessionEvent.Message -match "User:\s*([^\s,]+)") {
-                $RawUser = $Matches[1]
-                $UserName = if ($RawUser -match "\\(.*)") { $Matches[1] } else { $RawUser }
+            
+            # Legacy-safe string split parsing
+            $MsgLines = $LastSessionEvent.Message -split "`n"
+            foreach ($Line in $MsgLines) {
+                if ($Line -like "*User:*") {
+                    $UserName = ($Line -split "User:")[1].Trim().Split(" ")[0].Split(",")[0]
+                    if ($UserName -like "*\*") { $UserName = ($UserName -split "\\")[1] }
+                    break
+                }
             }
 
-            # 5. Calculate exact duration gaps for the summary text
+            # 5. Build executive timing delta metrics
             $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
             $TimeDiff = $RestartTimeCST - $LastUserTimeCST
             
@@ -101,18 +114,21 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             $NarrativeText = "• On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
         }
 
-        # 6. Safe String Parsing for Initiator and Comments (replaces ternary operators)
+        # 6. Safe explicit extraction loops for initiator parameters
         $InitiatedBy = "N/A"
         $Comment     = "N/A"
+        $RawLines = $RestartEvent.Message -split "`n"
 
-        if ($RestartEvent.Message -match "on behalf of user (.*?) for") {
-            $InitiatedBy = $Matches[1].Trim()
-        }
-        if ($RestartEvent.Message -match "Comment:\s*(.*)") {
-            $Comment = $Matches[1].Trim()
+        foreach ($L in $RawLines) {
+            if ($L -like "*on behalf of user*") {
+                $InitiatedBy = ($L -split "on behalf of user")[1].Split("for")[0].Trim()
+            }
+            if ($L -like "*Comment:*") {
+                $Comment = ($L -split "Comment:")[1].Trim()
+            }
         }
 
-        # Display the Daily Summary Block
+        # Render explicit summary layout blocks
         $Summary = [PSCustomObject]@{
             "Event ID"        = $RestartEvent.Id
             "Restart Type"    = $RestartType
@@ -124,12 +140,11 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
         }
         $Summary | Format-List
         
-        # Output the easy-to-read narrative highlight block
         Write-Host "💡 EXECUTIVE ANALYSIS SUMMARY:" -ForegroundColor Yellow
         Write-Host $NarrativeText -ForegroundColor White
         Write-Host ""
 
-        # 7. Display the localized pre-reboot timeline
+        # 7. Render sequential chronological table mapping
         if ($SessionEvents.Count -gt 0) {
             Write-Host "   >>> Pre-Restart Session Activity (5-Hour Window):" -ForegroundColor Cyan
             
@@ -137,20 +152,29 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             
             foreach ($Event in $SessionEvents) {
                 $LineUser = "N/A"
-                if ($Event.Message -match "User:\s*([^\s,]+)") {
-                    $RawLineUser = $Matches[1]
-                    $LineUser = if ($RawLineUser -match "\\(.*)") { $Matches[1] } else { $RawLineUser }
+                $EventLines = $Event.Message -split "`n"
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*User:*") {
+                        $LineUser = ($EL -split "User:")[1].Trim().Split(" ")[0].Split(",")[0]
+                        if ($LineUser -like "*\*") { $LineUser = ($LineUser -split "\\")[1] }
+                        break
+                    }
                 }
                 
                 $Reason = "N/A"
-                if ($Event.Message -match "reason code\s+([0-9]+)") {
-                    $Code = $Matches[1]
-                    $Reason = switch ($Code) {
-                        0  { "Normal Logoff/Disconnect" }
-                        5  { "Network Timeout/Closed Client" }
-                        11 { "Idle Timeout GPO" }
-                        12 { "Disconnected Session Timeout GPO" }
-                        default { "Code $Code" }
+                foreach ($EL in $EventLines) {
+                    if ($EL -like "*reason code*") {
+                        $CleanCode = ($EL -split "reason code")[1].RegExReplace("[^0-9]", "").Trim()
+                        if ($CleanCode -match "^\d+$") {
+                            $Reason = switch ([int]$CleanCode) {
+                                0  { "Normal Logoff/Disconnect" }
+                                5  { "Network Timeout/Closed Client" }
+                                11 { "Idle Timeout GPO" }
+                                12 { "Disconnected Session Timeout GPO" }
+                                default { "Code $CleanCode" }
+                            }
+                        }
+                        break
                     }
                 }
                 
