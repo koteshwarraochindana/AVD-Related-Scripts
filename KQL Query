@@ -1,124 +1,114 @@
-# ===================================================== #
-# AVD Restart Investigation Script - Daily Breakdown    #
-# ===================================================== #
+-----------------------
 
-$DaysToCheck = 7
-$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
-$Hostname = $env:COMPUTERNAME
 
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host " Generating AVD Reboot Report for Host: $Hostname " -ForegroundColor Green
-Write-Host " Timezone Target: Central Standard Time (CST)       " -ForegroundColor Green
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host ""
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 12:06:56 AM
+Last Active Usr  : U304997
+Session State    : Disconnected
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
 
-# Loop through each day backwards, starting from today (Day 0) down to Day 6
-for ($i = 0; $i -lt $DaysToCheck; $i++) {
-    
-    # Calculate the date boundaries in CST for the day being evaluated
-    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
-    $TargetDayName = $TargetDayCST.ToString("dddd (MM/dd/yyyy)")
-    
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    Write-Host " PROCESSING: $TargetDayName" -ForegroundColor Yellow
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
 
-    # Calculate UTC equivalents of the day boundaries to accurately query the Event Log backend
-    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
-    $DayEndUTC   = $DayStartUTC.AddDays(1)
 
-    # 1. Fetch all reboot events that occurred on this specific calendar day
-    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
-        LogName   = 'System'
-        Id        = 1074, 6008, 41
-        StartTime = $DayStartUTC
-    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
+   >>> Pre-Restart Session Activity (2-Hour Window):
 
-    if ($RestartEvents.Count -eq 0) {
-        Write-Host " -> No restart events recorded on this day.`n" -ForegroundColor Gray
-        continue
-    }
+Time (CST)  EventID Description      Message Data                                                                      
+----------  ------- -----------      ------------                                                                      
+11:00:34 PM      40 Client-Reconnect Session 2 has been disconnected, reason code 0                                    
+11:00:42 PM      24 Disconnect       Remote Desktop Services: Session has been disconnected:  User: ADHCSCINT\U30499...
 
-    # 2. Process each reboot found on this day
-    foreach ($RestartEvent in $RestartEvents) {
-        $RestartTime    = $RestartEvent.TimeCreated
-        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
 
-        $RestartType = switch ($RestartEvent.Id) {
-            1074 { "Planned Restart" }
-            41   { "System Crash / Power Failure (Dirty Event)" }
-            6008 { "Unexpected Shutdown" }
-            default { "Unknown" }
-        }
 
-        # 3. Gather session activity 2 hours before this specific reboot
-        $StartTimeLimit = $RestartTime.AddHours(-2)
-        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-            Id        = 21, 24, 25, 39, 40
-            StartTime = $StartTimeLimit
-        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
 
-        # 4. Determine last user activity details
-        $LastSessionEvent = $SessionEvents | Select-Object -Last 1
-        $UserState        = "No Activity Found"
-        $UserName         = "N/A"
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 09:59:20 AM
+Last Active Usr  : N/A
+Session State    : No Activity Found
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
 
-        if ($LastSessionEvent) {
-            $UserState = switch ($LastSessionEvent.Id) {
-                21 { "Active (Logged In)" }
-                24 { "Disconnected" }
-                25 { "Reconnected / Active" }
-                39 { "Disconnected By System" }
-                40 { "Reconnected Existing Session" }
-            }
-            if ($LastSessionEvent.Message -match "User:\s*([^\s,]+)") {
-                $RawUser = $Matches[1]
-                $UserName = if ($RawUser -match "\\(.*)") { $Matches[1] } else { $RawUser }
-            }
-        }
 
-        # 5. Extract initiator information if Event 1074
-        $InitiatedBy = "N/A"
-        $Comment     = "N/A"
 
-        if ($RestartEvent.Id -eq 1074) {
-            if ($RestartEvent.Message -match "on behalf of user (.*?) for") { $InitiatedBy = $Matches[1].Trim() }
-            if ($RestartEvent.Message -match "Comment:\s*(.*)") { $Comment = $Matches[1].Trim() }
-        }
+   >>> No user session events recorded within 2 hours of this reboot.
 
-        # 6. Display the Daily Summary Block
-        $Summary = [PSCustomObject]@{
-            "Event ID"        = $RestartEvent.Id
-            "Restart Type"    = $RestartType
-            "Time (CST)"      = $RestartTimeCST.ToString("hh:mm:ss tt")
-            "Last Active Usr" = $UserName
-            "Session State"   = $UserState
-            "Initiated By"    = $InitiatedBy
-            "Shutdown Comment"= $Comment
-        }
-        $Summary | Format-List
-        
-        # 7. Display the localized pre-reboot timeline for this specific drop
-        if ($SessionEvents.Count -gt 0) {
-            Write-Host "   >>> Pre-Restart Session Activity (2-Hour Window):" -ForegroundColor Cyan
-            $SessionEvents | ForEach-Object {
-                [PSCustomObject]@{
-                    "Time (CST)"   = [System.TimeZoneInfo]::ConvertTime($_.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
-                    "EventID"      = $_.Id
-                    "Description"  = switch ($_.Id) {
-                        21 { "Logon" }
-                        24 { "Disconnect" }
-                        25 { "Reconnect" }
-                        39 { "Sys-Disconnect" }
-                        40 { "Client-Reconnect" }
-                    }
-                    "Message Data" = $_.Message.Replace("`r`n", " ").Replace("`n", " ").Trim()
-                }
-            } | Format-Table -AutoSize
-        } else {
-            Write-Host "   >>> No user session events recorded within 2 hours of this reboot.`n" -ForegroundColor Gray
-        }
-    }
-    Write-Host ""
-}
+
+----------------------------------------------------
+ PROCESSING: Thursday (10/22/2026)
+----------------------------------------------------
+
+
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 03:05:27 AM
+Last Active Usr  : U304997
+Session State    : Disconnected
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
+
+
+
+   >>> Pre-Restart Session Activity (2-Hour Window):
+
+Time (CST)  EventID Description      Message Data                                                                      
+----------  ------- -----------      ------------                                                                      
+02:00:02 AM      40 Client-Reconnect Session 2 has been disconnected, reason code 0                                    
+02:00:04 AM      24 Disconnect       Remote Desktop Services: Session has been disconnected:  User: ADHCSCINT\U30499...
+
+
+
+
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 10:40:01 AM
+Last Active Usr  : N/A
+Session State    : No Activity Found
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
+
+
+
+   >>> No user session events recorded within 2 hours of this reboot.
+
+
+----------------------------------------------------
+ PROCESSING: Wednesday (10/21/2026)
+----------------------------------------------------
+
+
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 01:41:27 AM
+Last Active Usr  : U304997
+Session State    : Disconnected
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
+
+
+
+   >>> Pre-Restart Session Activity (2-Hour Window):
+
+Time (CST)  EventID Description      Message Data                                                                      
+----------  ------- -----------      ------------                                                                      
+12:00:06 AM      40 Client-Reconnect Session 2 has been disconnected, reason code 0                                    
+12:00:14 AM      24 Disconnect       Remote Desktop Services: Session has been disconnected:  User: ADHCSCINT\U30499...
+12:03:23 AM      40 Client-Reconnect Session 2 has been disconnected, reason code 5                                    
+12:03:25 AM      25 Reconnect        Remote Desktop Services: Session reconnection succeeded:  User: ADHCSCINT\U3049...
+12:32:27 AM      40 Client-Reconnect Session 2 has been disconnected, reason code 0                                    
+12:32:28 AM      24 Disconnect       Remote Desktop Services: Session has been disconnected:  User: ADHCSCINT\U30499...
+
+
+
+
+Event ID         : 1074
+Restart Type     : Planned Restart
+Time (CST)       : 11:33:10 AM
+Last Active Usr  : N/A
+Session State    : No Activity Found
+Initiated By     : NT AUTHORITY\SYSTEM
+Shutdown Comment : Calling CleanShutdown by wvchelper
+
+
+
+   >>> No user session events recorded within 2 hours of this reboot.
