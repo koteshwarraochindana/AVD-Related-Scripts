@@ -1,202 +1,46 @@
-# ==================================================================================== #
-# AVD Restart Investigation Script - Hardened Core Production Version (PS 5.1 & 7+)    #
-# ==================================================================================== #
 
-$DaysToCheck = 7
-$CSTZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("Central Standard Time")
-$Hostname = $env:COMPUTERNAME
-
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host " Generating AVD Reboot Report for Host: $Hostname " -ForegroundColor Green
-Write-Host " Timezone Target: Central Standard Time (CST)       " -ForegroundColor Green
-Write-Host " Investigation Window: 5 Hours Prior to Each Reboot " -ForegroundColor Green
-Write-Host "====================================================" -ForegroundColor Green
-Write-Host ""
-
-for ($i = 0; $i -lt $DaysToCheck; $i++) {
-    
-    $TargetDayCST = ([System.TimeZoneInfo]::ConvertTime((Get-Date), $CSTZone)).AddDays(-$i).Date
-    $TargetDayName = $TargetDayCST.ToString("dddd")
-    $TargetDateString = $TargetDayCST.ToString("MM/dd/yyyy")
-    
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
-    Write-Host " PROCESSING: $TargetDayName ($TargetDateString)" -ForegroundColor Yellow
-    Write-Host "----------------------------------------------------" -ForegroundColor Gray
-
-    $DayStartUTC = [System.TimeZoneInfo]::ConvertTime($TargetDayCST, $CSTZone).ToUniversalTime()
-    $DayEndUTC   = $DayStartUTC.AddDays(1)
-
-    # 1. Safely gather reboot events into a strict array format
-    $RestartEvents = @(Get-WinEvent -FilterHashtable @{
-        LogName   = 'System'
-        Id        = 1074, 6008, 41
-        StartTime = $DayStartUTC
-    } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -lt $DayEndUTC } | Sort-Object TimeCreated -Descending)
-
-    if ($RestartEvents.Count -eq 0) {
-        Write-Host " -> No restart events recorded on this day.`n" -ForegroundColor Gray
-        continue
-    }
-
-    # 2. Process each reboot
-    foreach ($RestartEvent in $RestartEvents) {
-        $RestartTime    = $RestartEvent.TimeCreated
-        $RestartTimeCST = [System.TimeZoneInfo]::ConvertTime($RestartTime, $CSTZone)
-
-        $RestartType = switch ($RestartEvent.Id) {
-            1074 { "Planned Restart" }
-            41   { "System Crash / Power Failure" }
-            6008 { "Unexpected Shutdown" }
-            default { "Unknown" }
-        }
-
-        # 3. Securely gather pre-reboot terminal session transitions
-        $StartTimeLimit = $RestartTime.AddHours(-5)
-        $SessionEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName   = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
-            Id        = 21, 24, 25, 39, 40
-            StartTime = $StartTimeLimit
-        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $RestartTime } | Sort-Object TimeCreated)
-
-        # 4. Extract final interactive identity signature safely without regex leakage
-        $LastSessionEvent = $null
-        for ($j = $SessionEvents.Count - 1; $j -ge 0; $j--) {
-            if ($SessionEvents[$j].Message -like "*User:*") {
-                $LastSessionEvent = $SessionEvents[$j]
-                break
-            }
-        }
-
-        $UserState        = "No Activity Found"
-        $UserName         = "N/A"
-        $NarrativeText    = ""
-
-        if ($LastSessionEvent) {
-            $UserState = switch ($LastSessionEvent.Id) {
-                21 { "Active (Logged In)" }
-                24 { "Disconnected" }
-                25 { "Reconnected / Active" }
-                39 { "Disconnected By System" }
-                40 { "Connection Handshake" }
-            }
-            
-            # Legacy-safe string split parsing
-            $MsgLines = $LastSessionEvent.Message -split "`n"
-            foreach ($Line in $MsgLines) {
-                if ($Line -like "*User:*") {
-                    $UserName = ($Line -split "User:")[1].Trim().Split(" ")[0].Split(",")[0]
-                    if ($UserName -like "*\*") { $UserName = ($UserName -split "\\")[1] }
-                    break
-                }
-            }
-
-            # 5. Build executive timing delta metrics
-            $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
-            $TimeDiff = $RestartTimeCST - $LastUserTimeCST
-            
-            $DurationString = ""
-            if ($TimeDiff.Hours -gt 0) {
-                $DurationString += "$($TimeDiff.Hours) hour" + ($TimeDiff.Hours -gt 1 ? "s" : "") + " and "
-            }
-            $DurationString += "$($TimeDiff.Minutes) minute" + ($TimeDiff.Minutes -gt 1 ? "s" : "") + " later"
-
-            $ActionVerb = switch ($LastSessionEvent.Id) {
-                21 { "logged in" }
-                24 { "disconnected" }
-                25 { "reconnected" }
-                39 { "was disconnected by the system" }
-                40 { "disconnected (handshake)" }
-                default { "had activity" }
-            }
-
-            $NarrativeText = "• On $TargetDayName, user ($UserName) $ActionVerb at $($LastUserTimeCST.ToString('hh:mm tt')), but the reboot didn't happen until $($RestartTimeCST.ToString('hh:mm tt')) ($DurationString)."
-        } else {
-            $NarrativeText = "• On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
-        }
-
-        # 6. Safe explicit extraction loops for initiator parameters
-        $InitiatedBy = "N/A"
-        $Comment     = "N/A"
-        $RawLines = $RestartEvent.Message -split "`n"
-
-        foreach ($L in $RawLines) {
-            if ($L -like "*on behalf of user*") {
-                $InitiatedBy = ($L -split "on behalf of user")[1].Split("for")[0].Trim()
-            }
-            if ($L -like "*Comment:*") {
-                $Comment = ($L -split "Comment:")[1].Trim()
-            }
-        }
-
-        # Render explicit summary layout blocks
-        $Summary = [PSCustomObject]@{
-            "Event ID"        = $RestartEvent.Id
-            "Restart Type"    = $RestartType
-            "Time (CST)"      = $RestartTimeCST.ToString("hh:mm:ss tt")
-            "Last Active Usr" = $UserName
-            "Session State"   = $UserState
-            "Initiated By"    = $InitiatedBy
-            "Shutdown Comment"= $Comment
-        }
-        $Summary | Format-List
-        
-        Write-Host "💡 EXECUTIVE ANALYSIS SUMMARY:" -ForegroundColor Yellow
-        Write-Host $NarrativeText -ForegroundColor White
-        Write-Host ""
-
-        # 7. Render sequential chronological table mapping
-        if ($SessionEvents.Count -gt 0) {
-            Write-Host "   >>> Pre-Restart Session Activity (5-Hour Window):" -ForegroundColor Cyan
-            
-            $TimelineTable = New-Object System.Collections.Generic.List[PSCustomObject]
-            
-            foreach ($Event in $SessionEvents) {
-                $LineUser = "N/A"
-                $EventLines = $Event.Message -split "`n"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*User:*") {
-                        $LineUser = ($EL -split "User:")[1].Trim().Split(" ")[0].Split(",")[0]
-                        if ($LineUser -like "*\*") { $LineUser = ($LineUser -split "\\")[1] }
-                        break
-                    }
-                }
-                
-                $Reason = "N/A"
-                foreach ($EL in $EventLines) {
-                    if ($EL -like "*reason code*") {
-                        $CleanCode = ($EL -split "reason code")[1].RegExReplace("[^0-9]", "").Trim()
-                        if ($CleanCode -match "^\d+$") {
-                            $Reason = switch ([int]$CleanCode) {
-                                0  { "Normal Logoff/Disconnect" }
-                                5  { "Network Timeout/Closed Client" }
-                                11 { "Idle Timeout GPO" }
-                                12 { "Disconnected Session Timeout GPO" }
-                                default { "Code $CleanCode" }
-                            }
-                        }
-                        break
-                    }
-                }
-                
-                $ActionName = switch ($Event.Id) {
-                    21 { "Logon" }
-                    24 { "Disconnect" }
-                    25 { "Reconnect" }
-                    39 { "Sys-Disconnect" }
-                    40 { "Handshake" }
-                }
-
-                $TimelineTable.Add([PSCustomObject]@{
-                    "Time (CST)"        = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
-                    "EventID"           = $Event.Id
-                    "User"              = $LineUser
-                    "Action"            = $ActionName
-                    "Disconnect Reason" = $Reason
-                })
-            }
-            
-            $TimelineTable | Format-Table -AutoSize
-        }
-    }
-    Write-Host ""
-}
+PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:99 char:87
++ ... tring += "$($TimeDiff.Hours) hour" + ($TimeDiff.Hours -gt 1 ? "s" : " ...
++                                                                 ~
+Unexpected token '?' in expression or statement.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:99 char:86
++ ... nString += "$($TimeDiff.Hours) hour" + ($TimeDiff.Hours -gt 1 ? "s" : ...
++                                                                  ~
+Missing closing ')' in expression.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:98 char:40
++             if ($TimeDiff.Hours -gt 0) {
++                                        ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:74 char:32
++         if ($LastSessionEvent) {
++                                ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:42 char:47
++     foreach ($RestartEvent in $RestartEvents) {
++                                               ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:16 char:41
++ for ($i = 0; $i -lt $DaysToCheck; $i++) {
++                                         ~
+Missing closing '}' in statement block or type definition.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:99 char:97
++ ... $($TimeDiff.Hours) hour" + ($TimeDiff.Hours -gt 1 ? "s" : "") + " and ...
++                                                                 ~
+Unexpected token ')' in expression or statement.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:100 char:13
++             }
++             ~
+Unexpected token '}' in expression or statement.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:101 char:89
++ ... += "$($TimeDiff.Minutes) minute" + ($TimeDiff.Minutes -gt 1 ? "s" : " ...
++                                                                 ~
+Unexpected token '?' in expression or statement.
+At C:\Users\U579652\Downloads\scripts\Run-Command\Restart-Initiated-By.ps1:101 char:88
++ ... g += "$($TimeDiff.Minutes) minute" + ($TimeDiff.Minutes -gt 1 ? "s" : ...
++                                                                  ~
+Missing closing ')' in expression.
+Not all parse errors were reported.  Correct the reported errors and try again.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : UnexpectedToken
+ 
