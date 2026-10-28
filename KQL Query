@@ -1,5 +1,5 @@
 # ==================================================================================== #
-# AVD Restart Investigation Script - With Plain-Text Narrative Analysis                #
+# AVD Restart Investigation Script - Production Version (PS 5.1 & 7+ Compatible)       #
 # ==================================================================================== #
 
 $DaysToCheck = 7
@@ -9,6 +9,7 @@ $Hostname = $env:COMPUTERNAME
 Write-Host "====================================================" -ForegroundColor Green
 Write-Host " Generating AVD Reboot Report for Host: $Hostname " -ForegroundColor Green
 Write-Host " Timezone Target: Central Standard Time (CST)       " -ForegroundColor Green
+Write-Host " Investigation Window: 5 Hours Prior to Each Reboot " -ForegroundColor Green
 Write-Host "====================================================" -ForegroundColor Green
 Write-Host ""
 
@@ -76,7 +77,7 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                 $UserName = if ($RawUser -match "\\(.*)") { $Matches[1] } else { $RawUser }
             }
 
-            # 5. DYNAMIC NARRATIVE GENERATION: Calculate exact duration gaps
+            # 5. Calculate exact duration gaps for the summary text
             $LastUserTimeCST = [System.TimeZoneInfo]::ConvertTime($LastSessionEvent.TimeCreated, $CSTZone)
             $TimeDiff = $RestartTimeCST - $LastUserTimeCST
             
@@ -100,15 +101,26 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
             $NarrativeText = "• On $TargetDayName, a reboot happened at $($RestartTimeCST.ToString('hh:mm tt')), but no user activity was recorded in the 5 hours prior."
         }
 
-        # 6. Display the Daily Summary Block
+        # 6. Safe String Parsing for Initiator and Comments (replaces ternary operators)
+        $InitiatedBy = "N/A"
+        $Comment     = "N/A"
+
+        if ($RestartEvent.Message -match "on behalf of user (.*?) for") {
+            $InitiatedBy = $Matches[1].Trim()
+        }
+        if ($RestartEvent.Message -match "Comment:\s*(.*)") {
+            $Comment = $Matches[1].Trim()
+        }
+
+        # Display the Daily Summary Block
         $Summary = [PSCustomObject]@{
             "Event ID"        = $RestartEvent.Id
             "Restart Type"    = $RestartType
             "Time (CST)"      = $RestartTimeCST.ToString("hh:mm:ss tt")
             "Last Active Usr" = $UserName
             "Session State"   = $UserState
-            "Initiated By"    = $RestartEvent.Message -match "on behalf of user (.*?) for" ? $Matches[1].Trim() : "N/A"
-            "Shutdown Comment"= $RestartEvent.Message -match "Comment:\s*(.*)" ? $Matches[1].Trim() : "N/A"
+            "Initiated By"    = $InitiatedBy
+            "Shutdown Comment"= $Comment
         }
         $Summary | Format-List
         
@@ -120,13 +132,18 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
         # 7. Display the localized pre-reboot timeline
         if ($SessionEvents.Count -gt 0) {
             Write-Host "   >>> Pre-Restart Session Activity (5-Hour Window):" -ForegroundColor Cyan
-            $SessionEvents | ForEach-Object {
+            
+            $TimelineTable = New-Object System.Collections.Generic.List[PSCustomObject]
+            
+            foreach ($Event in $SessionEvents) {
                 $LineUser = "N/A"
-                if ($_.Message -match "User:\s*([^\s,]+)") {
-                    $LineUser = if ($Matches[1] -match "\\(.*)") { $Matches[1] } else { $Matches[1] }
+                if ($Event.Message -match "User:\s*([^\s,]+)") {
+                    $RawLineUser = $Matches[1]
+                    $LineUser = if ($RawLineUser -match "\\(.*)") { $Matches[1] } else { $RawLineUser }
                 }
+                
                 $Reason = "N/A"
-                if ($_.Message -match "reason code\s+([0-9]+)") {
+                if ($Event.Message -match "reason code\s+([0-9]+)") {
                     $Code = $Matches[1]
                     $Reason = switch ($Code) {
                         0  { "Normal Logoff/Disconnect" }
@@ -136,20 +153,25 @@ for ($i = 0; $i -lt $DaysToCheck; $i++) {
                         default { "Code $Code" }
                     }
                 }
-                [PSCustomObject]@{
-                    "Time (CST)"    = [System.TimeZoneInfo]::ConvertTime($_.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
-                    "EventID"       = $_.Id
-                    "User"          = $LineUser
-                    "Action"        = switch ($_.Id) {
-                        21 { "Logon" }
-                        24 { "Disconnect" }
-                        25 { "Reconnect" }
-                        39 { "Sys-Disconnect" }
-                        40 { "Handshake" }
-                    }
-                    "Disconnect Reason" = $Reason
+                
+                $ActionName = switch ($Event.Id) {
+                    21 { "Logon" }
+                    24 { "Disconnect" }
+                    25 { "Reconnect" }
+                    39 { "Sys-Disconnect" }
+                    40 { "Handshake" }
                 }
-            } | Format-Table -AutoSize
+
+                $TimelineTable.Add([PSCustomObject]@{
+                    "Time (CST)"        = [System.TimeZoneInfo]::ConvertTime($Event.TimeCreated, $CSTZone).ToString("hh:mm:ss tt")
+                    "EventID"           = $Event.Id
+                    "User"              = $LineUser
+                    "Action"            = $ActionName
+                    "Disconnect Reason" = $Reason
+                })
+            }
+            
+            $TimelineTable | Format-Table -AutoSize
         }
     }
     Write-Host ""
