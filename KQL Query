@@ -1,52 +1,32 @@
-# ==========================================================
-# AVD IDLE TIMER INVESTIGATION
-# Read-only event collection
-# ==========================================================
-
-$StartTime = (Get-Date).AddHours(-24)
-$Output = "C:\Windows\Temp\AVD_IdleTimer_Events.txt"
-
-$Logs = @(
-    "System",
-    "Security",
-    "Microsoft-Windows-GroupPolicy/Operational",
-    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
-    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
-    "Microsoft-Windows-TaskScheduler/Operational"
-)
-
-"AVD IDLE TIMER INVESTIGATION" | Out-File $Output
-"Computer: $env:COMPUTERNAME" | Out-File $Output -Append
-"Start: $StartTime" | Out-File $Output -Append
-
-foreach ($Log in $Logs) {
-
-    "`n==================================================" |
-        Out-File $Output -Append
-
-    "LOG: $Log" | Out-File $Output -Append
-
-    "==================================================" |
-        Out-File $Output -Append
-
-    try {
-        $Events = Get-WinEvent -FilterHashtable @{
-            LogName   = $Log
-            StartTime = $StartTime
-        } -ErrorAction Stop
-
-        foreach ($Event in $Events) {
-
-            $Message = $Event.Message -replace "`r?`n", " "
-
-            "$($Event.TimeCreated) | ID: $($Event.Id) | Provider: $($Event.ProviderName) | $Message" |
-                Out-File $Output -Append
-        }
-    }
-    catch {
-        "Unable to read log or no events: $_" |
-            Out-File $Output -Append
-    }
-}
-
-Write-Host "`nReport generated: $Output" -ForegroundColor Green
+QuotaResources
+| where type =~ "microsoft.compute/locations/usages"
+| where isnotempty(properties)
+| mv-expand propertyJson = properties.value
+| extend quotaName = tostring(propertyJson.name.value)
+| where quotaName == "standardDASv5Family"
+| extend
+    QuotaDisplayName = tostring(propertyJson.name.localizedValue),
+    CurrentUsage = toint(propertyJson.currentValue), // Keep as integer for clean numbering
+    QuotaLimit = toint(propertyJson.limit)           // Keep as integer for clean numbering
+| extend
+    UsagePercentage = iff(
+        QuotaLimit > 0,
+        round(todouble(CurrentUsage) * 100.0 / todouble(QuotaLimit), 2),
+        real(null)
+    )
+| extend
+    // Rounds to a clean whole number before appending the symbol
+    ["Current Usage %"] = strcat(toint(round(UsagePercentage)), "%"), 
+    ["Usage Text representation"] = strcat(
+        format_number(CurrentUsage, 0, ','),
+        " of ",
+        format_number(QuotaLimit, 0, ',')
+    )
+| project
+    QuotaDisplayName,
+    location,
+    subscriptionId,
+    ["Current Usage %"],
+    ["Usage Text representation"],
+    UsagePercentage
+| order by UsagePercentage desc
