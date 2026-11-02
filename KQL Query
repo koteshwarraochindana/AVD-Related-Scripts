@@ -1,7 +1,5 @@
-$Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-
+PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> $Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
 Write-Host "`n=== RDS SESSION TIMEOUT POLICY ===" -ForegroundColor Cyan
-
 if (Test-Path $Path) {
     Get-ItemProperty -Path $Path |
     Select-Object MaxIdleTime, MaxDisconnectionTime,
@@ -11,7 +9,453 @@ if (Test-Path $Path) {
 else {
     Write-Host "No RDS policy registry key found."
 }
-
 Write-Host "`n=== APPLIED GROUP POLICIES ===" -ForegroundColor Cyan
-
 gpresult /scope computer /r
+
+=== RDS SESSION TIMEOUT POLICY ===
+
+
+MaxIdleTime          : 
+MaxDisconnectionTime : 
+MaxConnectionTime    : 
+fResetBroken         : 0
+
+
+
+
+=== APPLIED GROUP POLICIES ===
+
+Microsoft (R) Windows (R) Operating System Group Policy Result tool v2.0
+c Microsoft Corporation. All rights reserved.
+
+Created on ?11/?2/?2026 at 12:41:46 PM
+
+
+
+RSOP data for  on PAVW4d50 : Logging Mode
+------------------------------------------
+
+OS Configuration:            Member Workstation
+OS Version:                  10.0.26200
+Site Name:                   AZN
+Roaming Profile:             
+Local Profile:               
+Connected over a slow link?: No
+
+
+COMPUTER SETTINGS
+------------------
+    CN=PAVW4d50,OU=AVD,OU=Standard,OU=Win10,OU=Workstations,OU=HCSC,DC=adhcscint,DC=net
+    Last time Group Policy was applied: 11/2/2026 at 12:33:16 PM
+    Group Policy was applied from:      pazrswifdc01.adhcscint.net
+    Group Policy slow link threshold:   500 kbps
+    Domain Name:                        ADHCSCINT
+    Domain Type:                        Windows 2008 or later
+
+    Applied Group Policy Objects
+    -----------------------------
+        SEM WEC Policy 9
+        CTX VDA FAS
+        SecOps Computer - AVD Defender Fileshare
+        SecOps Computer - Disable Windows App Auto-Update
+        SecOps Computer - Windows 11 25H2
+        SecOps Computer - IE11 - Site Zone
+        SecOps Computer - DODownloadMode
+        AVD - Access from network_RDP
+        SecOps Computer - Deny AVD Session Timer
+        SecOps Computer - AVD Session Timer
+        AVD computer - remote Assist
+        SecOps Computer - Windows Defender ASR - AVD
+        SecOps Computer VDI - Win10 -Remote Assist
+        SecOps Core Computer Merged - EPM Cred Rotation
+        SecOps Computer Office 0365 - Teams Update AVD
+        SecOps Computer - Cert install - Brian M
+        SecOps Computer - Disable Windows App Auto-Update
+        SecOps Computer - RemoteApp WindowsApp Client
+        SecOps Computer - MS Edge Chromium v103 - Merged
+        SecOps Computer - Google Chrome v103 - Merged
+        SecOps Computer - DODownloadMode
+        SecOps Computers - Windows 11
+        SecOps Computer - Deny Fsquirt
+        SecOps computer - UAC - EPM
+        SecOps Computer - Windows Defender ASR - Desktop
+        DES Core Computer - Merged  Delta - 20H2
+        SecOps Google Chrome - Computer - SiteMinder - Physical Workstations
+        DES Core Computer - Merged  V1 - Delta 1803
+        DES Core Computer Standard User - Merged
+        DES core - Win10 STD - IS Testing - Delta
+        SecOps Citrix Receiver 4.8 Computer - PROD
+        DES Computer - Miracast - Test - Vipul
+        SecOps IE11 Computer - Merged
+        SecOps Office365 Computer - Merged
+        DES Core - Aruba - 802.1XX - Wired - Aruba Devices
+        DES Core Computer - Merged  Delta - 1909
+        SecOps Core Computer Merged - EPM Cred Rotation
+        DES Computer - Azure AD
+        SecOps Computer Certs - ISRG
+        SecOps Core Computer - Teams QoS
+        SecOps Computer - WinVerify
+        SecOps Computer - Ivanti Client Certificate Install
+        SecOps Computer - Storage Sense Cleanup
+        SecOps Computer - Defender Network Protection -Audit
+        Local Group Policy
+
+    The following GPOs were not applied because they were filtered out
+    -------------------------------------------------------------------
+        SEM WEC Policy 8
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Disable banner prompt
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Bitlocker Recovery Key Import - AAD
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: SecOps Laptop and Desktop
+
+        SecOps Computer Developer Mode - InterActive Admins
+            Filtering:  Denied (Security)
+
+        SecOps Computer - PROD AD2.0 - SSO - Cross Domain - All
+            Filtering:  Denied (Security)
+
+        SecOps IE11 - Facebook streamline
+            Filtering:  Denied (Security)
+
+        SecOps IE11 Computer - Merged
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Magnet - Deny AVD Session Timer - CD&I
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Magnet - Proxy OverRide
+            Filtering:  Denied (Security)
+
+        SecOps Computer - ASR Rules - Block
+            Filtering:  Denied (Security)
+
+        Des Core Computer standard User - Merged - P2_APP00005498_WRKSTNRDP_SECOPS_PROD_ADMIN
+            Filtering:  Denied (Security)
+
+        SecOps Computer - HPMS.gov Trusted Site test
+            Filtering:  Denied (Security)
+
+        SecOps MBAM - TPMandPIN- SurfacePro
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES SurfacePro
+
+        SecOps Computer Certs - ISRG
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Computer - PROD AD2.0 - SSO - Cross Domain - All
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Store Test
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Defender ASR - Laptops
+            Filtering:  Disabled (Link)
+
+        SecOps Computer - ASR Rules - Warn
+            Filtering:  Denied (Security)
+
+        SecOps Google Chrome - Computer - SiteMinder - Physical Workstations
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Computer - Citrix Secure Access Extension
+            Filtering:  Denied (Security)
+
+        SecOps MBAM Full Disk_DO NOT MERGE - Desktop - new MBAM - V1 - EUC BuildProcess
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Defender Network Protection -Block
+            Filtering:  Denied (Security)
+
+        SecOps Core Computer - Teams QoS
+            Filtering:  Disabled (Link)
+
+        SecOps Computer - PROD AD2.0 - SSO - Cross Domain - All
+            Filtering:  Denied (Security)
+
+        SecOps MBAM Full Disk_DO NOT MERGE - TPM and StartupPIN
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        SecOps Computer - Hybrid Join - RPA
+            Filtering:  Denied (Security)
+
+        SecOps MBAM Full Disk_DO NOT MERGE - TPM and StartupPIN
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        SecOps Computer - Intune Join - test Vipul
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Dark Theme Extension
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 6
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy B
+            Filtering:  Denied (Security)
+
+        SecOps Computer - OneDrive Sync Admin Reports
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 7
+            Filtering:  Denied (Security)
+
+        SecOps Computer - IntelliJ Test
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Google Chrome Pop Up - Disable
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Google Chrome v103 - Merged- HealthSpring
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy A
+            Filtering:  Denied (Security)
+
+        DES Computer - Azure AD
+            Filtering:  Not Applied (Unknown Reason)
+
+        DES Computer WiFi_DO NOT MERGE -Desktop
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Desktop Wifi
+
+        DES Google chrome v101 - Computer - Merged - ServAuth - Allow LocalHost
+            Filtering:  Denied (Security)
+
+        SecOps Computer - MS Edge One Browser
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Block RDP port 3389
+            Filtering:  Denied (Security)
+
+        SecOps Computer - NICE Browser Extension
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Defender ASR - Desktop
+            Filtering:  Disabled (Link)
+
+        DES Computer WiFi_DO NOT MERGE - Aruba Devices
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        SecOps Computer - Windows Update Test
+            Filtering:  Denied (Security)
+
+        SecOps Computer - RDP Test - EUC lab machines
+            Filtering:  Denied (Security)
+
+        SecOps Computer - ASR Rules - Block
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Hello For Business
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Allow Outbound FW Rules - CustomTest
+            Filtering:  Denied (Security)
+
+        SecOps User - DR Wallpaper
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: SecOps Windows 10 and 11 - DR
+
+        SEM WEC Policy D
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy F
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 3
+            Filtering:  Denied (Security)
+
+        DES Core Computer - Merged  Delta - 1909
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Computer - FW - Podman - ControlM
+            Filtering:  Denied (Security)
+
+        Secops Computer - Streamyard Mic&Camera
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Extensions - UIPath v23.10 Force Install
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Defender ASR - Laptops
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop - Win10
+
+        DES Core Computer - Merged  V1 - Delta 1803
+            Filtering:  Not Applied (Unknown Reason)
+
+        SEM WEC Policy 2
+            Filtering:  Denied (Security)
+
+        AVD - Block RDP port 3389
+            Filtering:  Denied (Security)
+
+        DES Core Computer - Merged  Delta - 20H2
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Computer - MS Edge Chromium v103 - Merged - HealthSpring
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Extensions Testing - CyberArk Identity Extension
+            Filtering:  Denied (Security)
+
+        SecOps Computer - AVD Session Timer - TAVD test
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: SecOps_TAVD Win10  Workstation
+
+        SecOps Computer - Deny Default credentials for Bots - WindowsAPP
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 1
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 0
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Deny Default credentials for Bots - WindowsAPP
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Disable Sign-In in Chrome
+            Filtering:  Denied (Security)
+
+        SecOps MBAM - MBAMClientUI startup
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        DES Computer WiFi_DO NOT MERGE - Aruba Devices
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        SecOps computer - UAC - EPM
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps IE11 - Facebook streamline
+            Filtering:  Denied (Security)
+
+        Copy of SecOps Computer - Extensions Edge Test
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 4
+            Filtering:  Denied (Security)
+
+        SecOps Computer - MS Edge Block Site from Sleeping
+            Filtering:  Denied (Security)
+
+        SecOps MBAM - TPMandPIN- SurfacePro
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES SurfacePro
+
+        SecOPs Computer - FW Off VPN Captive Portal Files
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop - Win10
+
+        SEM WEC Policy E
+            Filtering:  Denied (Security)
+
+        Secops Google chrome Extension Test - John Michell
+            Filtering:  Denied (Security)
+
+        SecOps Core Computer - Merged - AutoLogin - ITECPC
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Google Chrome v103 - Merged- HealthSpring
+            Filtering:  Denied (Security)
+
+        DES Computer - RDP Access - super computers
+            Filtering:  Denied (Security)
+
+        SEM WEC Policy 5
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Symmetry Print Spooler
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Defender Clould Protection Level
+            Filtering:  Denied (Security)
+
+        SecOps Computer - MS Edge Chromium v103 - Merged - HealthSpring
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Intune Join - test Vipul
+            Filtering:  Denied (Security)
+
+        SecOps Citrix Receiver 4.8 Computer - PROD
+            Filtering:  Not Applied (Unknown Reason)
+
+        SecOps Computer - Google Chrome Pop Up - Disable
+            Filtering:  Denied (Security)
+
+        SecOps Computer - ASR Rules - Warn
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Citrix Test - AppProtection
+            Filtering:  Denied (Security)
+
+        SecOps MBAM Full Disk_DO NOT MERGE - Desktop - new MBAM
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Desktop - No NPVDI Devices
+
+        SecOps Computer - Yello TRMx Extension Allow
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Windows Update Test
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Disable Prompt for Password upon Connection
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Delete Old User Profiles
+            Filtering:  Denied (Security)
+
+        DES Win10 workstations - Edge Chromium v1.2 - ServerAuth- allow LocalHost
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Extensions - UIPath v25.10 Force Install
+            Filtering:  Denied (Security)
+
+        SecOps MBAM - MBAMClientUI startup
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: DES Laptop
+
+        SEM WEC Policy C
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Extensions Testing - CyberArk Identity Extension
+            Filtering:  Denied (Security)
+
+        SecOps Computer - Automation - Schedule Task Elevation
+            Filtering:  Denied (WMI Filter)
+            WMI Filter: SecOps_CAVW Workstation
+
+        SecOps Computer - RDP Access -msazure_a6540026
+            Filtering:  Denied (Security)
+
+        SecOps Core Computer Merged - EPM Cred Rotation
+            Filtering:  Not Applied (Unknown Reason)
+
+        DES Core - Aruba - 802.1XX - Wired - Aruba Devices
+            Filtering:  Not Applied (Unknown Reason)
+
+    The computer is a part of the following security groups
+    -------------------------------------------------------
+        BUILTIN\Administrators
+        Everyone
+        BUILTIN\Users
+        NT AUTHORITY\NETWORK
+        NT AUTHORITY\Authenticated Users
+        This Organization
+        PAVW4d50$
+        SEM-WEC-Group9
+        Domain Computers
+        Deny_AVD_Session_Timer
+        Authentication authority asserted identity
+        System Mandatory Level
+        
+
+PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> 
