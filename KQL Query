@@ -1,1 +1,130 @@
-Search-AzGraph -Query "resources | where type == 'microsoft.desktopvirtualization/hostpools'"
+# 1. Start Connection
+Connect-AzAccount -WarningAction SilentlyContinue
+
+$ExportPath = "$home\Desktop\AVD-1103.csv"
+$FullReport = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+$TotalHosts = 0
+$TotalAssigned = 0
+$TotalEmpty = 0
+
+# 2. Global Scan across all Subscriptions
+$Subs = Get-AzSubscription
+foreach ($Sub in $Subs) {
+    $Context = Set-AzContext -SubscriptionId $Sub.Id -Force -ErrorAction SilentlyContinue
+    if (-not $Context) { continue }
+
+    # Query workspaces first to check for infrastructure presence
+    $Workspaces = Get-AzWvdWorkspace -ErrorAction SilentlyContinue
+    
+    # MODIFICATION: If the subscription has 0 AVD Workspaces, skip it entirely
+    if (-not $Workspaces) { continue }
+
+    # Only print to console if the subscription actually has AVD infrastructure
+    Write-Host "Scanning Subscription: $($Sub.Name)" -ForegroundColor Cyan
+
+    foreach ($WS in $Workspaces) {
+        $WSRG = ($WS.Id -split '/')[4]
+        
+        $AppGroups = Get-AzWvdApplicationGroup -ResourceGroupName $WSRG -ErrorAction SilentlyContinue | 
+            Where-Object { $_.WorkspaceArmPath -eq $WS.Id }
+
+        $GroupedByPool = $AppGroups | Group-Object HostPoolArmPath
+
+        foreach ($PoolGroup in $GroupedByPool) {
+            $PoolArmPath = $PoolGroup.Name
+            if ([string]::IsNullOrWhiteSpace($PoolArmPath)) { continue }
+
+            $PoolName = ($PoolArmPath -split '/')[-1]
+            $PoolRG = ($PoolArmPath -split '/')[4]
+
+            Write-Host "  -> Auditing Host Pool: $PoolName" -ForegroundColor DarkGray
+
+            $Pool = Get-AzWvdHostPool -ResourceGroupName $PoolRG -Name $PoolName -ErrorAction SilentlyContinue
+            if (-not $Pool) { continue }
+
+            # --- Consolidate Entitlements ---
+            $AllEntitlements = @()
+            foreach ($AG in $PoolGroup.Group) {
+                $Assignments = Get-AzRoleAssignment -Scope $AG.Id -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.ObjectType -eq "Group" -and $_.RoleDefinitionName -eq "Desktop Virtualization User" }
+                if ($Assignments) { $AllEntitlements += $Assignments.DisplayName }
+            }
+            $EntitlementsText = ($AllEntitlements | Sort-Object -Unique | Where-Object { $_ }) -join "; "
+            if ([string]::IsNullOrWhiteSpace($EntitlementsText)) { $EntitlementsText = "No Groups Assigned" }
+
+            # --- Session Host Audit ---
+            $SessionHosts = Get-AzWvdSessionHost -ResourceGroupName $PoolRG -HostPoolName $Pool.Name -ErrorAction SilentlyContinue
+            $CountTotal = ($SessionHosts | Measure-Object).Count
+            $CountAssigned = ($SessionHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_.AssignedUser) } | Measure-Object).Count
+            $CountEmpty = $CountTotal - $CountAssigned
+
+            $TotalHosts += $CountTotal
+            $TotalAssigned += $CountAssigned
+            $TotalEmpty += $CountEmpty
+
+            $Location = $Pool.Location
+            $NetInfo = "No VMs Found"
+
+            # --- Network Profile Topology Parsing ---
+            if ($CountTotal -gt 0) {
+                $FirstSH = $SessionHosts | Select-Object -First 1
+                if ($FirstSH.ResourceId) {
+                    $VMRG = ($FirstSH.ResourceId -split '/')[4]
+                    $VMName = ($FirstSH.ResourceId -split '/')[-1]
+                    
+                    $VM = Get-AzVM -ResourceGroupName $VMRG -Name $VMName -ErrorAction SilentlyContinue
+                    if ($VM) {
+                        $Location = $VM.Location
+                        $TargetNicId = $VM.NetworkProfile.NetworkInterfaces.Id
+                        
+                        if ($TargetNicId) {
+                            $NIC = Get-AzNetworkInterface -ResourceId $TargetNicId -ErrorAction SilentlyContinue
+                            if ($NIC -and $NIC.IpConfigurations.Subnet.Id) {
+                                $SubnetId = $NIC.IpConfigurations.Subnet.Id
+                                $SubnetName = ($SubnetId -split '/')[-1]
+                                $VNetName = ($SubnetId -split '/')[-3]
+                                $NetInfo = "$VNetName / $SubnetName"
+                            }
+                            elseif ($TargetNicId -match '/virtualNetworks/(?<vnet>[^/]+)/subnets/(?<subnet>[^/]+)') {
+                                $NetInfo = "$($Matches.vnet) / $($Matches.subnet)"
+                            }
+                        }
+                    }
+                }
+            }
+
+            $FullReport.Add([PSCustomObject]@{
+                Subscription      = $Sub.Name
+                Workspace         = $WS.Name
+                HostPool          = $Pool.Name
+                HostPoolType      = $Pool.HostPoolType
+                Entitlements      = $EntitlementsText
+                Location          = $Location
+                "VNet Subnet"     = $NetInfo
+                "Total Hosts"     = $CountTotal
+                "Assigned VMs"    = $CountAssigned
+                "Empty Assignment"= $CountEmpty
+            })
+        }
+    }
+}
+
+# 3. Add Grand Total Row
+$FullReport.Add([PSCustomObject]@{
+    Subscription      = "--- GRAND TOTAL ---"
+    Workspace         = ""
+    HostPool          = ""
+    HostPoolType      = ""
+    Entitlements      = ""
+    Location          = ""
+    "VNet Subnet"     = ""
+    "Total Hosts"     = $TotalHosts
+    "Assigned VMs"    = $TotalAssigned
+    "Empty Assignment"= $TotalEmpty
+})
+
+# 4. Export and Open
+$FullReport | Export-Csv -Path $ExportPath -NoTypeInformation
+Write-Host "`nReport saved to Desktop: $ExportPath" -ForegroundColor Green
+Invoke-Item $ExportPath
