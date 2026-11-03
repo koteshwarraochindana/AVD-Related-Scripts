@@ -1,4 +1,13 @@
-Get-WinEvent -LogName "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational" -MaxEvents 50 | 
-    Where-Object {$_.Id -in 21, 22, 24, 25} | 
-    Select-Object TimeCreated, Id, Message | 
-    Format-Table -AutoSize
+$profiles = Get-ChildItem "C:\Users" -Directory | 
+Where-Object { 
+    $_.Name -notin @("Public","Default","Default User","All Users") 
+} 
+$results = foreach ($p in $profiles) { 
+    [PSCustomObject]@{ 
+        ProfileName  = $p.Name 
+        CreationTime = $p.CreationTime 
+        LastWriteTime = $p.LastWriteTime 
+    } 
+} 
+$results | Sort-Object CreationTime | Format-Table -AutoSize 
+"Total User Profiles: $($profiles.Count)"
