@@ -1,31 +1,3 @@
-QuotaResources
-| where type =~ "microsoft.compute/locations/usages"
-| where isnotempty(properties)
-| mv-expand propertyJson = properties.value
-| extend quotaName = tostring(propertyJson.name.value)
-| where quotaName == "standardDASv5Family"
-| extend
-    QuotaDisplayName = tostring(propertyJson.name.localizedValue),
-    CurrentUsage = toint(propertyJson.currentValue),
-    QuotaLimit = toint(propertyJson.limit)
-| extend
-    UsagePercentage = iff(
-        QuotaLimit > 0,
-        round(todouble(CurrentUsage) * 100.0 / todouble(QuotaLimit), 2),
-        real(null)
-    )
-| extend
-    ["Current Usage %"] = strcat(toint(round(UsagePercentage)), "%"),
-    ["Usage Text representation"] = strcat(
-        format_number(CurrentUsage, 0, ','),
-        " of ",
-        format_number(QuotaLimit, 0, ',')
-    )
-| project
-    QuotaDisplayName,
-    location,
-    subscriptionId,
-    ["Current Usage %"],
-    ["Usage Text representation"],
-    UsagePercentage
-| order by UsagePercentage desc
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=1074} -MaxEvents 5 | 
+    Select-Object TimeCreated, Id, Message | 
+    Format-List
