@@ -8,7 +8,7 @@ $vmsData = Import-Csv -Path $csvFilePath
 Write-Output "Loaded $($vmsData.Count) target machines for OS disk expansion."
 
 foreach ($row in $vmsData) {
-    $subId  = $row.SubscriptionId
+    $subId   = $row.SubscriptionId
     $rgName  = $row.ResourceGroupName
     $vmName  = $row.VMName
     $sizeGB  = [int]$row.NewSizeGB
@@ -65,11 +65,24 @@ foreach ($row in $vmsData) {
         Write-Output "[$vmName] Pausing 30 seconds for Azure Guest Agent to initialize..."
         Start-Sleep -Seconds 30
 
-        # Step 4: Inject storage expansion script natively into Windows guest
-        Write-Output "[$vmName] Injecting volume extension logic into Windows partition framework..."
+        # Step 4: Inject advanced partition manipulation block into guest OS
+        Write-Output "[$vmName] Injecting partition adjustment logic into Windows..."
         
         $guestScriptBlock = @'
+        # 1. Force Windows storage layer to refresh and see the new unallocated space
         Update-HostStorageCache
+
+        # 2. Find and remove the stubborn Recovery Partition blocking the C: partition expansion
+        $RecoveryPartition = Get-Partition -DiskNumber 0 | Where-Object Type -eq 'Recovery'
+        if ($RecoveryPartition) {
+            # Delete the partition bypassing safety prompts
+            $RecoveryPartition | Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        # 3. Refresh disk layout after removal to merge unallocated pools
+        Update-HostStorageCache
+
+        # 4. Grab maximum available safe boundary for the C partition and resize it
         $supportedSize = Get-PartitionSupportedSize -DriveLetter C
         Resize-Partition -DriveLetter C -Size $supportedSize.SizeMax
 '@
