@@ -1,130 +1,92 @@
-# 1. Start Connection
-Connect-AzAccount -WarningAction SilentlyContinue
+# Authenticate once using device code before starting the loop
+Connect-AzAccount -UseDeviceAuthentication
 
-$ExportPath = "$home\Desktop\AVD-1103.csv"
-$FullReport = [System.Collections.Generic.List[PSCustomObject]]::new()
+# Define CSV Path (Update this path to where your CSV is saved)
+$csvFilePath = "C:\path\to\your\vms.csv"
+$vmsData = Import-Csv -Path $csvFilePath
 
-$TotalHosts = 0
-$TotalAssigned = 0
-$TotalEmpty = 0
+Write-Output "Loaded $($vmsData.Count) target machines for OS disk expansion."
 
-# 2. Global Scan across all Subscriptions
-$Subs = Get-AzSubscription
-foreach ($Sub in $Subs) {
-    $Context = Set-AzContext -SubscriptionId $Sub.Id -Force -ErrorAction SilentlyContinue
-    if (-not $Context) { continue }
+foreach ($row in $vmsData) {
+    $subId  = $row.SubscriptionId
+    $rgName  = $row.ResourceGroupName
+    $vmName  = $row.VMName
+    $sizeGB  = [int]$row.NewSizeGB
 
-    # Query workspaces first to check for infrastructure presence
-    $Workspaces = Get-AzWvdWorkspace -ErrorAction SilentlyContinue
-    
-    # MODIFICATION: If the subscription has 0 AVD Workspaces, skip it entirely
-    if (-not $Workspaces) { continue }
+    Write-Output "============================================================"
+    Write-Output "Processing machine: $vmName [RG: $rgName]"
+    Write-Output "============================================================"
 
-    # Only print to console if the subscription actually has AVD infrastructure
-    Write-Host "Scanning Subscription: $($Sub.Name)" -ForegroundColor Cyan
-
-    foreach ($WS in $Workspaces) {
-        $WSRG = ($WS.Id -split '/')[4]
-        
-        $AppGroups = Get-AzWvdApplicationGroup -ResourceGroupName $WSRG -ErrorAction SilentlyContinue | 
-            Where-Object { $_.WorkspaceArmPath -eq $WS.Id }
-
-        $GroupedByPool = $AppGroups | Group-Object HostPoolArmPath
-
-        foreach ($PoolGroup in $GroupedByPool) {
-            $PoolArmPath = $PoolGroup.Name
-            if ([string]::IsNullOrWhiteSpace($PoolArmPath)) { continue }
-
-            $PoolName = ($PoolArmPath -split '/')[-1]
-            $PoolRG = ($PoolArmPath -split '/')[4]
-
-            Write-Host "  -> Auditing Host Pool: $PoolName" -ForegroundColor DarkGray
-
-            $Pool = Get-AzWvdHostPool -ResourceGroupName $PoolRG -Name $PoolName -ErrorAction SilentlyContinue
-            if (-not $Pool) { continue }
-
-            # --- Consolidate Entitlements ---
-            $AllEntitlements = @()
-            foreach ($AG in $PoolGroup.Group) {
-                $Assignments = Get-AzRoleAssignment -Scope $AG.Id -ErrorAction SilentlyContinue | 
-                    Where-Object { $_.ObjectType -eq "Group" -and $_.RoleDefinitionName -eq "Desktop Virtualization User" }
-                if ($Assignments) { $AllEntitlements += $Assignments.DisplayName }
-            }
-            $EntitlementsText = ($AllEntitlements | Sort-Object -Unique | Where-Object { $_ }) -join "; "
-            if ([string]::IsNullOrWhiteSpace($EntitlementsText)) { $EntitlementsText = "No Groups Assigned" }
-
-            # --- Session Host Audit ---
-            $SessionHosts = Get-AzWvdSessionHost -ResourceGroupName $PoolRG -HostPoolName $Pool.Name -ErrorAction SilentlyContinue
-            $CountTotal = ($SessionHosts | Measure-Object).Count
-            $CountAssigned = ($SessionHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_.AssignedUser) } | Measure-Object).Count
-            $CountEmpty = $CountTotal - $CountAssigned
-
-            $TotalHosts += $CountTotal
-            $TotalAssigned += $CountAssigned
-            $TotalEmpty += $CountEmpty
-
-            $Location = $Pool.Location
-            $NetInfo = "No VMs Found"
-
-            # --- Network Profile Topology Parsing ---
-            if ($CountTotal -gt 0) {
-                $FirstSH = $SessionHosts | Select-Object -First 1
-                if ($FirstSH.ResourceId) {
-                    $VMRG = ($FirstSH.ResourceId -split '/')[4]
-                    $VMName = ($FirstSH.ResourceId -split '/')[-1]
-                    
-                    $VM = Get-AzVM -ResourceGroupName $VMRG -Name $VMName -ErrorAction SilentlyContinue
-                    if ($VM) {
-                        $Location = $VM.Location
-                        $TargetNicId = $VM.NetworkProfile.NetworkInterfaces.Id
-                        
-                        if ($TargetNicId) {
-                            $NIC = Get-AzNetworkInterface -ResourceId $TargetNicId -ErrorAction SilentlyContinue
-                            if ($NIC -and $NIC.IpConfigurations.Subnet.Id) {
-                                $SubnetId = $NIC.IpConfigurations.Subnet.Id
-                                $SubnetName = ($SubnetId -split '/')[-1]
-                                $VNetName = ($SubnetId -split '/')[-3]
-                                $NetInfo = "$VNetName / $SubnetName"
-                            }
-                            elseif ($TargetNicId -match '/virtualNetworks/(?<vnet>[^/]+)/subnets/(?<subnet>[^/]+)') {
-                                $NetInfo = "$($Matches.vnet) / $($Matches.subnet)"
-                            }
-                        }
-                    }
-                }
-            }
-
-            $FullReport.Add([PSCustomObject]@{
-                Subscription      = $Sub.Name
-                Workspace         = $WS.Name
-                HostPool          = $Pool.Name
-                HostPoolType      = $Pool.HostPoolType
-                Entitlements      = $EntitlementsText
-                Location          = $Location
-                "VNet Subnet"     = $NetInfo
-                "Total Hosts"     = $CountTotal
-                "Assigned VMs"    = $CountAssigned
-                "Empty Assignment"= $CountEmpty
-            })
+    try {
+        # Check current context to avoid redundant subscription switches
+        $currentContext = Get-AzContext
+        if ($currentContext.Subscription.Id -ne $subId) {
+            Write-Output "[$vmName] Switching Azure context to Subscription ID: $subId..."
+            Set-AzContext -SubscriptionId $subId -ErrorAction Stop
         }
+
+        # Step 1: Deallocate the VM
+        Write-Output "[$vmName] Requesting deallocation (Shutting down VM)..."
+        Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop
+
+        # Dynamic loop to monitor deallocation status
+        while ($true) {
+            $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+            if ($status -contains "VM deallocated") {
+                Write-Output "[$vmName] Successfully deallocated."
+                break
+            }
+            Write-Output "[$vmName] Current status: $status. Waiting 15 seconds..."
+            Start-Sleep -Seconds 15
+        }
+
+        # Step 2: Update Azure Storage profile metadata
+        Write-Output "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..."
+        $vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+        $vm.StorageProfile.OsDisk.DiskSizeGB = $sizeGB
+        Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop
+
+        # Step 3: Start the VM back up
+        Write-Output "[$vmName] Booting machine back up..."
+        Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+
+        # Dynamic loop to verify Windows is running
+        while ($true) {
+            $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+            if ($status -contains "VM running") {
+                Write-Output "[$vmName] OS is running."
+                break
+            }
+            Write-Output "[$vmName] Booting up... Waiting 15 seconds..."
+            Start-Sleep -Seconds 15
+        }
+
+        # Wait for the Windows Guest Agent service to stabilize inside the OS
+        Write-Output "[$vmName] Pausing 30 seconds for Azure Guest Agent to initialize..."
+        Start-Sleep -Seconds 30
+
+        # Step 4: Inject storage expansion script natively into Windows guest
+        Write-Output "[$vmName] Injecting volume extension logic into Windows partition framework..."
+        
+        $guestScriptBlock = @'
+        Update-HostStorageCache
+        $supportedSize = Get-PartitionSupportedSize -DriveLetter C
+        Resize-Partition -DriveLetter C -Size $supportedSize.SizeMax
+'@
+
+        $commandResult = Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScriptBlock -ErrorAction Stop
+        
+        # Display the result returned directly out of the Windows console
+        Write-Output "[$vmName] Windows Response: $($commandResult.Value.Message)"
+        Write-Output "[$vmName] Process finalized successfully."
+
+    }
+    catch {
+        # Catch and report any infrastructure errors without killing the entire loop
+        Write-Error "CRITICAL FAILURE on machine $vmName : $_"
     }
 }
 
-# 3. Add Grand Total Row
-$FullReport.Add([PSCustomObject]@{
-    Subscription      = "--- GRAND TOTAL ---"
-    Workspace         = ""
-    HostPool          = ""
-    HostPoolType      = ""
-    Entitlements      = ""
-    Location          = ""
-    "VNet Subnet"     = ""
-    "Total Hosts"     = $TotalHosts
-    "Assigned VMs"    = $TotalAssigned
-    "Empty Assignment"= $TotalEmpty
-})
-
-# 4. Export and Open
-$FullReport | Export-Csv -Path $ExportPath -NoTypeInformation
-Write-Host "`nReport saved to Desktop: $ExportPath" -ForegroundColor Green
-Invoke-Item $ExportPath
+Write-Output "============================================================"
+Write-Output "Batch process completed for all listed CSV hosts."
+Write-Output "============================================================"
