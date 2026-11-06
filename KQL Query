@@ -1,536 +1,105 @@
-#Requires -Modules Az.Accounts, Az.Compute
-<#
-.SYNOPSIS
-    Expands Azure OS managed disks and extends the Windows C: partition.
+# Authenticate once using device code before starting the loop
+Connect-AzAccount -UseDeviceAuthentication
 
-.DESCRIPTION
-    - Shuts the VM down ONLY when the Azure disk must grow (requested > current).
-    - If the Azure disk is already large enough, only the in-guest work runs (no shutdown).
-    - Relocates a small Recovery partition that blocks C: from extending (GPT only).
-    - Restores the original power state (running / stopped / deallocated) in a finally block.
-    - Writes the results CSV incrementally.
+# Define CSV Path (Update this path to where your CSV is saved)
+$csvFilePath = "C:\path\to\your\vms.csv"
+$vmsData = Import-Csv -Path $csvFilePath
 
-.PARAMETER CsvFilePath
-    CSV with columns: SubscriptionId, ResourceGroupName, VMName, NewSizeGB
-    Optional column: TenantId
-
-.PARAMETER DryRun
-    Reports what would be done; changes nothing.
-
-.PARAMETER TakeSnapshot
-    Creates a snapshot of the OS disk before any change.
-
-.PARAMETER SkipVMsNotRunning
-    If set, VMs that are not running are not started for the guest step
-    (default behaviour is to start them, do the guest work, then restore state).
-#>
-[CmdletBinding()]
-param(
-    [string]$CsvFilePath = "C:\Temp\vms.csv",
-    [string]$ReportPath  = "C:\Temp\OS_Disk_Expansion_Results.csv",
-    [switch]$DryRun,
-    [switch]$TakeSnapshot,
-    [switch]$SkipVMsNotRunning,
-    [int]$WaitTimeoutMinutes = 15,
-    [int]$PollIntervalSeconds = 15
-)
-
-$ErrorActionPreference = "Stop"
-
-# ---------------- AUTHENTICATION ----------------
-
-Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop | Out-Null
-
-# ---------------- VALIDATE CSV ----------------
-
-if (!(Test-Path $CsvFilePath)) { throw "CSV file not found: $CsvFilePath" }
-
-$vmsData = @(Import-Csv -Path $CsvFilePath)
-if ($vmsData.Count -eq 0) { throw "CSV contains no VM records." }
-
-$requiredColumns = @("SubscriptionId", "ResourceGroupName", "VMName", "NewSizeGB")
-$actualColumns   = $vmsData[0].PSObject.Properties.Name
-foreach ($column in $requiredColumns) {
-    if ($column -notin $actualColumns) { throw "Missing required CSV column: $column" }
-}
-$hasTenantColumn = ("TenantId" -in $actualColumns)
-
-$reportDir = Split-Path $ReportPath -Parent
-if ($reportDir -and !(Test-Path $reportDir)) { New-Item -ItemType Directory -Path $reportDir -Force | Out-Null }
-if (Test-Path $ReportPath) { Remove-Item $ReportPath -Force }
-
-Write-Output "Loaded $($vmsData.Count) target machines."
-if ($DryRun) { Write-Output "*** DRY RUN MODE - no changes will be made ***" }
-
-# ---------------- HELPER FUNCTIONS ----------------
-
-function Get-VMCurrentPowerState {
-    param([string]$ResourceGroupName, [string]$VMName)
-
-    $vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status -ErrorAction Stop
-    $powerState = $vmStatus.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1
-    if (!$powerState) { throw "Unable to determine VM power state." }
-    return $powerState.Code
-}
-
-function Wait-ForVMState {
-    param([string]$ResourceGroupName, [string]$VMName, [string]$ExpectedState)
-
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while ($timer.Elapsed.TotalMinutes -lt $WaitTimeoutMinutes) {
-        $currentState = Get-VMCurrentPowerState -ResourceGroupName $ResourceGroupName -VMName $VMName
-        Write-Output "  Current VM state: $currentState"
-        if ($currentState -eq $ExpectedState) { return }
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-    throw "Timeout waiting for VM state: $ExpectedState"
-}
-
-function Wait-ForVMAgent {
-    param([string]$ResourceGroupName, [string]$VMName)
-
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while ($timer.Elapsed.TotalMinutes -lt $WaitTimeoutMinutes) {
-        $vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status -ErrorAction Stop
-        $agentReady = $false
-        if ($vmStatus.VMAgent -and $vmStatus.VMAgent.Statuses) {
-            $agentReady = [bool]($vmStatus.VMAgent.Statuses | Where-Object { $_.DisplayStatus -eq "Ready" })
-        }
-        if ($agentReady) {
-            Write-Output "  VM agent is Ready."
-            return
-        }
-        Write-Output "  Waiting for VM agent..."
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-    throw "Timeout waiting for VM agent to become Ready."
-}
-
-function Restore-VMPowerState {
-    param([string]$ResourceGroupName, [string]$VMName, [string]$OriginalState)
-
-    $current = Get-VMCurrentPowerState -ResourceGroupName $ResourceGroupName -VMName $VMName
-
-    switch ($OriginalState) {
-        "PowerState/running" {
-            if ($current -ne "PowerState/running") {
-                Write-Output "Restoring original state: starting VM..."
-                Start-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -ErrorAction Stop | Out-Null
-            }
-        }
-        "PowerState/deallocated" {
-            if ($current -ne "PowerState/deallocated") {
-                Write-Output "Restoring original state: deallocating VM..."
-                Stop-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force -ErrorAction Stop | Out-Null
-            }
-        }
-        "PowerState/stopped" {
-            if ($current -ne "PowerState/stopped") {
-                Write-Output "Restoring original state: stopping VM (staying provisioned)..."
-                Stop-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -StayProvisioned -Force -ErrorAction Stop | Out-Null
-            }
-        }
-    }
-}
-
-# ---------------- GUEST PARTITION SCRIPT ----------------
-
-$guestScriptBlock = @'
-$ErrorActionPreference = "Stop"
-
-$RecoveryGuid = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
-$ReserveBytes = 1GB
-
-Write-Output "========== WINDOWS OS DISK ANALYSIS =========="
-Update-HostStorageCache
-Start-Sleep -Seconds 5
-
-$C         = Get-Partition -DriveLetter C
-$DiskNum   = $C.DiskNumber
-$Disk      = Get-Disk -Number $DiskNum
-$InitialC  = $C.Size
-
-Write-Output "Disk $DiskNum | Style: $($Disk.PartitionStyle) | Size: $([math]::Round($Disk.Size/1GB,2)) GB"
-Write-Output "Initial C: $([math]::Round($InitialC/1GB,2)) GB"
-
-$Parts = @(Get-Partition -DiskNumber $DiskNum | Sort-Object Offset)
-foreach ($p in $Parts) {
-    Write-Output ("Part {0} | {1} | Drive: {2} | {3} GB | Offset {4}" -f $p.PartitionNumber, $p.Type, $p.DriveLetter, [math]::Round($p.Size/1GB,3), $p.Offset)
-}
-
-$LastEnd = ($Parts | ForEach-Object { $_.Offset + $_.Size } | Measure-Object -Maximum).Maximum
-$TrailingFree = $Disk.Size - $LastEnd
-
-$Sup = Get-PartitionSupportedSize -DriveLetter C
-$Extendable = $Sup.SizeMax - $C.Size
-
-$RecreateInfo = $null
-
-try {
-    if ($Extendable -gt 1MB) {
-        Write-Output "ACTION: Extending C directly (free space is contiguous)."
-        Resize-Partition -DriveLetter C -Size $Sup.SizeMax
-    }
-    else {
-        $CEnd = $C.Offset + $C.Size
-        $Next = $Parts | Where-Object { $_.Offset -ge $CEnd } | Select-Object -First 1
-
-        if ($TrailingFree -lt 1GB) {
-            Write-Output "No meaningful free space on disk. Azure disk may not be expanded or not yet visible."
-        }
-        elseif (-not $Next) {
-            Write-Output "No partition after C, but C cannot extend. Investigation required."
-        }
-        elseif ($Disk.PartitionStyle -ne 'GPT') {
-            Write-Output "Disk is not GPT. Automatic recovery partition relocation skipped."
-        }
-        elseif ($Next.GptType -ine $RecoveryGuid) {
-            Write-Output "Partition $($Next.PartitionNumber) after C is not a Recovery partition (Type: $($Next.GptType)). Not touching it."
-        }
-        elseif ($Next.Size -gt 2GB) {
-            Write-Output "Recovery partition is larger than 2 GB ($([math]::Round($Next.Size/1GB,2)) GB). Not touching it."
-        }
-        else {
-            Write-Output ""
-            Write-Output "BLOCKER: Recovery partition $($Next.PartitionNumber) sits between C and free space."
-            Write-Output "ACTION: Relocating recovery partition to end of disk."
-
-            Write-Output "--- reagentc /info (before) ---"
-            reagentc /info
-
-            reagentc /disable
-            if ($LASTEXITCODE -ne 0) { throw "reagentc /disable failed (exit $LASTEXITCODE)." }
-
-            Remove-Partition -DiskNumber $DiskNum -PartitionNumber $Next.PartitionNumber -Confirm:$false
-            $RecreateInfo = @{ Disk = $DiskNum }
-            Write-Output "Recovery partition removed."
-
-            Update-HostStorageCache
-            Start-Sleep -Seconds 3
-
-            $Sup    = Get-PartitionSupportedSize -DriveLetter C
-            $Target = [int64]([math]::Floor(($Sup.SizeMax - $ReserveBytes) / 1MB)) * 1MB
-
-            if ($Target -le $C.Size) { throw "Calculated target size is not larger than current C size." }
-
-            Write-Output "Resizing C to $([math]::Round($Target/1GB,2)) GB..."
-            Resize-Partition -DriveLetter C -Size $Target
-            Write-Output "C resized."
-        }
-    }
-}
-catch {
-    Write-Output "ERROR: $($_.Exception.Message)"
-}
-finally {
-    if ($RecreateInfo) {
-        try {
-            Write-Output "Recreating recovery partition..."
-            Update-HostStorageCache
-
-            $New = New-Partition -DiskNumber $RecreateInfo.Disk -UseMaximumSize -GptType $RecoveryGuid
-            Format-Volume -Partition $New -FileSystem NTFS -NewFileSystemLabel "Windows RE tools" -Confirm:$false | Out-Null
-
-            $dp = @"
-select disk $($RecreateInfo.Disk)
-select partition $($New.PartitionNumber)
-gpt attributes=0x8000000000000001
-exit
-"@
-            $dpFile = Join-Path $env:TEMP "re_attr.txt"
-            Set-Content -Path $dpFile -Value $dp -Encoding ASCII
-            diskpart /s $dpFile | Out-Null
-            Remove-Item $dpFile -Force -ErrorAction SilentlyContinue
-
-            reagentc /enable
-            if ($LASTEXITCODE -ne 0) { Write-Output "WARNING: reagentc /enable failed (exit $LASTEXITCODE)." }
-
-            Write-Output "--- reagentc /info (after) ---"
-            reagentc /info
-            Write-Output "Recovery partition recreated and WinRE re-enabled."
-        }
-        catch {
-            Write-Output "CRITICAL: Failed to recreate recovery partition: $($_.Exception.Message)"
-            Write-Output "WinRE is currently DISABLED on this VM. Manual fix required."
-        }
-    }
-}
-
-# ---------- Final verification ----------
-Update-HostStorageCache
-$FinalC   = Get-Partition -DriveLetter C
-$FinalSup = Get-PartitionSupportedSize -DriveLetter C
-$FinalVol = Get-Volume -DriveLetter C
-
-Write-Output ""
-Write-Output "========== FINAL VERIFICATION =========="
-Write-Output "Final C Size: $([math]::Round($FinalC.Size/1GB,2)) GB"
-Write-Output "C Free Space: $([math]::Round($FinalVol.SizeRemaining/1GB,2)) GB"
-
-if ($FinalC.Size -gt $InitialC) {
-    Write-Output "FINAL STATUS: SUCCESS - C drive extended."
-}
-elseif (($FinalSup.SizeMax - $FinalC.Size) -le 1MB -and $TrailingFree -lt 1GB) {
-    Write-Output "FINAL STATUS: NO ACTION NEEDED - C already uses all available disk space."
-}
-else {
-    Write-Output "FINAL STATUS: CANNOT EXTEND - Investigation required."
-}
-Write-Output "========== END OF REPORT =========="
-'@
-
-# Write the guest script to a temp file (-ScriptPath works on all Az.Compute versions)
-$guestScriptFile = Join-Path $env:TEMP "Guest-ExtendCDrive.ps1"
-Set-Content -Path $guestScriptFile -Value $guestScriptBlock -Encoding UTF8
-
-# ---------------- PROCESS EACH VM ----------------
-
-$summary = @{}
+Write-Output "Loaded $($vmsData.Count) target machines for OS disk expansion."
 
 foreach ($row in $vmsData) {
+    $subId   = $row.SubscriptionId
+    $rgName  = $row.ResourceGroupName
+    $vmName  = $row.VMName
+    $sizeGB  = [int]$row.NewSizeGB
 
-    $subId    = $row.SubscriptionId.Trim()
-    $rgName   = $row.ResourceGroupName.Trim()
-    $vmName   = $row.VMName.Trim()
-    $tenantId = ""
-    if ($hasTenantColumn -and $row.TenantId) { $tenantId = $row.TenantId.Trim() }
-
-    $sizeGB          = 0
-    $originalState   = "Unknown"
-    $diskName        = ""
-    $currentDiskSize = 0
-    $action          = ""
-    $finalStatus     = "FAILED"
-    $details         = ""
-    $stateTouched    = $false
-
-    Write-Output ""
     Write-Output "============================================================"
-    Write-Output "PROCESSING VM: $vmName"
-    Write-Output "RESOURCE GROUP: $rgName"
+    Write-Output "Processing machine: $vmName [RG: $rgName]"
     Write-Output "============================================================"
 
     try {
-
-        # ---- Validate requested size ----
-        if ([string]::IsNullOrWhiteSpace($row.NewSizeGB) -or
-            ![int]::TryParse($row.NewSizeGB, [ref]$sizeGB) -or
-            $sizeGB -le 0) {
-            throw "Invalid NewSizeGB value."
+        # Check current context to avoid redundant subscription switches
+        $currentContext = Get-AzContext
+        if ($currentContext.Subscription.Id -ne $subId) {
+            Write-Output "[$vmName] Switching Azure context to Subscription ID: $subId..."
+            Set-AzContext -SubscriptionId $subId -ErrorAction Stop
         }
 
-        # ---- Switch subscription / tenant ----
-        $ctx = Get-AzContext
-        $needSwitch = ($ctx.Subscription.Id -ne $subId)
-        if ($tenantId -and $ctx.Tenant.Id -ne $tenantId) { $needSwitch = $true }
+        # Step 1: Deallocate the VM
+        Write-Output "[$vmName] Requesting deallocation (Shutting down VM)..."
+        Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop
 
-        if ($needSwitch) {
-            $ctxParams = @{ SubscriptionId = $subId; ErrorAction = "Stop" }
-            if ($tenantId) { $ctxParams["TenantId"] = $tenantId }
-            Set-AzContext @ctxParams | Out-Null
-        }
-
-        # ---- Get VM and validate ----
-        $vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
-        $osDisk = $vm.StorageProfile.OsDisk
-
-        if ($osDisk.OsType -ne "Windows") {
-            throw "VM is not Windows (OsType: $($osDisk.OsType)). This script supports Windows only."
-        }
-        if (!$osDisk.ManagedDisk -or !$osDisk.ManagedDisk.Id) {
-            throw "OS disk is not a managed disk (unmanaged VHD). Not supported."
-        }
-        if ($osDisk.DiffDiskSettings -and $osDisk.DiffDiskSettings.Option -eq "Local") {
-            throw "Ephemeral OS disk cannot be resized. Not supported."
-        }
-
-        # ---- Resolve managed disk from its resource ID ----
-        $diskMatch = [regex]::Match(
-            $osDisk.ManagedDisk.Id,
-            '/resourceGroups/([^/]+)/providers/Microsoft\.Compute/disks/([^/]+)$',
-            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if (!$diskMatch.Success) { throw "Could not parse OS disk resource ID." }
-
-        $diskRg   = $diskMatch.Groups[1].Value
-        $diskName = $diskMatch.Groups[2].Value
-
-        $disk = Get-AzDisk -ResourceGroupName $diskRg -DiskName $diskName -ErrorAction Stop
-        $currentDiskSize = [int]$disk.DiskSizeGB
-
-        if ($disk.EncryptionSettingsCollection -and $disk.EncryptionSettingsCollection.Enabled) {
-            throw "Azure Disk Encryption (ADE) is enabled on the OS disk. Review Microsoft guidance before resizing."
-        }
-
-        $originalState = Get-VMCurrentPowerState -ResourceGroupName $rgName -VMName $vmName
-
-        if ($originalState -notin @("PowerState/running", "PowerState/deallocated", "PowerState/stopped")) {
-            throw "VM is in transitional state ($originalState). Re-run later."
-        }
-
-        Write-Output "Azure OS Disk: $diskName (RG: $diskRg)"
-        Write-Output "Current Azure Disk Size: $currentDiskSize GB"
-        Write-Output "Requested Disk Size: $sizeGB GB"
-        Write-Output "Original VM State: $originalState"
-
-        $needAzureResize = ($sizeGB -gt $currentDiskSize)
-
-        if ($needAzureResize) {
-            $action = "AZURE DISK EXPANSION + WINDOWS PARTITION EXTENSION"
-            Write-Output "Azure disk expansion required (VM shutdown needed)."
-        }
-        else {
-            $action = "WINDOWS PARTITION EXTENSION ONLY"
-            if ($sizeGB -lt $currentDiskSize) {
-                Write-Output "Requested size is smaller than existing disk. Shrinking is not supported; existing size retained."
-            }
-            Write-Output "Azure disk expansion NOT required. VM shutdown will be skipped."
-        }
-
-        # ---- Dry run ----
-        if ($DryRun) {
-            $finalStatus = "DRYRUN"
-            $details = "Would perform: $action. Original state: $originalState."
-            if ($originalState -ne "PowerState/running" -and $SkipVMsNotRunning) {
-                $details += " Guest step would be skipped (VM not running, -SkipVMsNotRunning set)."
-            }
-            elseif ($originalState -ne "PowerState/running") {
-                $details += " VM would be started temporarily for guest step, then returned to $originalState."
-            }
-            Write-Output $details
-            continue
-        }
-
-        # ---- Optional snapshot ----
-        if ($TakeSnapshot) {
-            $snapName = ("{0}-pre-{1}" -f $diskName, (Get-Date -Format "yyyyMMddHHmm"))
-            if ($snapName.Length -gt 80) { $snapName = $snapName.Substring($snapName.Length - 80) }
-            Write-Output "Creating snapshot: $snapName"
-            $snapCfg = New-AzSnapshotConfig -SourceUri $disk.Id -Location $disk.Location -CreateOption Copy
-            New-AzSnapshot -ResourceGroupName $diskRg -SnapshotName $snapName -Snapshot $snapCfg -ErrorAction Stop | Out-Null
-        }
-
-        # ---- Skip VMs not running if requested (and no Azure resize needed) ----
-        if (-not $needAzureResize -and $originalState -ne "PowerState/running" -and $SkipVMsNotRunning) {
-            $finalStatus = "PENDING - VM NOT RUNNING"
-            $details = "Azure disk already sufficient. Guest step skipped because VM is not running and -SkipVMsNotRunning was set."
-            Write-Output $details
-            continue
-        }
-
-        # ---- Azure disk expansion (needs deallocated VM) ----
-        if ($needAzureResize) {
-
-            if ($originalState -ne "PowerState/deallocated") {
-                Write-Output "Deallocating VM..."
-                $stateTouched = $true
-                Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -ErrorAction Stop | Out-Null
-                Wait-ForVMState -ResourceGroupName $rgName -VMName $vmName -ExpectedState "PowerState/deallocated"
-            }
-
-            Write-Output "Updating Azure managed OS disk to $sizeGB GB..."
-            $disk.DiskSizeGB = $sizeGB
-            Update-AzDisk -ResourceGroupName $diskRg -DiskName $diskName -Disk $disk -ErrorAction Stop | Out-Null
-            Write-Output "Azure managed disk updated."
-        }
-
-        # ---- Ensure VM is running for guest step ----
-        $currentState = Get-VMCurrentPowerState -ResourceGroupName $rgName -VMName $vmName
-        if ($currentState -ne "PowerState/running") {
-            Write-Output "Starting VM for guest partition step..."
-            $stateTouched = $true
-            Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop | Out-Null
-            Wait-ForVMState -ResourceGroupName $rgName -VMName $vmName -ExpectedState "PowerState/running"
-        }
-
-        Wait-ForVMAgent -ResourceGroupName $rgName -VMName $vmName
-
-        # ---- Run guest script with retry ----
-        Write-Output ""
-        Write-Output "Executing Windows partition analysis..."
-
-        $commandResult = $null
-        $maxAttempts = 3
-        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            try {
-                $commandResult = Invoke-AzVMRunCommand `
-                    -ResourceGroupName $rgName `
-                    -VMName $vmName `
-                    -CommandId "RunPowerShellScript" `
-                    -ScriptPath $guestScriptFile `
-                    -ErrorAction Stop
+        # Dynamic loop to monitor deallocation status
+        while ($true) {
+            $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+            if ($status -contains "VM deallocated") {
+                Write-Output "[$vmName] Successfully deallocated."
                 break
             }
-            catch {
-                Write-Output "  Run command attempt $attempt failed: $($_.Exception.Message)"
-                if ($attempt -eq $maxAttempts) { throw }
-                Start-Sleep -Seconds 30
+            Write-Output "[$vmName] Current status: $status. Waiting 15 seconds..."
+            Start-Sleep -Seconds 15
+        }
+
+        # Step 2: Update Azure Storage profile metadata
+        Write-Output "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..."
+        $vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+        $vm.StorageProfile.OsDisk.DiskSizeGB = $sizeGB
+        Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop
+
+        # Step 3: Start the VM back up
+        Write-Output "[$vmName] Booting machine back up..."
+        Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+
+        # Dynamic loop to verify Windows is running
+        while ($true) {
+            $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+            if ($status -contains "VM running") {
+                Write-Output "[$vmName] OS is running."
+                break
             }
+            Write-Output "[$vmName] Booting up... Waiting 15 seconds..."
+            Start-Sleep -Seconds 15
         }
 
-        $details = ($commandResult.Value | ForEach-Object { $_.Message }) -join "`n"
-        Write-Output $details
+        # Wait for the Windows Guest Agent service to stabilize inside the OS
+        Write-Output "[$vmName] Pausing 30 seconds for Azure Guest Agent to initialize..."
+        Start-Sleep -Seconds 30
 
-        if ($details -match "FINAL STATUS: SUCCESS") {
-            $finalStatus = "SUCCESS"
-            if ($details -match "CRITICAL:") { $finalStatus = "SUCCESS - WINRE REVIEW" }
+        # Step 4: Inject advanced partition manipulation block into guest OS
+        Write-Output "[$vmName] Injecting partition adjustment logic into Windows..."
+        
+        $guestScriptBlock = @'
+        # 1. Force Windows storage layer to refresh and see the new unallocated space
+        Update-HostStorageCache
+
+        # 2. Find and remove the stubborn Recovery Partition blocking the C: partition expansion
+        $RecoveryPartition = Get-Partition -DiskNumber 0 | Where-Object Type -eq 'Recovery'
+        if ($RecoveryPartition) {
+            # Delete the partition bypassing safety prompts
+            $RecoveryPartition | Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
         }
-        elseif ($details -match "FINAL STATUS: NO ACTION NEEDED") {
-            $finalStatus = "NO ACTION NEEDED"
-        }
-        elseif ($details -match "FINAL STATUS: CANNOT EXTEND") {
-            $finalStatus = "PARTITION BLOCKED"
-            if ($details -match "CRITICAL:") { $finalStatus = "FAILED - WINRE DISABLED" }
-        }
-        else {
-            $finalStatus = "REVIEW REQUIRED"
-        }
+
+        # 3. Refresh disk layout after removal to merge unallocated pools
+        Update-HostStorageCache
+
+        # 4. Grab maximum available safe boundary for the C partition and resize it
+        $supportedSize = Get-PartitionSupportedSize -DriveLetter C
+        Resize-Partition -DriveLetter C -Size $supportedSize.SizeMax
+'@
+
+        $commandResult = Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScriptBlock -ErrorAction Stop
+        
+        # Display the result returned directly out of the Windows console
+        Write-Output "[$vmName] Windows Response: $($commandResult.Value.Message)"
+        Write-Output "[$vmName] Process finalized successfully."
+
     }
     catch {
-        $finalStatus = "FAILED"
-        $details = $_.Exception.Message
-        Write-Error "FAILURE on $vmName : $details" -ErrorAction Continue
+        # Catch and report any infrastructure errors without killing the entire loop
+        Write-Error "CRITICAL FAILURE on machine $vmName : $_"
     }
-    finally {
-        # Always try to put the VM back to its original power state
-        if ($stateTouched -and -not $DryRun -and $originalState -ne "Unknown") {
-            try {
-                Restore-VMPowerState -ResourceGroupName $rgName -VMName $vmName -OriginalState $originalState
-            }
-            catch {
-                $finalStatus = "FAILED - STATE NOT RESTORED"
-                $details += "`nCould not restore original power state ($originalState): $($_.Exception.Message)"
-                Write-Error "Could not restore power state on $vmName" -ErrorAction Continue
-            }
-        }
-    }
-
-    # ---- Record result (written incrementally) ----
-    [PSCustomObject]@{
-        VMName             = $vmName
-        SubscriptionId     = $subId
-        ResourceGroup      = $rgName
-        AzureOSDisk        = $diskName
-        RequestedSizeGB    = $sizeGB
-        OriginalDiskSizeGB = $currentDiskSize
-        OriginalVMState    = $originalState
-        Action             = $action
-        FinalStatus        = $finalStatus
-        Details            = $details
-    } | Export-Csv -Path $ReportPath -Append -NoTypeInformation -Encoding UTF8
-
-    if ($summary.ContainsKey($finalStatus)) { $summary[$finalStatus]++ } else { $summary[$finalStatus] = 1 }
-    Write-Output ""
-    Write-Output "VM RESULT: $finalStatus"
 }
 
-Remove-Item $guestScriptFile -Force -ErrorAction SilentlyContinue
-
-# ---------------- SUMMARY ----------------
-
-Write-Output ""
 Write-Output "============================================================"
-Write-Output "BATCH PROCESS COMPLETED"
-Write-Output "Total VMs: $($vmsData.Count)"
-foreach ($k in $summary.Keys) { Write-Output ("  {0}: {1}" -f $k, $summary[$k]) }
-Write-Output "Results: $ReportPath"
+Write-Output "Batch process completed for all listed CSV hosts."
 Write-Output "============================================================"
