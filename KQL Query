@@ -1,73 +1,41 @@
-PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> C:\Users\U579652\Downloads\scripts\DailyUsedScripts\Disk\Disk.ps1
+Write-Host "`n========== DISK DETAILS ==========" -ForegroundColor Cyan
 
-====================================================
-VM: PAVW934d
-Subscription: 56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55
-Requested OS disk size: 512 GB
-====================================================
-Current Azure OS disk size: 512 GB
-Current VM power state: running
-Azure OS disk is already large enough. No Azure disk resize is required.
-Waiting for Azure VM Agent...
-Running Windows C: partition extension...
-Status=Failed
-ComputerName=PAVW934d
-ExpectedSizeGB=512
-WindowsDiskSizeGB=512
-Drive=C:
-DiskNumber=0
-CPartitionSizeGB=254.86
-CPartitionMaxSizeGB=
-CPartitionExtended=False
-RecoveryPartitionFound=False
-RecoveryPartitionInfo=
-Message=Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
-Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script0.ps1:84 char:5
-+     throw $Report.Message
-+     ~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (Failed
-Activity...3-24f3cef08ed0}:String) [], RuntimeException
-    + FullyQualifiedErrorId : Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
- 
-ERROR: Guest operation did not report success. Guest output: Status=Failed
-ComputerName=PAVW934d
-ExpectedSizeGB=512
-WindowsDiskSizeGB=512
-Drive=C:
-DiskNumber=0
-CPartitionSizeGB=254.86
-CPartitionMaxSizeGB=
-CPartitionExtended=False
-RecoveryPartitionFound=False
-RecoveryPartitionInfo=
-Message=Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
-Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
-At C:\Packages\Plugins\Microsoft.CPlat.Core.RunCommandWindows\1.1.22\Downloads\script0.ps1:84 char:5
-+     throw $Report.Message
-+     ~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (Failed
-Activity...3-24f3cef08ed0}:String) [], RuntimeException
-    + FullyQualifiedErrorId : Failed
-Activity ID: {d81734da-24ac-4384-9d73-24f3cef08ed0}
- 
-Result: Failed
-Final VM state: running
+Get-Disk |
+    Format-List Number, FriendlyName, PartitionStyle, OperationalStatus,
+                HealthStatus, Size, LargestFreeExtent, IsBoot, IsSystem
 
-====================================================
-OS DISK EXPANSION COMPLETED
-====================================================
+Write-Host "`n========== PARTITION LAYOUT ==========" -ForegroundColor Cyan
 
-Name   Count
-----   -----
-Failed     1
+Get-Partition -DiskNumber 0 |
+    Sort-Object Offset |
+    Format-Table PartitionNumber, DriveLetter, Type, GptType,
+                 @{N="SizeGB";E={[math]::Round($_.Size / 1GB,2)}},
+                 @{N="OffsetGB";E={[math]::Round($_.Offset / 1GB,2)}} -AutoSize
 
+Write-Host "`n========== VOLUME DETAILS ==========" -ForegroundColor Cyan
 
-Report saved to: C:\Temp\OSDiskExpansion_Report.csv
+Get-Volume |
+    Format-Table DriveLetter, FileSystemLabel, FileSystem,
+                 @{N="SizeGB";E={[math]::Round($_.Size / 1GB,2)}},
+                 @{N="FreeGB";E={[math]::Round($_.SizeRemaining / 1GB,2)}} -AutoSize
 
-PS C:\Users\U579652\Downloads\scripts\DailyUsedScripts\HP&SH-Inventory> 
+Write-Host "`n========== C: EXTENSION TEST ==========" -ForegroundColor Cyan
+
+try {
+    Get-PartitionSupportedSize -DriveLetter C -ErrorAction Stop |
+        Format-List *
+}
+catch {
+    Write-Host "Get-PartitionSupportedSize FAILED" -ForegroundColor Red
+    Write-Host "Exception: $($_.Exception.ToString())"
+    Write-Host "Inner exception: $($_.Exception.InnerException)"
+}
+
+Write-Host "`n========== WINRE STATUS ==========" -ForegroundColor Cyan
+
+reagentc /info
+
+Write-Host "`n========== STORAGE MODULE ==========" -ForegroundColor Cyan
+
+Get-Module Storage -ListAvailable |
+    Select-Object Name, Version, Path
