@@ -25,81 +25,80 @@ foreach ($row in $vmsData) {
             Set-AzContext -SubscriptionId $subId -ErrorAction Stop
         }
 
-        # Step 1: Deallocate the VM
-        Write-Output "[$vmName] Requesting deallocation (Shutting down VM)..."
-        Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop
-
-        # Dynamic loop to monitor deallocation status
-        while ($true) {
-            $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
-            if ($status -contains "VM deallocated") {
-                Write-Output "[$vmName] Successfully deallocated."
-                break
-            }
-            Write-Output "[$vmName] Current status: $status. Waiting 15 seconds..."
-            Start-Sleep -Seconds 15
-        }
-
-        # Step 2: Update Azure Storage profile metadata
-        Write-Output "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..."
+        # Fetch live VM data to check the current disk size configuration
         $vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
-        $vm.StorageProfile.OsDisk.DiskSizeGB = $sizeGB
-        Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop
+        $currentDiskSize = $vm.StorageProfile.OsDisk.DiskSizeGB
 
-        # Step 3: Start the VM back up
-        Write-Output "[$vmName] Booting machine back up..."
-        Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
-
-        # Dynamic loop to verify Windows is running
-        while ($true) {
+        # --- NEW CONDITIONAL LOGIC ---
+        if ($currentDiskSize -ge $sizeGB) {
+            Write-Output "[$vmName] Azure OS disk size is already $currentDiskSize GB. Skipping Azure hardware modification..."
+            
+            # Verify if the VM is running. If it's stopped, we need to start it to run the guest script.
             $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
-            if ($status -contains "VM running") {
-                Write-Output "[$vmName] OS is running."
-                break
+            if ($status -notcontains "VM running") {
+                Write-Output "[$vmName] VM is not running (Current: $status). Powering up to run expansion..."
+                Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+                while ($true) {
+                    if ((Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus -contains "VM running") { break }
+                    Start-Sleep -Seconds 15
+                }
+                Start-Sleep -Seconds 30
             }
-            Write-Output "[$vmName] Booting up... Waiting 15 seconds..."
-            Start-Sleep -Seconds 15
+        } else {
+            # Execute standard resize workflow if the disk size needs increasing in Azure
+            Write-Output "[$vmName] Current disk size ($currentDiskSize GB) is less than target ($sizeGB GB). Proceeding with resize..."
+
+            # Step 1: Deallocate the VM
+            Write-Output "[$vmName] Requesting deallocation (Shutting down VM)..."
+            Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop
+
+            while ($true) {
+                $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+                if ($status -contains "VM deallocated") { break }
+                Start-Sleep -Seconds 15
+            }
+
+            # Step 2: Update Azure Storage profile metadata
+            Write-Output "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..."
+            $vm.StorageProfile.OsDisk.DiskSizeGB = $sizeGB
+            Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop
+
+            # Step 3: Start the VM back up
+            Write-Output "[$vmName] Booting machine back up..."
+            Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+
+            while ($true) {
+                $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
+                if ($status -contains "VM running") { break }
+                Start-Sleep -Seconds 15
+            }
+            Start-Sleep -Seconds 30
         }
 
-        # Wait for the Windows Guest Agent service to stabilize inside the OS
-        Write-Output "[$vmName] Pausing 30 seconds for Azure Guest Agent to initialize..."
-        Start-Sleep -Seconds 30
-
-        # Step 4: Inject advanced partition manipulation block into guest OS
-        Write-Output "[$vmName] Injecting partition adjustment logic into Windows..."
+        # Step 4: Run the In-Guest Volume Extension (Always runs to ensure partition is extended)
+        Write-Output "[$vmName] Injecting partition adjustment logic into Windows guest OS..."
         
         $guestScriptBlock = @'
-        # 1. Force Windows storage layer to refresh and see the new unallocated space
         Update-HostStorageCache
-
-        # 2. Find and remove the stubborn Recovery Partition blocking the C: partition expansion
         $RecoveryPartition = Get-Partition -DiskNumber 0 | Where-Object Type -eq 'Recovery'
         if ($RecoveryPartition) {
-            # Delete the partition bypassing safety prompts
             $RecoveryPartition | Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
         }
-
-        # 3. Refresh disk layout after removal to merge unallocated pools
         Update-HostStorageCache
-
-        # 4. Grab maximum available safe boundary for the C partition and resize it
         $supportedSize = Get-PartitionSupportedSize -DriveLetter C
         Resize-Partition -DriveLetter C -Size $supportedSize.SizeMax
 '@
 
         $commandResult = Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScriptBlock -ErrorAction Stop
-        
-        # Display the result returned directly out of the Windows console
         Write-Output "[$vmName] Windows Response: $($commandResult.Value.Message)"
         Write-Output "[$vmName] Process finalized successfully."
 
     }
     catch {
-        # Catch and report any infrastructure errors without killing the entire loop
         Write-Error "CRITICAL FAILURE on machine $vmName : $_"
     }
 }
 
 Write-Output "============================================================"
-Write-Output "Batch process completed for all listed CSV hosts."
+Write-Output "Batch process completed."
 Write-Output "============================================================"
