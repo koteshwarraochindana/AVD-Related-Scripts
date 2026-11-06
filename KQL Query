@@ -5,39 +5,46 @@ Connect-AzAccount -UseDeviceAuthentication
 $csvFilePath = "C:\path\to\your\vms.csv"
 $vmsData = Import-Csv -Path $csvFilePath
 
-Write-Output "Loaded $($vmsData.Count) target machines for OS disk expansion."
+$totalVMs = $vmsData.Count
+$currentIndex = 0
+
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " STARTING OS DISK EXPANSION PROCESS FOR $totalVMs TARGET MACHINES" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
 
 foreach ($row in $vmsData) {
+    $currentIndex++
     $subId   = $row.SubscriptionId
     $rgName  = $row.ResourceGroupName
     $vmName  = $row.VMName
     $sizeGB  = [int]$row.NewSizeGB
 
-    Write-Output "============================================================"
-    Write-Output "Processing machine: $vmName [RG: $rgName]"
-    Write-Output "============================================================"
+    Write-Host "`n"
+    Write-Host "==========================================================================================" -ForegroundColor Gray
+    Write-Host " [$currentIndex / $totalVMs] TARGET HOST: $vmName " -ForegroundColor Black -BackgroundColor Cyan
+    Write-Host " Resource Group: $rgName" -ForegroundColor Gray
+    Write-Host "==========================================================================================" -ForegroundColor Gray
 
     try {
         # Check current context to avoid redundant subscription switches
         $currentContext = Get-AzContext
         if ($currentContext.Subscription.Id -ne $subId) {
-            Write-Output "[$vmName] Switching Azure context to Subscription ID: $subId..."
-            Set-AzContext -SubscriptionId $subId -ErrorAction Stop
+            Write-Host "[$vmName] Switching Azure context to Subscription ID: $subId..." -ForegroundColor Yellow
+            Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
         }
 
         # Fetch live VM data to check the current disk size configuration
         $vm = Get-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
         $currentDiskSize = $vm.StorageProfile.OsDisk.DiskSizeGB
 
-        # --- NEW CONDITIONAL LOGIC ---
         if ($currentDiskSize -ge $sizeGB) {
-            Write-Output "[$vmName] Azure OS disk size is already $currentDiskSize GB. Skipping Azure hardware modification..."
+            Write-Host "[$vmName] Azure OS disk size is already $currentDiskSize GB. Skipping Azure hardware modification..." -ForegroundColor Green
             
             # Verify if the VM is running. If it's stopped, we need to start it to run the guest script.
             $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
             if ($status -notcontains "VM running") {
-                Write-Output "[$vmName] VM is not running (Current: $status). Powering up to run expansion..."
-                Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+                Write-Host "[$vmName] VM is not running (Current: $status). Powering up to run expansion..." -ForegroundColor Yellow
+                Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop | Out-Null
                 while ($true) {
                     if ((Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus -contains "VM running") { break }
                     Start-Sleep -Seconds 15
@@ -45,12 +52,11 @@ foreach ($row in $vmsData) {
                 Start-Sleep -Seconds 30
             }
         } else {
-            # Execute standard resize workflow if the disk size needs increasing in Azure
-            Write-Output "[$vmName] Current disk size ($currentDiskSize GB) is less than target ($sizeGB GB). Proceeding with resize..."
+            Write-Host "[$vmName] Current disk size ($currentDiskSize GB) is less than target ($sizeGB GB). Proceeding with resize..." -ForegroundColor Yellow
 
             # Step 1: Deallocate the VM
-            Write-Output "[$vmName] Requesting deallocation (Shutting down VM)..."
-            Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop
+            Write-Host "[$vmName] Requesting deallocation (Shutting down VM)..." -ForegroundColor Yellow
+            Stop-AzVM -ResourceGroupName $rgName -Name $vmName -Force -NoWait -ErrorAction Stop | Out-Null
 
             while ($true) {
                 $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
@@ -59,13 +65,13 @@ foreach ($row in $vmsData) {
             }
 
             # Step 2: Update Azure Storage profile metadata
-            Write-Output "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..."
+            Write-Host "[$vmName] Increasing Azure OS disk configuration to $sizeGB GB..." -ForegroundColor Yellow
             $vm.StorageProfile.OsDisk.DiskSizeGB = $sizeGB
-            Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop
+            Update-AzVM -ResourceGroupName $rgName -VM $vm -ErrorAction Stop | Out-Null
 
             # Step 3: Start the VM back up
-            Write-Output "[$vmName] Booting machine back up..."
-            Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop
+            Write-Host "[$vmName] Booting machine back up..." -ForegroundColor Yellow
+            Start-AzVM -ResourceGroupName $rgName -Name $vmName -ErrorAction Stop | Out-Null
 
             while ($true) {
                 $status = (Get-AzVM -ResourceGroupName $rgName -Name $vmName -Status).Statuses.DisplayStatus
@@ -75,30 +81,41 @@ foreach ($row in $vmsData) {
             Start-Sleep -Seconds 30
         }
 
-        # Step 4: Run the In-Guest Volume Extension (Always runs to ensure partition is extended)
-        Write-Output "[$vmName] Injecting partition adjustment logic into Windows guest OS..."
+        # Step 4: Run the In-Guest Volume Extension with Storage Timing Fixes
+        Write-Host "[$vmName] Injecting partition adjustment logic into Windows guest OS..." -ForegroundColor Yellow
         
         $guestScriptBlock = @'
+        # 1. Force Windows storage layer to refresh and see the new unallocated space
         Update-HostStorageCache
+
+        # 2. Find and remove the stubborn Recovery Partition blocking the C: partition expansion
         $RecoveryPartition = Get-Partition -DiskNumber 0 | Where-Object Type -eq 'Recovery'
         if ($RecoveryPartition) {
             $RecoveryPartition | Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
+            # CRITICAL TIMING FIX: Give Windows storage subsystem 5 seconds to commit partition changes
+            Start-Sleep -Seconds 5
         }
+
+        # 3. Refresh disk layout after removal to merge unallocated pools
         Update-HostStorageCache
+        Start-Sleep -Seconds 2
+
+        # 4. Grab maximum available safe boundary for the C partition and resize it
         $supportedSize = Get-PartitionSupportedSize -DriveLetter C
         Resize-Partition -DriveLetter C -Size $supportedSize.SizeMax
 '@
 
         $commandResult = Invoke-AzVMRunCommand -ResourceGroupName $rgName -VMName $vmName -CommandId 'RunPowerShellScript' -ScriptString $guestScriptBlock -ErrorAction Stop
-        Write-Output "[$vmName] Windows Response: $($commandResult.Value.Message)"
-        Write-Output "[$vmName] Process finalized successfully."
+        
+        Write-Host "[$vmName] Windows Response: $($commandResult.Value.Message)" -ForegroundColor White
+        Write-Host "[$vmName] Process finalized successfully." -ForegroundColor Green
 
     }
     catch {
-        Write-Error "CRITICAL FAILURE on machine $vmName : $_"
+        Write-Host "CRITICAL FAILURE on machine $vmName : $_" -ForegroundColor Red
     }
 }
 
-Write-Output "============================================================"
-Write-Output "Batch process completed."
-Write-Output "============================================================"
+Write-Host "`n============================================================" -ForegroundColor Cyan
+Write-Host " Batch process completed for all listed CSV hosts." -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
