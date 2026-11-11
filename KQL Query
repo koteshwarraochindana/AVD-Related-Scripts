@@ -1,6 +1,7 @@
-union isfuzzy=true withsource=TableName Perf, Event, SecurityEvent, WVDCheckpoints, WVDErrors, WVDConnections
-| where TimeGenerated > ago(4h)
-| extend Host = coalesce(column_ifexists("Computer", ""), column_ifexists("SessionHostName", ""), "Unknown")
-| summarize RecordCount = count(), EstimatedMB = round(sum(_BilledSize) / 1048576.0, 2) by Host, TableName
-| order by EstimatedMB desc
-| take 25
+This loop is caused by Windows 11 passkey privacy settings on the user's local PC blocking WebAuthn redirection. Because No is highlighted by default on the "Let Windows App enumerate your passkeys?" prompt, clicking No (or pressing Enter) permanently blocks the Windows App from reading local credentials into AVD, causing the MFA prompt to repeat.
+Since users are on unmanaged/BYOD endpoints, please share these steps to unblock them on their local physical Windows 11 PC (outside of AVD):
+1. Open Settings on the local PC and go to Privacy & security > Passkeys.
+2. Toggle Passkey access to On.
+3. Find Windows App in the app list below and toggle it On.
+4. Reopen the My Sign-ins portal in AVD (click Yes if prompted again).
+Quick Workaround: If a user cannot update their local settings right away, they can click "Sign in another way" on the login prompt and select Microsoft Authenticator instead of a passkey or Windows Hello.
