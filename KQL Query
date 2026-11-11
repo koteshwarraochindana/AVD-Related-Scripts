@@ -1,5 +1,6 @@
-union withsource=TableName Perf, Event, SecurityEvent, WVDCheckpoints, WVDErrors, WVDConnections
+union isfuzzy=true withsource=TableName Perf, Event, SecurityEvent, WVDCheckpoints, WVDErrors, WVDConnections
 | where TimeGenerated > ago(4h)
-| summarize RecordCount = count(), EstimatedMB = round(sum(_BilledSize) / 1048576.0, 2) by Computer, TableName
+| extend Host = coalesce(column_ifexists("Computer", ""), column_ifexists("SessionHostName", ""), "Unknown")
+| summarize RecordCount = count(), EstimatedMB = round(sum(_BilledSize) / 1048576.0, 2) by Host, TableName
 | order by EstimatedMB desc
 | take 25
