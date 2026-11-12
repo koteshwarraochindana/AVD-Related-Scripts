@@ -1,1 +1,4 @@
-https://learn.microsoft.com/en-us/azure/virtual-desktop/proxy-server-support
+• Total Daily Ingestion: 275 GB / day
+• Total Hourly Ingestion (All 35,000 VMs): 275 GB ÷ 24 hours = 11.46 GB / hr
+• Daily Ingestion Per VM: (275 GB × 1,024 MB) ÷ 35,000 VMs = 8.05 MB / day per VM
+• Hourly Ingestion Per VM: 8.05 MB ÷ 24 hours = 0.34 MB / hr per VM (~343 KB / hr)
