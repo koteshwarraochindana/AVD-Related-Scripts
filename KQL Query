@@ -1,2 +1,1 @@
-1. Add a UDR bypass on the AVD subnets for the AzureMonitor and WindowsVirtualDesktop Service Tags (Next Hop = Internet), or
-2. Exclude *.monitoring.core.windows.net and *.warmpath.msftcloudes.com from SSL Decryption on the Palo Altos?
+https://learn.microsoft.com/en-us/azure/virtual-desktop/proxy-server-support
