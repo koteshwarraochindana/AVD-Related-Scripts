@@ -1,6 +1,2 @@
-Quick update on the high AVD traffic (~900 GB/hr to gcs.prod.monitoring.core.windows.net and *.warmpath.msftcloudes.com) hitting 02 FW:
-• Log Analytics Check: Our total workspace ingestion across all 3,500 VMs is only ~275 GB/day (~11.5 GB/hr), confirming our AVD telemetry and Data Collection Rules are normal.
-• Root Cause: Palo Alto is performing SSL Decryption on these endpoints (indicated by the 288k+ URL hits in Panorama). Per Microsoft guidelines, SSL inspection breaks agent certificate validation and traps the VMs in a continuous retry loop, inflating ~11.5 GB/hr of normal telemetry into ~900 GB/hr.
-Are we good to reply to the email thread with these findings and suggest that the network/firewall team review:
-1. Bypassing the firewall for this Microsoft control-plane telemetry traffic, or
-2. Excluding these monitoring endpoints from SSL Decryption on the Palo Alto firewalls?
+1. Add a UDR bypass on the AVD subnets for the AzureMonitor and WindowsVirtualDesktop Service Tags (Next Hop = Internet), or
+2. Exclude *.monitoring.core.windows.net and *.warmpath.msftcloudes.com from SSL Decryption on the Palo Altos?
