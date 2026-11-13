@@ -1,17 +1,361 @@
-$rdInfraPath = "C:\Program Files\Microsoft RDInfra"
+# ==============================================================
+# GHOSTED NETWORK ADAPTER CLEANUP - AZURE VM RUN COMMAND
+# Runs the Microsoft Windows_GhostedNIC_Removal_time.ps1 script
+# on each VM listed in the CSV. Stopped/deallocated VMs are
+# started first and the guest agent is awaited.
+# PowerShell : 5.1 Compatible
+# Operation  : *** DELETES ghosted NICs and may START VMs ***
+#
+# Usage:
+#   .\GhostedNIC_Cleanup_RunCommand.ps1 -OnlyVM PAVW83de      # test on one VM first
+#   .\GhostedNIC_Cleanup_RunCommand.ps1                       # all VMs in the CSV (asks to confirm)
+#   .\GhostedNIC_Cleanup_RunCommand.ps1 -RestorePowerState    # deallocate VMs this script started, after a clean success
+#   .\GhostedNIC_Cleanup_RunCommand.ps1 -Force                # skip the confirmation prompt
+# ==============================================================
 
-# Locate the newest RDAgent version folder containing WVDAgentUrlTool.exe
-$tool = Get-ChildItem -Path $rdInfraPath -Filter "WVDAgentUrlTool.exe" -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
+[CmdletBinding()]
+param(
+    [string]$OnlyVM = "",
+    [switch]$RestorePowerState,
+    [switch]$Force
+)
 
-if ($tool) {
-    Write-Output "Running tool from: $($tool.DirectoryName)"
-    Write-Output "--------------------------------------------------"
-    
-    # Change directory so the tool finds WVDAgentUrlTool.config in the same folder
-    Set-Location -Path $tool.DirectoryName
-    & ".\WVDAgentUrlTool.exe"
-} else {
-    Write-Error "WVDAgentUrlTool.exe was not found in $rdInfraPath."
+$CsvPath           = "C:\Temp\avd_hosts.csv"
+$CleanupScriptPath = "C:\Temp\Windows_GhostedNIC_Removal_time.ps1"   # the Microsoft script, saved locally
+$OutputPath        = "C:\Temp\GhostedNIC_Cleanup_Results.csv"
+$AgentTimeoutMin   = 10     # how long to wait for the guest agent after starting a VM
+
+$ErrorActionPreference = "Stop"
+
+Write-Host ""
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "       GHOSTED NETWORK ADAPTER CLEANUP" -ForegroundColor Cyan
+Write-Host "       AZURE VM RUN COMMAND  (DELETES GHOSTED NICs)" -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+
+# --------------------------------------------------------------
+# Helper functions
+# --------------------------------------------------------------
+
+function Get-VMPowerState {
+    param([string]$RG, [string]$Name)
+    $S = Get-AzVM -ResourceGroupName $RG -Name $Name -Status -ErrorAction Stop
+    $Code = ($S.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1).Code
+    if ($Code) { return ($Code -replace '^PowerState/', '') }
+    return "unknown"
 }
+
+function Wait-VMAgentReady {
+    param([string]$RG, [string]$Name, [int]$TimeoutMinutes = 10)
+    $Deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $Deadline) {
+        $S = Get-AzVM -ResourceGroupName $RG -Name $Name -Status -ErrorAction Stop
+        $Code = ($S.Statuses | Where-Object { $_.Code -like "PowerState/*" } | Select-Object -First 1).Code
+        $Agent = $null
+        if ($S.VMAgent -and $S.VMAgent.Statuses) {
+            $Agent = ($S.VMAgent.Statuses | Select-Object -First 1).DisplayStatus
+        }
+        if ($Code -eq "PowerState/running" -and $Agent -eq "Ready") { return $true }
+        Start-Sleep -Seconds 15
+    }
+    return $false
+}
+
+# --------------------------------------------------------------
+# 1. Validate input
+# --------------------------------------------------------------
+
+if (!(Test-Path $CsvPath))           { throw "CSV file not found: $CsvPath" }
+if (!(Test-Path $CleanupScriptPath)) { throw "Cleanup script not found: $CleanupScriptPath (save the Microsoft script there)" }
+
+$VMList = @(Import-Csv -Path $CsvPath)
+
+if ($VMList.Count -eq 0) { throw "CSV contains no VM records." }
+
+foreach ($Column in @("VMName", "ResourceGroupName", "SubscriptionId")) {
+    if ($Column -notin $VMList[0].PSObject.Properties.Name) {
+        throw "Missing required CSV column: $Column"
+    }
+}
+
+$VMList = @($VMList | Where-Object {
+    ![string]::IsNullOrWhiteSpace($_.VMName) -and
+    ![string]::IsNullOrWhiteSpace($_.ResourceGroupName) -and
+    ![string]::IsNullOrWhiteSpace($_.SubscriptionId)
+})
+
+if (![string]::IsNullOrWhiteSpace($OnlyVM)) {
+    $VMList = @($VMList | Where-Object { $_.VMName.Trim() -eq $OnlyVM.Trim() })
+    if ($VMList.Count -eq 0) { throw "VM '$OnlyVM' not found in the CSV." }
+}
+
+if ($VMList.Count -eq 0) { throw "No valid VM records found in CSV." }
+
+Write-Host "VMs to clean          : $($VMList.Count)"
+$VMList | ForEach-Object { Write-Host "  - $($_.VMName.Trim())" }
+
+# --------------------------------------------------------------
+# 2. Confirmation
+# --------------------------------------------------------------
+
+if (-not $Force) {
+    Write-Host ""
+    Write-Host "This will DELETE ghosted NICs on the VMs above." -ForegroundColor Yellow
+    Write-Host "It also runs pnpclean, which removes ALL non-present devices, not only NICs." -ForegroundColor Yellow
+    Write-Host "Stopped or deallocated VMs WILL BE STARTED (compute charges apply while running)." -ForegroundColor Yellow
+    if ($RestorePowerState) {
+        Write-Host "VMs started by this script will be deallocated again after a clean success." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "VMs started by this script will be LEFT RUNNING (use -RestorePowerState to change this)." -ForegroundColor Yellow
+    }
+    $Answer = Read-Host "Type YES to continue"
+    if ($Answer -cne "YES") {
+        Write-Host "Cancelled. Nothing was changed." -ForegroundColor Green
+        return
+    }
+}
+
+# --------------------------------------------------------------
+# 3. Connect to Azure
+# --------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Checking Azure authentication..." -ForegroundColor Yellow
+
+try {
+    $Context = Get-AzContext
+    if (!$Context) { Connect-AzAccount | Out-Null }
+    Write-Host "Azure authentication successful." -ForegroundColor Green
+}
+catch {
+    throw "Azure authentication failed: $($_.Exception.Message)"
+}
+
+# --------------------------------------------------------------
+# 4. Build the remote script
+#    header (before counts) + Microsoft script + footer (after counts + result line)
+# --------------------------------------------------------------
+
+$Header = @'
+$ErrorActionPreference = "Continue"
+try { $PreGhosts = @(Get-PnpDevice -Class Net -ErrorAction Stop | Where-Object { $_.Present -eq $false }).Count } catch { $PreGhosts = -1 }
+try { $PreAdapters = @(Get-NetAdapter -ErrorAction Stop).Count } catch { $PreAdapters = -1 }
+'@
+
+$Footer = @'
+try { $PostGhosts = @(Get-PnpDevice -Class Net -ErrorAction Stop | Where-Object { $_.Present -eq $false }).Count } catch { $PostGhosts = -1 }
+try { $PostAdapters = @(Get-NetAdapter -ErrorAction Stop).Count } catch { $PostAdapters = -1 }
+Write-Output ("GHOSTED_NIC_CLEANUP|Done|{0}|{1}|{2}|{3}|{4}" -f $env:COMPUTERNAME, $PreGhosts, $PostGhosts, $PreAdapters, $PostAdapters)
+'@
+
+$MsScript = Get-Content -Path $CleanupScriptPath -Raw
+$Combined = $Header + "`r`n" + $MsScript + "`r`n" + $Footer
+
+# Write without BOM so the first line is not corrupted
+$TempScript = Join-Path $env:TEMP "GhostedNIC_Cleanup_Remote.ps1"
+[System.IO.File]::WriteAllText($TempScript, $Combined, (New-Object System.Text.UTF8Encoding($false)))
+
+# --------------------------------------------------------------
+# 5. Execute against each VM (one at a time)
+# --------------------------------------------------------------
+
+$Results = @()
+$Counter = 0
+
+foreach ($VM in $VMList) {
+
+    $Counter++
+
+    $VMName = $VM.VMName.Trim()
+    $RG     = $VM.ResourceGroupName.Trim()
+    $SubId  = $VM.SubscriptionId.Trim()
+
+    $PowerBefore     = "Unknown"
+    $StartedByScript = $false
+
+    Write-Host ""
+    Write-Host "[$Counter/$($VMList.Count)] Cleaning VM: $VMName" -ForegroundColor Cyan
+    Write-Host "Resource Group: $RG"
+
+    $Watch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        Set-AzContext -SubscriptionId $SubId -ErrorAction Stop | Out-Null
+
+        # ---- Power state check / start ----
+        $PowerBefore = Get-VMPowerState -RG $RG -Name $VMName
+        Write-Host "Power state: $PowerBefore"
+
+        if ($PowerBefore -in @("stopped", "deallocated")) {
+            Write-Host "VM is not running. Starting VM..." -ForegroundColor Yellow
+            Start-AzVM -ResourceGroupName $RG -Name $VMName -ErrorAction Stop | Out-Null
+            $StartedByScript = $true
+            Write-Host "VM started." -ForegroundColor Green
+        }
+        elseif ($PowerBefore -eq "starting") {
+            Write-Host "VM is already starting. Waiting..." -ForegroundColor Yellow
+        }
+        elseif ($PowerBefore -ne "running") {
+            throw "VM is in state '$PowerBefore'. Skipped; try again when it is running or stopped."
+        }
+
+        # ---- Wait for the guest agent ----
+        Write-Host "Waiting for guest agent (up to $AgentTimeoutMin min)..." -ForegroundColor Yellow
+        if (-not (Wait-VMAgentReady -RG $RG -Name $VMName -TimeoutMinutes $AgentTimeoutMin)) {
+            throw "VM guest agent was not Ready within $AgentTimeoutMin minutes."
+        }
+
+        if ($StartedByScript) {
+            Write-Host "Letting Windows finish booting (30s)..."
+            Start-Sleep -Seconds 30
+        }
+
+        # ---- Run the cleanup ----
+        Write-Host "Running cleanup. This can take several minutes per VM. Please wait..." -ForegroundColor Yellow
+
+        $Response = Invoke-AzVMRunCommand `
+            -ResourceGroupName $RG `
+            -VMName $VMName `
+            -CommandId "RunPowerShellScript" `
+            -ScriptPath $TempScript `
+            -ErrorAction Stop
+
+        $Message = ($Response.Value | ForEach-Object { $_.Message }) -join "`n"
+
+        if ($Message -match '(?m)GHOSTED_NIC_CLEANUP\|([^\r\n]*)') {
+
+            # Done | VM | GhostBefore | GhostAfter | AdaptersBefore | AdaptersAfter
+            $P = $Matches[1] -split '\|'
+
+            $GhostBefore    = [int]$P[2]
+            $GhostAfter     = [int]$P[3]
+            $AdaptersBefore = [int]$P[4]
+            $AdaptersAfter  = [int]$P[5]
+
+            $Status = "Success"
+            if ($AdaptersBefore -ge 0 -and $AdaptersAfter -ge 0 -and $AdaptersAfter -lt $AdaptersBefore) {
+                $Status = "WARNING - Adapter count dropped, verify VM connectivity"
+            }
+
+            $Results += [PSCustomObject]@{
+                VMName            = $VMName
+                ResourceGroupName = $RG
+                SubscriptionId    = $SubId
+                PowerBefore       = $PowerBefore
+                StartedByScript   = $StartedByScript
+                PoweredOffAfter   = $false
+                GhostedBefore     = $GhostBefore
+                GhostedAfter      = $GhostAfter
+                AdaptersBefore    = $AdaptersBefore
+                AdaptersAfter     = $AdaptersAfter
+                Minutes           = [math]::Round($Watch.Elapsed.TotalMinutes, 1)
+                CleanupStatus     = $Status
+                Error             = ""
+            }
+
+            if ($Status -eq "Success") {
+                Write-Host "Done. Ghosted NICs: $GhostBefore -> $GhostAfter | Adapters: $AdaptersBefore -> $AdaptersAfter" -ForegroundColor Green
+            }
+            else {
+                Write-Host "$Status ($AdaptersBefore -> $AdaptersAfter)" -ForegroundColor Red
+            }
+        }
+        else {
+            $Snippet = $Message
+            if ($Snippet.Length -gt 500) { $Snippet = $Snippet.Substring($Snippet.Length - 500) }
+            throw "No result marker in response. Last output: [$Snippet]"
+        }
+    }
+    catch {
+        $ErrorMessage = $_.Exception.Message
+        Write-Host "Failed: $ErrorMessage" -ForegroundColor Red
+
+        $Results += [PSCustomObject]@{
+            VMName            = $VMName
+            ResourceGroupName = $RG
+            SubscriptionId    = $SubId
+            PowerBefore       = $PowerBefore
+            StartedByScript   = $StartedByScript
+            PoweredOffAfter   = $false
+            GhostedBefore     = $null
+            GhostedAfter      = $null
+            AdaptersBefore    = $null
+            AdaptersAfter     = $null
+            Minutes           = [math]::Round($Watch.Elapsed.TotalMinutes, 1)
+            CleanupStatus     = "Run Command Failed"
+            Error             = $ErrorMessage
+        }
+    }
+
+    # ---- Restore power state (only after a clean success) ----
+    if ($StartedByScript) {
+        if ($RestorePowerState -and $Results[-1].CleanupStatus -eq "Success") {
+            Write-Host "Restoring original power state (deallocating VM)..." -ForegroundColor Yellow
+            try {
+                Stop-AzVM -ResourceGroupName $RG -Name $VMName -Force -ErrorAction Stop | Out-Null
+                $Results[-1].PoweredOffAfter = $true
+                Write-Host "VM deallocated." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "Could not deallocate VM: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        else {
+            Write-Host "NOTE: $VMName was started by this script and is still running." -ForegroundColor Yellow
+        }
+    }
+}
+
+if (Test-Path $TempScript) { Remove-Item $TempScript -Force -ErrorAction SilentlyContinue }
+
+# --------------------------------------------------------------
+# 6. Summary
+# --------------------------------------------------------------
+
+$Succeeded = @($Results | Where-Object { $_.CleanupStatus -eq "Success" })
+$Warnings  = @($Results | Where-Object { $_.CleanupStatus -like "WARNING*" })
+$Failed    = @($Results | Where-Object { $_.CleanupStatus -eq "Run Command Failed" })
+$Started   = @($Results | Where-Object { $_.StartedByScript })
+$StillOn   = @($Started | Where-Object { -not $_.PoweredOffAfter })
+
+Write-Host ""
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "                 CLEANUP SUMMARY" -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "VMs Processed          : $($Results.Count)"
+Write-Host "Succeeded              : $($Succeeded.Count)" -ForegroundColor Green
+Write-Host "Warnings               : $($Warnings.Count)" -ForegroundColor Yellow
+Write-Host "Failed                 : $($Failed.Count)" -ForegroundColor Red
+Write-Host "Started by script      : $($Started.Count)"
+Write-Host "Started and still on   : $($StillOn.Count)" -ForegroundColor Yellow
+
+Write-Host ""
+$Results |
+    Select-Object VMName, PowerBefore, StartedByScript, PoweredOffAfter, GhostedBefore, GhostedAfter, AdaptersBefore, AdaptersAfter, Minutes, CleanupStatus |
+    Format-Table -AutoSize -Wrap
+
+if ($Failed.Count -gt 0) {
+    Write-Host "FAILED VMs" -ForegroundColor Red
+    $Failed | Select-Object VMName, Error | Format-Table -AutoSize -Wrap
+}
+
+if ($StillOn.Count -gt 0) {
+    Write-Host "VMs started by this script and still running:" -ForegroundColor Yellow
+    $StillOn | ForEach-Object { Write-Host "  - $($_.VMName)" -ForegroundColor Yellow }
+}
+
+# --------------------------------------------------------------
+# 7. Export results
+# --------------------------------------------------------------
+
+$OutDir = Split-Path $OutputPath -Parent
+if ($OutDir -and !(Test-Path $OutDir)) {
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+}
+
+$Results | Export-Csv -Path $OutputPath -NoTypeInformation -Force
+
+Write-Host ""
+Write-Host "Results exported to: $OutputPath" -ForegroundColor Green
+Write-Host "Cleanup completed." -ForegroundColor Green
