@@ -1,372 +1,46 @@
+# Update path to your input CSV file
+$CsvPath = "C:\Temp\avd_hosts.csv"
 
-# ============================================================
-# AZURE AVD / VM GHOSTED NETWORK ADAPTER INVENTORY
-#
-# Azure PowerShell + WinRM
-# PowerShell 5.1 Compatible
-# READ-ONLY - NO VM OR NETWORK CONFIGURATION CHANGES
-#
-# Scans running Windows VMs across 16 subscriptions
-# Detects network devices with Status = Unknown
-# ============================================================
-
-# ------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------
-
-$TargetSubscriptions = @(
-    "f9c819dc-4e16-4a04-8487-a734dcd880e1",
-    "c59f3913-9612-4704-94f8-4a1d4f695b2f",
-    "750da1a4-85cc-489e-b629-e512e0989c16",
-    "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
-    "df7de03e-1d71-4adf-8fd1-bd5791326a26",
-    "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e",
-    "752e53bf-6605-464f-ab75-bcead037561e",
-    "ffabf3d6-ec1e-4626-b146-ec289cfe71ab",
-    "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
-    "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
-    "5412eea3-1603-414b-9d0f-5c21a191c8f3",
-    "20760d19-cc7b-4363-a17e-8a4ab8b6e9e5",
-    "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
-    "7160cf79-3964-41af-8168-05a588c5f99b",
-    "9ff6edd3-6b39-4d33-8776-56703398260c",
-    "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f"
-)
-
-$ThrottleLimit = 50
-
-$TargetVMs = @()
-$Results = @()
-$RemoteErrors = @()
-
-# ------------------------------------------------------------
-# STEP 1: VERIFY AZURE POWERSHELL AUTHENTICATION
-# ------------------------------------------------------------
-
-Write-Host "`n======================================================" -ForegroundColor Cyan
-Write-Host "       AZURE GHOSTED NETWORK ADAPTER INVENTORY" -ForegroundColor Cyan
-Write-Host "======================================================" -ForegroundColor Cyan
-
-Write-Host "`nChecking Azure PowerShell authentication..." -ForegroundColor Cyan
-
-try {
-
-    $Account = Get-AzContext -ErrorAction Stop
-
-    if (-not $Account -or -not $Account.Account) {
-        throw "No active Azure PowerShell account found."
-    }
-
-    Write-Host "Authenticated Account: $($Account.Account.Id)" -ForegroundColor Green
-    Write-Host "Tenant: $($Account.Tenant.Id)" -ForegroundColor Green
-
-}
-catch {
-
-    Write-Host "ERROR: Azure authentication unavailable." -ForegroundColor Red
-    Write-Host "Run Connect-AzAccount and execute the script again." -ForegroundColor Yellow
+if (-not (Test-Path $CsvPath)) {
+    Write-Error "CSV file not found at $CsvPath"
     return
-
 }
 
-# ------------------------------------------------------------
-# STEP 2: VERIFY REQUIRED AZ MODULES
-# ------------------------------------------------------------
+$vmList = Import-Csv -Path $CsvPath
+$computers = $vmList.VMName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
-if (-not (Get-Module -ListAvailable -Name Az.Compute)) {
+Write-Host "Scanning $($computers.Count) targeted VMs from CSV via WinRM (Read-Only)..." -ForegroundColor Cyan
 
-    Write-Host "Az.Compute module is missing." -ForegroundColor Red
-    return
-
-}
-
-Import-Module Az.Compute -ErrorAction Stop
-
-# ------------------------------------------------------------
-# STEP 3: DISCOVER RUNNING WINDOWS VMS
-# ------------------------------------------------------------
-
-Write-Host "`nDiscovering running Windows VMs across $($TargetSubscriptions.Count) subscriptions..." -ForegroundColor Cyan
-
-foreach ($SubId in $TargetSubscriptions) {
-
-    Write-Host "`nChecking Subscription: $SubId" -ForegroundColor Gray
-
-    try {
-
-        Set-AzContext -SubscriptionId $SubId -ErrorAction Stop |
-            Out-Null
-
-        $VMData = @(
-            Get-AzVM -Status -ErrorAction Stop
-        )
-
-        $SubscriptionVMCount = 0
-
-        foreach ($VM in $VMData) {
-
-            $PowerState = @(
-                $VM.Statuses |
-                    Where-Object {
-                        $_.Code -eq "PowerState/running"
-                    }
-            ).Count -gt 0
-
-            $IsWindows = (
-                $VM.StorageProfile.OsDisk.OsType -eq "Windows"
-            )
-
-            if ($PowerState -and $IsWindows) {
-
-                $TargetVMs += [PSCustomObject]@{
-                    VMName       = $VM.Name
-                    Subscription = $SubId
-                }
-
-                $SubscriptionVMCount++
-
-            }
-
-        }
-
-        Write-Host "Running Windows VMs: $SubscriptionVMCount" -ForegroundColor Green
-
-    }
-    catch {
-
-        Write-Warning "Failed to query subscription $SubId : $($_.Exception.Message)"
-
-    }
-
-}
-
-# ------------------------------------------------------------
-# STEP 4: PREPARE UNIQUE WINRM TARGETS
-# ------------------------------------------------------------
-
-$Computers = @(
-    $TargetVMs |
-        Select-Object -ExpandProperty VMName -Unique
-)
-
-Write-Host "`n======================================================" -ForegroundColor Cyan
-Write-Host "AZURE VM DISCOVERY SUMMARY" -ForegroundColor Cyan
-Write-Host "======================================================" -ForegroundColor Cyan
-
-Write-Host "Subscriptions Checked : $($TargetSubscriptions.Count)" -ForegroundColor White
-Write-Host "Running Windows VMs   : $($TargetVMs.Count)" -ForegroundColor White
-Write-Host "Unique VM Hostnames   : $($Computers.Count)" -ForegroundColor White
-
-if ($Computers.Count -eq 0) {
-
-    Write-Host "`nNo running Windows VMs found." -ForegroundColor Yellow
-    return
-
-}
-
-# Build VM-to-subscription lookup.
-# This preserves subscription information if duplicate VM names exist.
-
-$SubscriptionLookup = @{}
-
-foreach ($VM in $TargetVMs) {
-
-    if (-not $SubscriptionLookup.ContainsKey($VM.VMName)) {
-
-        $SubscriptionLookup[$VM.VMName] = @()
-
-    }
-
-    $SubscriptionLookup[$VM.VMName] += $VM.Subscription
-
-}
-
-# ------------------------------------------------------------
-# STEP 5: SCAN GHOSTED NETWORK ADAPTERS USING WINRM
-# ------------------------------------------------------------
-
-Write-Host "`nScanning $($Computers.Count) unique VMs using WinRM..." -ForegroundColor Cyan
-Write-Host "Throttle Limit: $ThrottleLimit" -ForegroundColor Gray
-
-$Results = @(
-    Invoke-Command `
-        -ComputerName $Computers `
-        -ThrottleLimit $ThrottleLimit `
-        -ErrorAction Continue `
-        -ErrorVariable RemoteErrors `
-        -ScriptBlock {
-
-            try {
-
-                $GhostedNICs = @(
-                    Get-PnpDevice -Class Net -ErrorAction Stop |
-                        Where-Object {
-                            $_.Status -eq "Unknown"
-                        }
-                )
-
-                [PSCustomObject]@{
-
-                    VMName      = $env:COMPUTERNAME
-                    GhostedNICs = $GhostedNICs.Count
-
-                }
-
-            }
-            catch {
-
-                [PSCustomObject]@{
-
-                    VMName      = $env:COMPUTERNAME
-                    GhostedNICs = -1
-
-                }
-
-            }
-
-        }
-)
-
-# ------------------------------------------------------------
-# STEP 6: ENRICH RESULTS WITH SUBSCRIPTION INFORMATION
-# ------------------------------------------------------------
-
-$FinalResults = foreach ($Result in $Results) {
-
-    $VMSubscription = $SubscriptionLookup[$Result.VMName]
-
+# Scan only the VMs listed in your CSV in parallel
+$scanResults = Invoke-Command -ComputerName $computers -ThrottleLimit 50 -ErrorAction SilentlyContinue -ScriptBlock {
     [PSCustomObject]@{
-
-        VMName       = $Result.VMName
-        Subscription = $VMSubscription -join "; "
-        GhostedNICs  = $Result.GhostedNICs
-
+        VMName      = $env:COMPUTERNAME
+        GhostedNICs = (Get-PnpDevice -Class Net -Status Unknown -ErrorAction SilentlyContinue).Count
     }
-
 }
 
-# ------------------------------------------------------------
-# STEP 7: CALCULATE ENVIRONMENT SUMMARY
-# ------------------------------------------------------------
-
-$ScannedVMs = @(
-    $FinalResults |
-        Where-Object { $_.GhostedNICs -ge 0 }
-)
-
-$FailedScans = @(
-    $FinalResults |
-        Where-Object { $_.GhostedNICs -lt 0 }
-)
-
-$SuccessfulVMNames = @(
-    $FinalResults |
-        Where-Object { $_.GhostedNICs -ge 0 } |
-        Select-Object -ExpandProperty VMName
-)
-
-$UnreachableVMs = @(
-    $Computers |
-        Where-Object { $_ -notin $SuccessfulVMNames }
-)
-
-$AffectedVMs = @(
-    $ScannedVMs |
-        Where-Object { $_.GhostedNICs -gt 0 }
-)
-
-$TotalGhosted = (
-    $ScannedVMs |
-        Measure-Object -Property GhostedNICs -Sum
-).Sum
-
-if ($null -eq $TotalGhosted) {
-    $TotalGhosted = 0
+# Map SubscriptionId and ResourceGroupName back to the scan results for display
+$finalReport = foreach ($row in $scanResults) {
+    $csvMeta = $vmList | Where-Object { $_.VMName -eq $row.VMName } | Select-Object -First 1
+    [PSCustomObject]@{
+        VMName            = $row.VMName
+        GhostedNICs       = $row.GhostedNICs
+        ResourceGroupName = $csvMeta.ResourceGroupName
+        SubscriptionId    = $csvMeta.SubscriptionId
+    }
 }
 
-# ------------------------------------------------------------
-# STEP 8: DISPLAY ENVIRONMENT SUMMARY
-# ------------------------------------------------------------
+# Display totals directly in the console (no output files created)
+$totalGhosted = ($finalReport | Measure-Object -Property GhostedNICs -Sum).Sum
+$affectedVMs  = ($finalReport | Where-Object { $_.GhostedNICs -gt 0 }).Count
 
-Write-Host "`n"
-Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "         GHOSTED NETWORK ADAPTER REPORT" -ForegroundColor Cyan
+Write-Host "`n================ TARGETED CSV SUMMARY ================" -ForegroundColor Cyan
+Write-Host "VMs Listed in CSV      : $($computers.Count)" -ForegroundColor White
+Write-Host "Online VMs Scanned     : $($finalReport.Count)" -ForegroundColor White
+Write-Host "VMs With Ghosted NICs  : $affectedVMs" -ForegroundColor Yellow
+Write-Host "Total Ghosted NICs     : $totalGhosted" -ForegroundColor Red
 Write-Host "======================================================" -ForegroundColor Cyan
 
-Write-Host "Subscriptions Checked    : $($TargetSubscriptions.Count)" -ForegroundColor White
-Write-Host "Running Windows VMs      : $($TargetVMs.Count)" -ForegroundColor White
-Write-Host "Unique VM Hostnames      : $($Computers.Count)" -ForegroundColor White
-Write-Host "Successfully Scanned     : $($ScannedVMs.Count)" -ForegroundColor Green
-Write-Host "Unreachable / Failed     : $($UnreachableVMs.Count)" -ForegroundColor Yellow
-Write-Host "VMs With Ghosted NICs    : $($AffectedVMs.Count)" -ForegroundColor Yellow
-Write-Host "Total Ghosted NICs       : $TotalGhosted" -ForegroundColor Red
-
-Write-Host "======================================================" -ForegroundColor Cyan
-
-# ------------------------------------------------------------
-# STEP 9: DISPLAY TOP 25 AFFECTED VMS
-# ------------------------------------------------------------
-
-Write-Host "`nTOP 25 VMS WITH GHOSTED NETWORK ADAPTERS" -ForegroundColor Cyan
-
-if ($AffectedVMs.Count -gt 0) {
-
-    $AffectedVMs |
-        Sort-Object -Property GhostedNICs -Descending |
-        Select-Object -First 25 VMName, GhostedNICs, Subscription |
-        Format-Table -AutoSize
-
-}
-else {
-
-    Write-Host "No ghosted network adapters detected." -ForegroundColor Green
-
-}
-
-# ------------------------------------------------------------
-# STEP 10: DISPLAY FAILED / UNREACHABLE VMS
-# ------------------------------------------------------------
-
-if ($UnreachableVMs.Count -gt 0) {
-
-    Write-Host "`nUNREACHABLE OR FAILED VM SCANS" -ForegroundColor Yellow
-
-    $UnreachableVMs |
-        ForEach-Object {
-            Write-Host $_ -ForegroundColor Yellow
-        }
-
-}
-
-if ($FailedScans.Count -gt 0) {
-
-    Write-Host "`nREMOTE DEVICE ENUMERATION FAILURES" -ForegroundColor Yellow
-
-    $FailedScans |
-        Format-Table VMName, Subscription -AutoSize
-
-}
-
-if ($RemoteErrors.Count -gt 0) {
-
-    Write-Host "`nWINRM CONNECTION ERRORS (FIRST 20)" -ForegroundColor Yellow
-
-    $RemoteErrors |
-        Select-Object -First 20 |
-        ForEach-Object {
-            Write-Host $_.ToString() -ForegroundColor DarkYellow
-        }
-
-}
-
-# ------------------------------------------------------------
-# STEP 11: COMPLETION
-# ------------------------------------------------------------
-
-Write-Host "`n======================================================" -ForegroundColor Cyan
-Write-Host "SCAN COMPLETED" -ForegroundColor Green
-Write-Host "======================================================" -ForegroundColor Cyan
-
-# ============================================================
-# END OF SCRIPT
-# ============================================================
+$finalReport | Where-Object { $_.GhostedNICs -gt 0 } |
+    Sort-Object -Property GhostedNICs -Descending |
+    Format-Table VMName, GhostedNICs, ResourceGroupName, SubscriptionId -AutoSize
