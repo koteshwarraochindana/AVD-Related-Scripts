@@ -1,1 +1,57 @@
-Install-Module -Name Az.Accounts, Az.Compute -Scope CurrentUser -Force
+$TargetSubscriptions = @(
+    "f9c819dc-4e16-4a04-8487-a734dcd880e1",
+    "c59f3913-9612-4704-94f8-4a1d4f695b2f",
+    "750da1a4-85cc-489e-b629-e512e0989c16",
+    "56fb6a7f-8b65-4aba-90f0-b17a9dbb7b55",
+    "df7de03e-1d71-4adf-8fd1-bd5791326a26",
+    "0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e",
+    "752e53bf-6605-464f-ab75-bcead037561e",
+    "ffabf3d6-ec1e-4626-b146-ec289cfe71ab",
+    "3db8f6c1-6208-4799-b3b9-a931bb78ff10",
+    "236d25ee-6a67-4d1e-b8a2-d18340cab27a",
+    "5412eea3-1603-414b-9d0f-5c21a191c8f3",
+    "20760d19-cc7b-4363-a17e-8a4ab8b6e9e5",
+    "bf9eecc9-7f67-46e2-b3f8-268da59f1299",
+    "7160cf79-3964-41af-8168-05a588c5f99b",
+    "9ff6edd3-6b39-4d33-8776-56703398260c",
+    "c4b71001-3b61-4bd7-af51-df7bfc0d9f1f"
+)
+
+if (-not (Get-AzContext)) {
+    Connect-AzAccount
+}
+
+Write-Host "Fetching running VMs across $($TargetSubscriptions.Count) subscriptions..." -ForegroundColor Cyan
+$computers = @()
+
+foreach ($subId in $TargetSubscriptions) {
+    Set-AzContext -SubscriptionId $subId -ErrorAction SilentlyContinue | Out-Null
+    $runningVMs = (Get-AzVM -Status | Where-Object { $_.PowerState -eq "VM running" }).Name
+    if ($runningVMs) {
+        $computers += $runningVMs
+    }
+}
+
+$computers = $computers | Select-Object -Unique
+Write-Host "Scanning $($computers.Count) running VMs via WinRM (Read-Only)..." -ForegroundColor Cyan
+
+$results = Invoke-Command -ComputerName $computers -ThrottleLimit 50 -ErrorAction SilentlyContinue -ScriptBlock {
+    [PSCustomObject]@{
+        VMName      = $env:COMPUTERNAME
+        GhostedNICs = (Get-PnpDevice -Class Net -Status Unknown -ErrorAction SilentlyContinue).Count
+    }
+}
+
+$totalGhosted = ($results | Measure-Object -Property GhostedNICs -Sum).Sum
+$affectedVMs  = ($results | Where-Object { $_.GhostedNICs -gt 0 }).Count
+
+Write-Host "`n================ ENVIRONMENT SUMMARY ================" -ForegroundColor Cyan
+Write-Host "Online VMs Scanned     : $($results.Count)" -ForegroundColor White
+Write-Host "VMs With Ghosted NICs  : $affectedVMs" -ForegroundColor Yellow
+Write-Host "Total Ghosted NICs     : $totalGhosted" -ForegroundColor Red
+Write-Host "=====================================================" -ForegroundColor Cyan
+
+$results | Where-Object { $_.GhostedNICs -gt 0 } |
+    Sort-Object -Property GhostedNICs -Descending |
+    Select-Object -First 25 VMName, GhostedNICs |
+    Format-Table -AutoSize
