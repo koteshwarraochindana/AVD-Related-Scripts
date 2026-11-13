@@ -1,42 +1,307 @@
-PS C:\Users\U579652> C:\Users\U579652\Downloads\1112.ps1
 
-======================================================
-       GHOSTED NETWORK ADAPTER INVENTORY
-======================================================
-CSV Records           : 3
-Valid VM Records      : 3
-Unique VM Targets     : 3
-WinRM Throttle Limit  : 50
+# ============================================================
+# TARGETED AVD GHOSTED NETWORK ADAPTER INVENTORY
+# CSV + WINRM
+# PowerShell 5.1 Compatible
+# READ-ONLY
+# ============================================================
 
-Starting remote scan...
+$CsvPath = "C:\Temp\avd_hosts.csv"
+$ThrottleLimit = 50
 
-======================================================
-           TARGETED CSV SCAN SUMMARY
-======================================================
-VMs Listed in CSV       : 3
-Successfully Scanned   : 0
-Unreachable VMs        : 3
-Enumeration Failures   : 0
-VMs With Ghosted NICs  : 0
-Total Ghosted NICs     : 0
-======================================================
+# ------------------------------------------------------------
+# STEP 1: VALIDATE CSV
+# ------------------------------------------------------------
 
-TOP 25 VMS WITH GHOSTED NETWORK ADAPTERS
-No ghosted NICs detected on successfully scanned VMs.
+if (-not (Test-Path -LiteralPath $CsvPath)) {
+    Write-Host "CSV file not found: $CsvPath" -ForegroundColor Red
+    return
+}
 
-FAILED OR UNREACHABLE VM SCANS
+$VMList = @(Import-Csv -Path $CsvPath)
 
-VMName   ScanStatus                ResourceGroupName               SubscriptionId                       ScanError                             
-------   ----------                -----------------               --------------                       ---------                             
-PAVW3654 Unreachable / No Response HCSC_APP00047108_AVD2_SC_APP_RG 0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e No successful WinRM response received.
-PAVW5e2a Unreachable / No Response HCSC_APP00047108_AVD2_SC_APP_RG 0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e No successful WinRM response received.
-PAVW83de Unreachable / No Response HCSC_APP00047108_AVD2_SC_APP_RG 0ecf5d7c-dbde-4eaf-8fb4-df512ccd5d3e No successful WinRM response received.
+if ($VMList.Count -eq 0) {
+    Write-Host "CSV contains no records." -ForegroundColor Red
+    return
+}
 
+$RequiredColumns = @("VMName", "ResourceGroupName", "SubscriptionId")
 
+foreach ($Column in $RequiredColumns) {
+    if ($Column -notin $VMList[0].PSObject.Properties.Name) {
+        Write-Host "Missing CSV column: $Column" -ForegroundColor Red
+        return
+    }
+}
 
-======================================================
-SCAN COMPLETED
-No Azure or VM configuration changes performed.
-======================================================
+$ValidRows = @(
+    $VMList | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.VMName)
+    }
+)
 
-PS C:\Users\U579652> 
+$Computers = @(
+    $ValidRows |
+        ForEach-Object { $_.VMName.Trim() } |
+        Select-Object -Unique
+)
+
+Write-Host "`n======================================================" -ForegroundColor Cyan
+Write-Host "       GHOSTED NETWORK ADAPTER INVENTORY" -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+
+Write-Host "CSV Records          : $($VMList.Count)"
+Write-Host "Unique VM Targets    : $($Computers.Count)"
+Write-Host "Throttle Limit       : $ThrottleLimit"
+
+# ------------------------------------------------------------
+# STEP 2: PREPARE METADATA LOOKUP
+# ------------------------------------------------------------
+
+$MetadataLookup = @{}
+
+foreach ($Row in $ValidRows) {
+
+    $Key = $Row.VMName.Trim().ToLowerInvariant()
+
+    if (-not $MetadataLookup.ContainsKey($Key)) {
+        $MetadataLookup[$Key] = $Row
+    }
+}
+
+# ------------------------------------------------------------
+# STEP 3: TEST REMOTE EXECUTION
+# ------------------------------------------------------------
+
+Write-Host "`nTesting remote PowerShell execution..." -ForegroundColor Cyan
+
+try {
+
+    $TestResult = Invoke-Command `
+        -ComputerName $Computers[0] `
+        -ScriptBlock {
+            [PSCustomObject]@{
+                VMName = $env:COMPUTERNAME
+                User   = whoami
+            }
+        } `
+        -ErrorAction Stop
+
+    Write-Host "WinRM remote execution successful: $($TestResult.VMName)" -ForegroundColor Green
+    Write-Host "Remote identity: $($TestResult.User)" -ForegroundColor Green
+
+}
+catch {
+
+    Write-Host "Remote execution test failed." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Yellow
+
+    Write-Host "`nCheck remote permissions and authentication before scanning." -ForegroundColor Yellow
+    return
+}
+
+# ------------------------------------------------------------
+# STEP 4: SCAN ALL TARGET VMS
+# ------------------------------------------------------------
+
+Write-Host "`nStarting ghosted NIC scan..." -ForegroundColor Cyan
+
+$RemoteErrors = @()
+
+$ScanResults = @(
+    Invoke-Command `
+        -ComputerName $Computers `
+        -ThrottleLimit $ThrottleLimit `
+        -ErrorAction SilentlyContinue `
+        -ErrorVariable +RemoteErrors `
+        -ScriptBlock {
+
+            try {
+
+                $Devices = @(
+                    Get-PnpDevice -Class Net -ErrorAction Stop
+                )
+
+                $GhostedNICs = @(
+                    $Devices | Where-Object {
+                        $_.Status -eq "Unknown"
+                    }
+                )
+
+                [PSCustomObject]@{
+                    VMName      = $env:COMPUTERNAME
+                    GhostedNICs = $GhostedNICs.Count
+                    ScanStatus  = "Success"
+                    ScanError   = ""
+                }
+
+            }
+            catch {
+
+                [PSCustomObject]@{
+                    VMName      = $env:COMPUTERNAME
+                    GhostedNICs = -1
+                    ScanStatus  = "Device Enumeration Failed"
+                    ScanError   = $_.Exception.Message
+                }
+
+            }
+
+        }
+)
+
+# ------------------------------------------------------------
+# STEP 5: MAP RESULTS TO CSV
+# ------------------------------------------------------------
+
+$ResultLookup = @{}
+
+foreach ($Result in $ScanResults) {
+
+    $TargetName = [string]$Result.PSComputerName
+
+    if ([string]::IsNullOrWhiteSpace($TargetName)) {
+        $TargetName = [string]$Result.VMName
+    }
+
+    $Key = $TargetName.Trim().ToLowerInvariant()
+
+    $ResultLookup[$Key] = $Result
+}
+
+$FinalReport = foreach ($Computer in $Computers) {
+
+    $Key = $Computer.Trim().ToLowerInvariant()
+    $Metadata = $MetadataLookup[$Key]
+
+    if ($ResultLookup.ContainsKey($Key)) {
+
+        $Result = $ResultLookup[$Key]
+
+        [PSCustomObject]@{
+            VMName            = $Computer
+            GhostedNICs       = $Result.GhostedNICs
+            ScanStatus        = $Result.ScanStatus
+            ResourceGroupName = $Metadata.ResourceGroupName
+            SubscriptionId    = $Metadata.SubscriptionId
+            ScanError         = $Result.ScanError
+        }
+
+    }
+    else {
+
+        $MatchingError = @(
+            $RemoteErrors | Where-Object {
+                $_.TargetObject -eq $Computer -or
+                $_.Exception.Message -match [regex]::Escape($Computer)
+            }
+        ) | Select-Object -First 1
+
+        $ErrorMessage = "No successful WinRM response received."
+
+        if ($MatchingError) {
+            $ErrorMessage = $MatchingError.Exception.Message
+        }
+
+        [PSCustomObject]@{
+            VMName            = $Computer
+            GhostedNICs       = $null
+            ScanStatus        = "Connection Failed"
+            ResourceGroupName = $Metadata.ResourceGroupName
+            SubscriptionId    = $Metadata.SubscriptionId
+            ScanError         = $ErrorMessage
+        }
+
+    }
+}
+
+# ------------------------------------------------------------
+# STEP 6: CALCULATE SUMMARY
+# ------------------------------------------------------------
+
+$SuccessfulVMs = @(
+    $FinalReport | Where-Object {
+        $_.ScanStatus -eq "Success"
+    }
+)
+
+$FailedVMs = @(
+    $FinalReport | Where-Object {
+        $_.ScanStatus -ne "Success"
+    }
+)
+
+$AffectedVMs = @(
+    $SuccessfulVMs | Where-Object {
+        $_.GhostedNICs -gt 0
+    }
+)
+
+$TotalGhosted = (
+    $SuccessfulVMs |
+        Measure-Object -Property GhostedNICs -Sum
+).Sum
+
+if ($null -eq $TotalGhosted) {
+    $TotalGhosted = 0
+}
+
+# ------------------------------------------------------------
+# STEP 7: DISPLAY SUMMARY
+# ------------------------------------------------------------
+
+Write-Host "`n======================================================" -ForegroundColor Cyan
+Write-Host "           TARGETED CSV SCAN SUMMARY" -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+
+Write-Host "VMs Listed in CSV      : $($Computers.Count)" -ForegroundColor White
+Write-Host "Successfully Scanned   : $($SuccessfulVMs.Count)" -ForegroundColor Green
+Write-Host "Failed Scans           : $($FailedVMs.Count)" -ForegroundColor Yellow
+Write-Host "VMs With Ghosted NICs  : $($AffectedVMs.Count)" -ForegroundColor Yellow
+Write-Host "Total Ghosted NICs     : $TotalGhosted" -ForegroundColor Red
+
+Write-Host "======================================================" -ForegroundColor Cyan
+
+# ------------------------------------------------------------
+# STEP 8: DISPLAY AFFECTED VMS
+# ------------------------------------------------------------
+
+Write-Host "`nTOP 25 VMS WITH GHOSTED NETWORK ADAPTERS" -ForegroundColor Cyan
+
+if ($AffectedVMs.Count -gt 0) {
+
+    $AffectedVMs |
+        Sort-Object GhostedNICs -Descending |
+        Select-Object -First 25 VMName,
+            GhostedNICs,
+            ResourceGroupName,
+            SubscriptionId |
+        Format-Table -AutoSize
+
+}
+else {
+
+    Write-Host "No ghosted NICs detected on successfully scanned VMs." -ForegroundColor Green
+
+}
+
+# ------------------------------------------------------------
+# STEP 9: DISPLAY FAILED VMS
+# ------------------------------------------------------------
+
+if ($FailedVMs.Count -gt 0) {
+
+    Write-Host "`nFAILED VM SCANS" -ForegroundColor Yellow
+
+    $FailedVMs |
+        Format-Table VMName, ScanStatus, ScanError -Wrap -AutoSize
+
+}
+
+Write-Host "`n======================================================" -ForegroundColor Cyan
+Write-Host "SCAN COMPLETED - READ ONLY" -ForegroundColor Green
+Write-Host "======================================================" -ForegroundColor Cyan
+
+# ============================================================
+# END
+# ============================================================
