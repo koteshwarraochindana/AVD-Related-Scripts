@@ -1,58 +1,53 @@
-# 1. Target all AVD session hosts from Active Directory (adjust SearchBase to your AVD OU)
-$computers = (Get-ADComputer -Filter * -SearchBase "OU=AVD,DC=yourdomain,DC=com").Name
+# 1. Verify Azure login
+if (-not (Get-AzContext)) {
+    Connect-AzAccount
+}
 
-# Or pull from a specific Azure Host Pool instead:
-# $computers = (Get-AzWvdSessionHost -ResourceGroupName "RG-AVD" -HostPoolName "HP-SingleSession").Name | ForEach-Object { ($_ -split '/')[1] -replace '\..*','' }
+# 2. Collect all currently running VMs across every accessible subscription
+Write-Host "Fetching running VMs across all subscriptions..." -ForegroundColor Cyan
+$subscriptions = Get-AzSubscription
+$computers = @()
 
-Write-Host "Scanning $($computers.Count) AVD hosts for ghosted NICs..." -ForegroundColor Cyan
-
-# 2. Execute the Microsoft registry scan logic across all online hosts in parallel
-$results = Invoke-Command -ComputerName $computers -ThrottleLimit 50 -ErrorAction SilentlyContinue -ScriptBlock {
-    $AllAdaptersPnPIDs = (Get-NetAdapter).PnpDeviceID
-    $ghostCount = 0
-    $validCount = 0
-
-    foreach ($BusName in @("PCI", "VMBUS")) {
-        $RootPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\"
-        $RegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$BusName"
-
-        if (Test-Path -Path $RegistryPath) {
-            Get-ChildItem -Path $RegistryPath -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object {
-                $BusPath = $_.Name.ToString().Replace("HKEY_LOCAL_MACHINE\", "HKLM:\")
-                
-                Get-ChildItem -Path $BusPath -Depth 0 -ErrorAction SilentlyContinue | ForEach-Object {
-                    $DevPath = $_.Name.ToString().Replace("HKEY_LOCAL_MACHINE\", "HKLM:\")
-                    $BusRelativeName = $_.Name.ToString().Replace($RootPath, "")
-                    $ServiceType = (Get-ItemProperty -Path $DevPath -Name Service -ErrorAction SilentlyContinue).Service
-
-                    if ($ServiceType -in ("netvsc", "mlx5", "mlx4_bus")) {
-                        if ($AllAdaptersPnPIDs -contains $BusRelativeName) {
-                            $validCount++
-                        } else {
-                            $ghostCount++
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    [PSCustomObject]@{
-        VMName      = $env:COMPUTERNAME
-        GhostedNICs = $ghostCount
-        ValidNICs   = $validCount
+foreach ($sub in $subscriptions) {
+    Set-AzContext -SubscriptionId $sub.Id -ErrorAction SilentlyContinue | Out-Null
+    $runningVMs = (Get-AzVM -Status | Where-Object { $_.PowerState -eq "VM running" }).Name
+    
+    if ($runningVMs) {
+        $computers += $runningVMs
     }
 }
 
-# 3. Calculate and display the environment-wide totals in the console
+# Remove any duplicate names just in case
+$computers = $computers | Select-Object -Unique
+
+if (-not $computers) {
+    Write-Warning "No running VMs were found across your subscriptions."
+    return
+}
+
+Write-Host "Scanning $($computers.Count) running VMs across $($subscriptions.Count) subscription(s)..." -ForegroundColor Cyan
+
+# 3. Scan all running VMs in parallel via WinRM (Read-Only)
+$results = Invoke-Command -ComputerName $computers -ThrottleLimit 50 -ErrorAction SilentlyContinue -ScriptBlock {
+    [PSCustomObject]@{
+        VMName      = $env:COMPUTERNAME
+        GhostedNICs = (Get-PnpDevice -Class Net -Status Unknown -ErrorAction SilentlyContinue).Count
+    }
+}
+
+# 4. Calculate and display environment-wide totals
 $totalGhosted = ($results | Measure-Object -Property GhostedNICs -Sum).Sum
 $affectedVMs  = ($results | Where-Object { $_.GhostedNICs -gt 0 }).Count
 
 Write-Host "`n================ ENVIRONMENT SUMMARY ================" -ForegroundColor Cyan
+Write-Host "Subscriptions Checked  : $($subscriptions.Count)" -ForegroundColor White
 Write-Host "Online VMs Scanned     : $($results.Count)" -ForegroundColor White
 Write-Host "VMs With Ghosted NICs  : $affectedVMs" -ForegroundColor Yellow
 Write-Host "Total Ghosted NICs     : $totalGhosted" -ForegroundColor Red
 Write-Host "=====================================================" -ForegroundColor Cyan
 
-# Display the top 25 worst offenders on screen
-$results | Sort-Object GhostedNICs -Descending | Select-Object -First 25 VMName, GhostedNICs, ValidNICs | Format-Table -AutoSize
+# 5. Display top 25 VMs with the highest ghosted NIC count
+$results | Where-Object { $_.GhostedNICs -gt 0 } |
+    Sort-Object -Property GhostedNICs -Descending |
+    Select-Object -First 25 VMName, GhostedNICs |
+    Format-Table -AutoSize
