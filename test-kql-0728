@@ -1,23 +1,24 @@
 $ShareBase = "\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts"
 $ModuleRepo = "$ShareBase\AzOfflineModules"
+$RequiredModules = @("Az.Accounts", "Az.Compute", "Az.Resources")
 
-# 1. Create the module folder on the network share
-Write-Host "Creating folder at $ModuleRepo..." -ForegroundColor Cyan
+# 1. Clean or create the module folder on the network share
+if (Test-Path $ModuleRepo) { Remove-Item -Path $ModuleRepo -Recurse -Force }
 New-Item -ItemType Directory -Path $ModuleRepo -Force | Out-Null
 
-# 2. Download Az and all sub-modules directly to the share
-Write-Host "Downloading Az modules to network share (takes 3-6 minutes)..." -ForegroundColor Cyan
-Save-Module -Name Az -Path $ModuleRepo -Repository PSGallery -Force
+# 2. Download ONLY the 3 required modules directly to the share
+Write-Host "Downloading Az.Accounts, Az.Compute, and Az.Resources (~100 MB)..." -ForegroundColor Cyan
+Save-Module -Name $RequiredModules -Path $ModuleRepo -Repository PSGallery -Force
 
 # 3. Generate the One-Click .bat Installer for the offshore team
 $BatContent = @'
 @echo off
-title Azure PowerShell (Az) Offline Installer
+title Azure PowerShell (VM Cleanup Modules) Offline Installer
 color 0B
 echo ============================================================================
-echo   Installing Azure PowerShell (Az) Module for Current User...
+echo   Installing Required Azure PowerShell Modules (Accounts, Compute, Resources)
 echo   Source: \\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\AzOfflineModules
-echo   Please do not close this window. This usually takes 2-4 minutes.
+echo   Please do not close this window. This takes less than 1 minute.
 echo ============================================================================
 echo.
 
@@ -30,11 +31,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "    robocopy $Source $Target /E /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NJS | Out-Null;" ^
   "}" ^
   "Write-Host \"`nVerifying installation...\" -ForegroundColor Yellow;" ^
-  "$Installed = Get-Module -ListAvailable -Name Az;" ^
-  "if ($Installed) {" ^
-  "    Write-Host \"SUCCESS! Azure PowerShell version $($Installed.Version) is installed.\" -ForegroundColor Green;" ^
+  "$Installed = Get-Module -ListAvailable -Name Az.Accounts, Az.Compute, Az.Resources;" ^
+  "if ($Installed.Count -ge 3) {" ^
+  "    Write-Host \"SUCCESS! Required Azure modules are installed and ready.\" -ForegroundColor Green;" ^
   "} else {" ^
-  "    Write-Host \"WARNING: Could not verify Az module. Check network share access.\" -ForegroundColor Red;" ^
+  "    Write-Host \"WARNING: Could not verify all 3 modules. Check network share access.\" -ForegroundColor Red;" ^
   "}"
 
 echo.
@@ -44,5 +45,5 @@ pause
 $BatPath = "$ShareBase\Install-AzPowerShell.bat"
 Set-Content -Path $BatPath -Value $BatContent -Encoding ASCII
 
-Write-Host "`nAll done! Share this file path with your team:" -ForegroundColor Green
+Write-Host "`nAll done! Lightweight installer is ready at:" -ForegroundColor Green
 Write-Host $BatPath -ForegroundColor Yellow
