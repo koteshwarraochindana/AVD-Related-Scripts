@@ -1,35 +1,69 @@
-# 1. Log in immediately without prompting for a subscription menu
-Connect-AzAccount -SkipContextPopulation | Out-Null
+# ===========================
+# DATA COLLECTION & LOGIN
+# ===========================
+$inputCsv = "\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\ManuallyDeleteAVD\VM_List.csv"
+
+# Import CSV and filter out any accidental blank rows
+$vmList = Import-Csv -Path $inputCsv | Where-Object { 
+    -not [string]::IsNullOrWhiteSpace($_.VMName) -and -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) 
+}
+
+if (-not $vmList) {
+    Write-Host "No valid VM entries found in $inputCsv. Exiting." -ForegroundColor Red
+    return
+}
+
+# Connect directly using the first SubscriptionId in the CSV (completely bypasses the subscription prompt)
+$firstSubId = ($vmList | Select-Object -First 1).SubscriptionId.Trim()
+Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
+
+Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
 
 # ===========================
-# DATA COLLECTION & ACTION
+# PROCESSING BY SUBSCRIPTION
 # ===========================
-$inputCsv = "C:\Temp\VM_List.csv" 
-$vmList = Import-Csv -Path $inputCsv
-
-Write-Host "--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
-
 # Group VMs by SubscriptionId so we only fetch VMs once per subscription
-$groupedBySub = $vmList | Group-Object -Property SubscriptionId
+$groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
 
 $results = foreach ($subGroup in $groupedBySub) {
     $subId = $subGroup.Name
     Write-Host "`nSwitching to Subscription: $subId" -ForegroundColor Magenta
-    Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
+    
+    try {
+        Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "Failed to switch to Subscription $subId : $($_.Exception.Message)" -ForegroundColor Red
+        foreach ($row in $subGroup.Group) {
+            [PSCustomObject]@{
+                SubscriptionId = $subId
+                VMName         = $row.VMName.Trim()
+                ResourceGroup  = "N/A"
+                ActionTaken    = "Skipped (Subscription Access Error)"
+            }
+        }
+        continue
+    }
 
     # Get all VMs in this subscription once for speed
     $allVmsInSub = Get-AzVM 
 
     foreach ($row in $subGroup.Group) {
-        $vmName = $row.VMName
+        $vmName = $row.VMName.Trim()
         $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
         
+        # Visual Dotted Header for each VM
         Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
         Write-Host "VM: $vmName" -ForegroundColor Cyan
 
         if (-not $foundVm) {
             Write-Host "VM - $vmName - [NOT FOUND]" -ForegroundColor Red
-            [PSCustomObject]@{ SubscriptionId = $subId; VMName = $vmName; ActionTaken = "Skipped (Not Found)" }
+            [PSCustomObject]@{ 
+                SubscriptionId = $subId
+                VMName         = $vmName
+                ResourceGroup  = "N/A"
+                ActionTaken    = "Skipped (Not Found)" 
+            }
             continue
         }
 
@@ -37,6 +71,7 @@ $results = foreach ($subGroup in $groupedBySub) {
         $actionStatus = "Success"
 
         try {
+            # Capture IDs before VM is gone
             $osDiskId = $foundVm.StorageProfile.OsDisk.ManagedDisk.Id
             $nicIds = $foundVm.NetworkProfile.NetworkInterfaces.Id
 
@@ -52,9 +87,11 @@ $results = foreach ($subGroup in $groupedBySub) {
             }
 
             # 3. Delete OS Disk
-            $diskName = $osDiskId.Split('/')[-1]
-            Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue
-            Write-Host "Disk - $diskName - [DELETED]" -ForegroundColor Yellow
+            if ($osDiskId) {
+                $diskName = $osDiskId.Split('/')[-1]
+                Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue
+                Write-Host "Disk - $diskName - [DELETED]" -ForegroundColor Yellow
+            }
 
             $actionStatus = "VM, NIC, and Disk Deleted"
         } catch {
@@ -74,8 +111,10 @@ $results = foreach ($subGroup in $groupedBySub) {
 Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
 
 # ===========================
-# EXPORT
+# EXPORT REPORT
 # ===========================
 $outputPath = "C:\Temp\VM_Deletion_Report.csv"
+if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
+
 $results | Export-Csv -Path $outputPath -NoTypeInformation -Force
 Write-Host "`nProcess Complete. Summary exported to $outputPath" -ForegroundColor Green
