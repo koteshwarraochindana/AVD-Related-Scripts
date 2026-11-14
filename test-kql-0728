@@ -1,30 +1,81 @@
-@echo off
-title Azure PowerShell (VM Cleanup Modules) Offline Installer
-color 0B
-echo ============================================================================
-echo   Installing Required Azure PowerShell Modules (Accounts, Compute, Resources)
-echo   Source: \\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\AzOfflineModules
-echo   Please do not close this window. This takes less than 1 minute.
-echo ============================================================================
-echo.
+# 1. Log in immediately without prompting for a subscription menu
+Connect-AzAccount -SkipContextPopulation | Out-Null
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$Source = '\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\AzOfflineModules';" ^
-  "$Targets = @(\"$env:USERPROFILE\Documents\WindowsPowerShell\Modules\", \"$env:USERPROFILE\Documents\PowerShell\Modules\");" ^
-  "foreach ($Target in $Targets) {" ^
-  "    Write-Host \"Copying modules to $Target...\" -ForegroundColor Cyan;" ^
-  "    New-Item -ItemType Directory -Path $Target -Force | Out-Null;" ^
-  "    robocopy $Source $Target /E /MT:8 /R:2 /W:2 /NFL /NDL /NJH /NJS | Out-Null;" ^
-  "}" ^
-  "Write-Host \"`nConfiguring PowerShell ISE compatibility...\" -ForegroundColor Yellow;" ^
-  "Update-AzConfig -EnableLoginByWam $false | Out-Null;" ^
-  "Write-Host \"Verifying installation...\" -ForegroundColor Yellow;" ^
-  "$Installed = Get-Module -ListAvailable -Name Az.Accounts, Az.Compute, Az.Resources;" ^
-  "if ($Installed.Count -ge 3) {" ^
-  "    Write-Host \"SUCCESS! Required Azure modules are installed and ISE is configured.\" -ForegroundColor Green;" ^
-  "} else {" ^
-  "    Write-Host \"WARNING: Could not verify all 3 modules. Check network share access.\" -ForegroundColor Red;" ^
-  "}"
+# ===========================
+# DATA COLLECTION & ACTION
+# ===========================
+$inputCsv = "C:\Temp\VM_List.csv" 
+$vmList = Import-Csv -Path $inputCsv
 
-echo.
-pause
+Write-Host "--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
+
+# Group VMs by SubscriptionId so we only fetch VMs once per subscription
+$groupedBySub = $vmList | Group-Object -Property SubscriptionId
+
+$results = foreach ($subGroup in $groupedBySub) {
+    $subId = $subGroup.Name
+    Write-Host "`nSwitching to Subscription: $subId" -ForegroundColor Magenta
+    Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
+
+    # Get all VMs in this subscription once for speed
+    $allVmsInSub = Get-AzVM 
+
+    foreach ($row in $subGroup.Group) {
+        $vmName = $row.VMName
+        $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
+        
+        Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
+        Write-Host "VM: $vmName" -ForegroundColor Cyan
+
+        if (-not $foundVm) {
+            Write-Host "VM - $vmName - [NOT FOUND]" -ForegroundColor Red
+            [PSCustomObject]@{ SubscriptionId = $subId; VMName = $vmName; ActionTaken = "Skipped (Not Found)" }
+            continue
+        }
+
+        $rg = $foundVm.ResourceGroupName
+        $actionStatus = "Success"
+
+        try {
+            $osDiskId = $foundVm.StorageProfile.OsDisk.ManagedDisk.Id
+            $nicIds = $foundVm.NetworkProfile.NetworkInterfaces.Id
+
+            # 1. Delete VM
+            Remove-AzVM -ResourceGroupName $rg -Name $vmName -Force -ErrorAction Stop
+            Write-Host "VM - $vmName - [DELETED]" -ForegroundColor Yellow
+
+            # 2. Delete NICs
+            foreach ($nicId in $nicIds) {
+                $nicName = $nicId.Split('/')[-1]
+                Remove-AzResource -ResourceId $nicId -Force -ErrorAction SilentlyContinue
+                Write-Host "NIC - $nicName - [DELETED]" -ForegroundColor Yellow
+            }
+
+            # 3. Delete OS Disk
+            $diskName = $osDiskId.Split('/')[-1]
+            Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue
+            Write-Host "Disk - $diskName - [DELETED]" -ForegroundColor Yellow
+
+            $actionStatus = "VM, NIC, and Disk Deleted"
+        } catch {
+            Write-Host "Error processing $vmName : $($_.Exception.Message)" -ForegroundColor Red
+            $actionStatus = "Error: $($_.Exception.Message)"
+        }
+
+        [PSCustomObject]@{
+            SubscriptionId = $subId
+            VMName         = $vmName
+            ResourceGroup  = $rg
+            ActionTaken    = $actionStatus
+        }
+    }
+}
+
+Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
+
+# ===========================
+# EXPORT
+# ===========================
+$outputPath = "C:\Temp\VM_Deletion_Report.csv"
+$results | Export-Csv -Path $outputPath -NoTypeInformation -Force
+Write-Host "`nProcess Complete. Summary exported to $outputPath" -ForegroundColor Green
