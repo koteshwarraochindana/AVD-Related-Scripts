@@ -1,21 +1,35 @@
 # ===========================
-# DATA COLLECTION & LOGIN
+# DATA COLLECTION & CONFIRMATION
 # ===========================
 $inputCsv = "\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\ManuallyDeleteAVD\VM_List.csv"
 
-# Import CSV and filter out any accidental blank rows
-$vmList = Import-Csv -Path $inputCsv | Where-Object { 
+# Wrap in @(...) so .Count always works accurately even if there is only 1 VM in the CSV
+$vmList = @(Import-Csv -Path $inputCsv | Where-Object { 
     -not [string]::IsNullOrWhiteSpace($_.VMName) -and -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) 
-}
+})
 
-if (-not $vmList) {
+if ($vmList.Count -eq 0) {
     Write-Host "No valid VM entries found in $inputCsv. Exiting." -ForegroundColor Red
     return
 }
 
-# Connect directly using the first SubscriptionId in the CSV (completely bypasses the subscription prompt)
-$firstSubId = ($vmList | Select-Object -First 1).SubscriptionId.Trim()
-Write-Host "Authenticating to Azure..." -ForegroundColor Cyan
+# Show only the total count from the CSV
+Write-Host "`n===================================================" -ForegroundColor Yellow
+Write-Host "Total VMs found in CSV for deletion: $($vmList.Count)" -ForegroundColor Cyan
+Write-Host "===================================================" -ForegroundColor Yellow
+
+# Mandatory Confirmation Gate
+$confirm = Read-Host "`nType YES to proceed with deletion, or press Enter to cancel"
+if ($confirm -ne "YES") {
+    Write-Host "Operation cancelled by user. No VMs were modified or deleted." -ForegroundColor Red
+    return
+}
+
+# ===========================
+# AZURE LOGIN
+# ===========================
+$firstSubId = $vmList[0].SubscriptionId.Trim()
+Write-Host "`nAuthenticating to Azure..." -ForegroundColor Cyan
 Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
 
 Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
@@ -23,7 +37,6 @@ Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -Foreg
 # ===========================
 # PROCESSING BY SUBSCRIPTION
 # ===========================
-# Group VMs by SubscriptionId so we only fetch VMs once per subscription
 $groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
 
 $results = foreach ($subGroup in $groupedBySub) {
@@ -52,7 +65,6 @@ $results = foreach ($subGroup in $groupedBySub) {
         $vmName = $row.VMName.Trim()
         $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
         
-        # Visual Dotted Header for each VM
         Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
         Write-Host "VM: $vmName" -ForegroundColor Cyan
 
