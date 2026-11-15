@@ -42,7 +42,7 @@ $lblHeader.Location = New-Object System.Drawing.Point(15, 15)
 $lblHeader.Size = New-Object System.Drawing.Size(710, 45)
 $form.Controls.Add($lblHeader)
 
-# DataGridView Table (Shows VMName, ResourceGroupName, SubscriptionId)
+# DataGridView Table (Shows VMName, ResourceGroup, SubscriptionId)
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Location = New-Object System.Drawing.Point(15, 68)
 $grid.Size = New-Object System.Drawing.Size(715, 290)
@@ -58,7 +58,6 @@ $grid.Columns.Add("ResourceGroup", "Resource Group") | Out-Null
 $grid.Columns.Add("SubscriptionId", "Subscription ID") | Out-Null
 
 foreach ($row in $vmList) {
-    # Supports either 'ResourceGroupName' or 'ResourceGroup' column header in CSV
     $rgDisplay = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { "(Auto-Detect)" }
     $grid.Rows.Add($row.VMName.Trim(), $rgDisplay, $row.SubscriptionId.Trim()) | Out-Null
 }
@@ -104,7 +103,7 @@ Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
 Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
 
 # ===========================
-# 4. PROCESSING BY SUBSCRIPTION (BATCHED)
+# 4. PROCESSING BY SUBSCRIPTION (FAST DIRECT LOOKUP)
 # ===========================
 $groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
 
@@ -112,7 +111,7 @@ $results = foreach ($subGroup in $groupedBySub) {
     $subId = $subGroup.Name
     
     if ((Get-AzContext).Subscription.Id -ne $subId) {
-        Write-Host "`nSwitching to Subscription: $subId" -ForegroundColor Magenta
+        Write-Host "`nSwitching to Subscription: $subId ($($subGroup.Count) VMs)" -ForegroundColor Magenta
         try {
             Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
         } catch {
@@ -131,22 +130,20 @@ $results = foreach ($subGroup in $groupedBySub) {
         Write-Host "`nProcessing Subscription: $subId ($($subGroup.Count) VMs)" -ForegroundColor Magenta
     }
 
-    Write-Host "Querying Azure VM inventory in subscription (please wait)..." -ForegroundColor DarkGray
-    $allVmsInSub = Get-AzVM 
-
     foreach ($row in $subGroup.Group) {
         $vmName = $row.VMName.Trim()
-        
-        # Match by both VMName and ResourceGroup if provided in CSV
         $csvRg = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { $null }
-        if ($csvRg) {
-            $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName -and $_.ResourceGroupName -eq $csvRg }
-        } else {
-            $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
-        }
         
+        $rgLabel = if ($csvRg) { " | RG: $csvRg" } else { "" }
         Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
-        Write-Host "VM: $vmName" -ForegroundColor Cyan
+        Write-Host "VM: $vmName$rgLabel" -ForegroundColor Cyan
+
+        # Query ONLY this exact VM directly instead of downloading the entire subscription's VM list
+        if ($csvRg) {
+            $foundVm = Get-AzVM -ResourceGroupName $csvRg -Name $vmName -ErrorAction SilentlyContinue
+        } else {
+            $foundVm = Get-AzVM -Name $vmName -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
 
         if (-not $foundVm) {
             Write-Host "VM - $vmName - [NOT FOUND]" -ForegroundColor Red
