@@ -2,6 +2,9 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Suppress Azure PowerShell survey prompts and breaking-change banners in ISE
+Update-AzConfig -DisplaySurveyMessage $false -DisplayBreakingChangeWarning $false -AppliesTo Az -Scope Process -ErrorAction SilentlyContinue | Out-Null
+
 # ===========================
 # 1. DATA COLLECTION
 # ===========================
