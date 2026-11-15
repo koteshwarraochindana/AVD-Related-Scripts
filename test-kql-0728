@@ -16,13 +16,15 @@ if (-not (Test-Path $inputCsv)) {
 
 # Import CSV and clean any accidental spaces in column headers
 $rawCsv = Import-Csv -Path $inputCsv
-$vmList = @(foreach ($r in $rawCsv) {
+$cleanedRows = @(foreach ($r in $rawCsv) {
     $cleanObj = [ordered]@{}
     foreach ($prop in $r.PSObject.Properties) {
         $cleanObj[$prop.Name.Trim()] = if ($null -ne $prop.Value) { $prop.Value.Trim() } else { "" }
     }
     [PSCustomObject]$cleanObj
-} | Where-Object { 
+})
+
+$vmList = @($cleanedRows | Where-Object { 
     -not [string]::IsNullOrWhiteSpace($_.VMName) -and -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) 
 })
 
