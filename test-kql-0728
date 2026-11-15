@@ -1,4 +1,5 @@
 Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
 # ===========================
 # 1. DATA COLLECTION
@@ -20,34 +21,81 @@ if ($vmList.Count -eq 0) {
     return
 }
 
-# Prepare clean preview list
-$previewList = $vmList | Select-Object @{Name='VMName';Expression={$_.VMName.Trim()}}, @{Name='SubscriptionId';Expression={$_.SubscriptionId.Trim()}}
+# ===========================
+# 2. SINGLE CUSTOM CONFIRMATION POPUP (COUNT + FULL TABLE + BUTTONS)
+# ===========================
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Confirm Permanent AVD VM Deletion"
+$form.Size = New-Object System.Drawing.Size(760, 460)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
 
-# ===========================
-# 2. POPUP STEP 1: VALIDATE VM LIST
-# ===========================
-# Opens a native Windows table showing all VMs from the CSV; pauses until the user clicks OK or closes the window
-$previewList | Out-GridView -Title "Step 1 of 2: Review Target VMs ($($vmList.Count) Total) - Click OK to Continue" -Wait
+# Top Summary Label (Total VM Count)
+$lblHeader = New-Object System.Windows.Forms.Label
+$lblHeader.Text = "Total VMs found in CSV for deletion: $($vmList.Count)`nReview the VM Name, Resource Group, and Subscription ID below before proceeding:"
+$lblHeader.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$lblHeader.ForeColor = [System.Drawing.Color]::DarkRed
+$lblHeader.Location = New-Object System.Drawing.Point(15, 15)
+$lblHeader.Size = New-Object System.Drawing.Size(710, 45)
+$form.Controls.Add($lblHeader)
 
-# ===========================
-# 3. POPUP STEP 2: YES / NO CONFIRMATION
-# ===========================
-$msg = "You are about to permanently delete $($vmList.Count) Virtual Machine(s) along with their attached NICs and OS Disks.`n`nAre you sure you want to proceed?"
-$confirmResult = [System.Windows.Forms.MessageBox]::Show(
-    $msg,
-    "Step 2 of 2: Confirm Permanent VM Deletion",
-    [System.Windows.Forms.MessageBoxButtons]::YesNo,
-    [System.Windows.Forms.MessageBoxIcon]::Warning,
-    [System.Windows.Forms.MessageBoxDefaultButton]::Button2  # Defaults to 'No' for safety
-)
+# DataGridView Table (Shows VMName, ResourceGroupName, SubscriptionId)
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Location = New-Object System.Drawing.Point(15, 68)
+$grid.Size = New-Object System.Drawing.Size(715, 290)
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.RowHeadersVisible = $false
+$grid.AutoSizeColumnsMode = "Fill"
+$grid.SelectionMode = "FullRowSelect"
 
-if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) {
+$grid.Columns.Add("VMName", "VM Name") | Out-Null
+$grid.Columns.Add("ResourceGroup", "Resource Group") | Out-Null
+$grid.Columns.Add("SubscriptionId", "Subscription ID") | Out-Null
+
+foreach ($row in $vmList) {
+    # Supports either 'ResourceGroupName' or 'ResourceGroup' column header in CSV
+    $rgDisplay = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { "(Auto-Detect)" }
+    $grid.Rows.Add($row.VMName.Trim(), $rgDisplay, $row.SubscriptionId.Trim()) | Out-Null
+}
+$form.Controls.Add($grid)
+
+# Proceed / Delete Button
+$btnYes = New-Object System.Windows.Forms.Button
+$btnYes.Text = "Yes, Delete $($vmList.Count) VM(s)"
+$btnYes.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+$btnYes.BackColor = [System.Drawing.Color]::Firebrick
+$btnYes.ForeColor = [System.Drawing.Color]::White
+$btnYes.FlatStyle = "Flat"
+$btnYes.Location = New-Object System.Drawing.Point(450, 372)
+$btnYes.Size = New-Object System.Drawing.Size(165, 35)
+$btnYes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+$form.Controls.Add($btnYes)
+
+# Cancel Button (Default)
+$btnCancel = New-Object System.Windows.Forms.Button
+$btnCancel.Text = "Cancel"
+$btnCancel.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
+$btnCancel.Location = New-Object System.Drawing.Point(625, 372)
+$btnCancel.Size = New-Object System.Drawing.Size(105, 35)
+$btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.CancelButton = $btnCancel
+$form.Controls.Add($btnCancel)
+
+$dialogResult = $form.ShowDialog()
+$form.Dispose()
+
+if ($dialogResult -ne [System.Windows.Forms.DialogResult]::Yes) {
     Write-Host "Operation cancelled by user. No VMs were modified or deleted." -ForegroundColor Red
     return
 }
 
 # ===========================
-# 4. AZURE LOGIN
+# 3. AZURE LOGIN
 # ===========================
 $firstSubId = ($vmList | Select-Object -First 1).SubscriptionId.Trim()
 Write-Host "`nAuthenticating to Azure..." -ForegroundColor Cyan
@@ -56,27 +104,31 @@ Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
 Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
 
 # ===========================
-# 5. PROCESSING BY SUBSCRIPTION
+# 4. PROCESSING BY SUBSCRIPTION (BATCHED)
 # ===========================
 $groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
 
 $results = foreach ($subGroup in $groupedBySub) {
     $subId = $subGroup.Name
-    Write-Host "`nSwitching to Subscription: $subId" -ForegroundColor Magenta
     
-    try {
-        Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
-    } catch {
-        Write-Host "Failed to switch to Subscription $subId : $($_.Exception.Message)" -ForegroundColor Red
-        foreach ($row in $subGroup.Group) {
-            [PSCustomObject]@{
-                SubscriptionId = $subId
-                VMName         = $row.VMName.Trim()
-                ResourceGroup  = "N/A"
-                ActionTaken    = "Skipped (Subscription Access Error)"
+    if ((Get-AzContext).Subscription.Id -ne $subId) {
+        Write-Host "`nSwitching to Subscription: $subId" -ForegroundColor Magenta
+        try {
+            Set-AzContext -SubscriptionId $subId -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Host "Failed to switch to Subscription $subId : $($_.Exception.Message)" -ForegroundColor Red
+            foreach ($row in $subGroup.Group) {
+                [PSCustomObject]@{
+                    SubscriptionId = $subId
+                    VMName         = $row.VMName.Trim()
+                    ResourceGroup  = "N/A"
+                    ActionTaken    = "Skipped (Subscription Access Error)"
+                }
             }
+            continue
         }
-        continue
+    } else {
+        Write-Host "`nProcessing Subscription: $subId ($($subGroup.Count) VMs)" -ForegroundColor Magenta
     }
 
     Write-Host "Querying Azure VM inventory in subscription (please wait)..." -ForegroundColor DarkGray
@@ -84,7 +136,14 @@ $results = foreach ($subGroup in $groupedBySub) {
 
     foreach ($row in $subGroup.Group) {
         $vmName = $row.VMName.Trim()
-        $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
+        
+        # Match by both VMName and ResourceGroup if provided in CSV
+        $csvRg = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { $null }
+        if ($csvRg) {
+            $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName -and $_.ResourceGroupName -eq $csvRg }
+        } else {
+            $foundVm = $allVmsInSub | Where-Object { $_.Name -eq $vmName }
+        }
         
         Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
         Write-Host "VM: $vmName" -ForegroundColor Cyan
@@ -94,7 +153,7 @@ $results = foreach ($subGroup in $groupedBySub) {
             [PSCustomObject]@{ 
                 SubscriptionId = $subId
                 VMName         = $vmName
-                ResourceGroup  = "N/A"
+                ResourceGroup  = if ($csvRg) { $csvRg } else { "N/A" }
                 ActionTaken    = "Skipped (Not Found)" 
             }
             continue
@@ -143,7 +202,7 @@ $results = foreach ($subGroup in $groupedBySub) {
 Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
 
 # ===========================
-# 6. EXPORT REPORT & COMPLETION POPUP
+# 5. EXPORT REPORT & COMPLETION POPUP
 # ===========================
 $outputPath = "C:\Temp\VM_Deletion_Report.csv"
 if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
