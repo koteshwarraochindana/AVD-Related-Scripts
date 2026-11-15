@@ -1,19 +1,35 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ===========================
 # 1. DATA COLLECTION
 # ===========================
 $inputCsv = "\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\ManuallyDeleteAVD\VM_List.csv"
 
-# Wrap in @(...) so .Count always works accurately even for 1 VM
-$vmList = @(Import-Csv -Path $inputCsv | Where-Object { 
+Write-Host "Reading CSV file: $inputCsv" -ForegroundColor Cyan
+
+if (-not (Test-Path $inputCsv)) {
+    Write-Host "ERROR: CSV file not found at $inputCsv" -ForegroundColor Red
+    return
+}
+
+# Import CSV and clean any accidental spaces in column headers
+$rawCsv = Import-Csv -Path $inputCsv
+$vmList = @(foreach ($r in $rawCsv) {
+    $cleanObj = [ordered]@{}
+    foreach ($prop in $r.PSObject.Properties) {
+        $cleanObj[$prop.Name.Trim()] = if ($null -ne $prop.Value) { $prop.Value.Trim() } else { "" }
+    }
+    [PSCustomObject]$cleanObj
+} | Where-Object { 
     -not [string]::IsNullOrWhiteSpace($_.VMName) -and -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) 
 })
 
 if ($vmList.Count -eq 0) {
+    Write-Host "ERROR: No valid rows found. Ensure CSV headers are 'VMName' and 'SubscriptionId'." -ForegroundColor Red
     [System.Windows.Forms.MessageBox]::Show(
-        "No valid VM entries were found in:`n$inputCsv",
+        "No valid VM entries were found in:`n$inputCsv`n`nPlease verify the CSV is not empty and has 'VMName' and 'SubscriptionId' headers.",
         "CSV Empty or Invalid",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error
@@ -21,8 +37,10 @@ if ($vmList.Count -eq 0) {
     return
 }
 
+Write-Host "Loaded $($vmList.Count) VM(s) from CSV. Opening confirmation window..." -ForegroundColor Yellow
+
 # ===========================
-# 2. SINGLE CUSTOM CONFIRMATION POPUP (COUNT + FULL TABLE + BUTTONS)
+# 2. SINGLE CUSTOM CONFIRMATION POPUP
 # ===========================
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Confirm Permanent AVD VM Deletion"
@@ -32,8 +50,9 @@ $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
 $form.MinimizeBox = $false
 $form.TopMost = $true
+$form.Add_Shown({ $form.Activate() })
 
-# Top Summary Label (Total VM Count)
+# Top Summary Label
 $lblHeader = New-Object System.Windows.Forms.Label
 $lblHeader.Text = "Total VMs found in CSV for deletion: $($vmList.Count)`nReview the VM Name, Resource Group, and Subscription ID below before proceeding:"
 $lblHeader.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
@@ -42,7 +61,7 @@ $lblHeader.Location = New-Object System.Drawing.Point(15, 15)
 $lblHeader.Size = New-Object System.Drawing.Size(710, 45)
 $form.Controls.Add($lblHeader)
 
-# DataGridView Table (Shows VMName, ResourceGroup, SubscriptionId)
+# DataGridView Table
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Location = New-Object System.Drawing.Point(15, 68)
 $grid.Size = New-Object System.Drawing.Size(715, 290)
@@ -58,8 +77,8 @@ $grid.Columns.Add("ResourceGroup", "Resource Group") | Out-Null
 $grid.Columns.Add("SubscriptionId", "Subscription ID") | Out-Null
 
 foreach ($row in $vmList) {
-    $rgDisplay = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { "(Auto-Detect)" }
-    $grid.Rows.Add($row.VMName.Trim(), $rgDisplay, $row.SubscriptionId.Trim()) | Out-Null
+    $rgDisplay = if ($row.ResourceGroupName) { $row.ResourceGroupName } elseif ($row.ResourceGroup) { $row.ResourceGroup } else { "(Auto-Detect)" }
+    $grid.Rows.Add($row.VMName, $rgDisplay, $row.SubscriptionId) | Out-Null
 }
 $form.Controls.Add($grid)
 
@@ -75,7 +94,7 @@ $btnYes.Size = New-Object System.Drawing.Size(165, 35)
 $btnYes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
 $form.Controls.Add($btnYes)
 
-# Cancel Button (Default)
+# Cancel Button
 $btnCancel = New-Object System.Windows.Forms.Button
 $btnCancel.Text = "Cancel"
 $btnCancel.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
@@ -96,7 +115,7 @@ if ($dialogResult -ne [System.Windows.Forms.DialogResult]::Yes) {
 # ===========================
 # 3. AZURE LOGIN
 # ===========================
-$firstSubId = ($vmList | Select-Object -First 1).SubscriptionId.Trim()
+$firstSubId = ($vmList | Select-Object -First 1).SubscriptionId
 Write-Host "`nAuthenticating to Azure..." -ForegroundColor Cyan
 Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
 
@@ -105,7 +124,7 @@ Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -Foreg
 # ===========================
 # 4. PROCESSING BY SUBSCRIPTION (FAST DIRECT LOOKUP)
 # ===========================
-$groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
+$groupedBySub = $vmList | Group-Object -Property SubscriptionId
 
 $results = foreach ($subGroup in $groupedBySub) {
     $subId = $subGroup.Name
@@ -119,7 +138,7 @@ $results = foreach ($subGroup in $groupedBySub) {
             foreach ($row in $subGroup.Group) {
                 [PSCustomObject]@{
                     SubscriptionId = $subId
-                    VMName         = $row.VMName.Trim()
+                    VMName         = $row.VMName
                     ResourceGroup  = "N/A"
                     ActionTaken    = "Skipped (Subscription Access Error)"
                 }
@@ -131,14 +150,14 @@ $results = foreach ($subGroup in $groupedBySub) {
     }
 
     foreach ($row in $subGroup.Group) {
-        $vmName = $row.VMName.Trim()
-        $csvRg = if ($row.ResourceGroupName) { $row.ResourceGroupName.Trim() } elseif ($row.ResourceGroup) { $row.ResourceGroup.Trim() } else { $null }
+        $vmName = $row.VMName
+        $csvRg = if ($row.ResourceGroupName) { $row.ResourceGroupName } elseif ($row.ResourceGroup) { $row.ResourceGroup } else { $null }
         
         $rgLabel = if ($csvRg) { " | RG: $csvRg" } else { "" }
         Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
         Write-Host "VM: $vmName$rgLabel" -ForegroundColor Cyan
 
-        # Query ONLY this exact VM directly instead of downloading the entire subscription's VM list
+        # Query ONLY this exact VM directly
         if ($csvRg) {
             $foundVm = Get-AzVM -ResourceGroupName $csvRg -Name $vmName -ErrorAction SilentlyContinue
         } else {
