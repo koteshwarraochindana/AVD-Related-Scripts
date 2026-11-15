@@ -172,21 +172,21 @@ $results = foreach ($subGroup in $groupedBySub) {
             $osDiskId = $foundVm.StorageProfile.OsDisk.ManagedDisk.Id
             $nicIds = $foundVm.NetworkProfile.NetworkInterfaces.Id
 
-            # 1. Delete VM
-            Remove-AzVM -ResourceGroupName $rg -Name $vmName -Force -ErrorAction Stop
+            # 1. Delete VM (Out-Null prevents OperationId objects from polluting the CSV report)
+            Remove-AzVM -ResourceGroupName $rg -Name $vmName -Force -ErrorAction Stop | Out-Null
             Write-Host "VM - $vmName - [DELETED]" -ForegroundColor Yellow
 
             # 2. Delete NICs
             foreach ($nicId in $nicIds) {
                 $nicName = $nicId.Split('/')[-1]
-                Remove-AzResource -ResourceId $nicId -Force -ErrorAction SilentlyContinue
+                Remove-AzResource -ResourceId $nicId -Force -ErrorAction SilentlyContinue | Out-Null
                 Write-Host "NIC - $nicName - [DELETED]" -ForegroundColor Yellow
             }
 
             # 3. Delete OS Disk
             if ($osDiskId) {
                 $diskName = $osDiskId.Split('/')[-1]
-                Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue
+                Remove-AzResource -ResourceId $osDiskId -Force -ErrorAction SilentlyContinue | Out-Null
                 Write-Host "Disk - $diskName - [DELETED]" -ForegroundColor Yellow
             }
 
