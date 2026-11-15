@@ -1,41 +1,62 @@
+Add-Type -AssemblyName System.Windows.Forms
+
 # ===========================
-# DATA COLLECTION & CONFIRMATION
+# 1. DATA COLLECTION
 # ===========================
 $inputCsv = "\\smb.waunas23f.hcscint.net\infrastructure\MSP_VTT\AVD-Related-Scripts\ManuallyDeleteAVD\VM_List.csv"
 
-# Wrap in @(...) so .Count always works accurately even if there is only 1 VM in the CSV
+# Wrap in @(...) so .Count always works accurately even for 1 VM
 $vmList = @(Import-Csv -Path $inputCsv | Where-Object { 
     -not [string]::IsNullOrWhiteSpace($_.VMName) -and -not [string]::IsNullOrWhiteSpace($_.SubscriptionId) 
 })
 
 if ($vmList.Count -eq 0) {
-    Write-Host "No valid VM entries found in $inputCsv. Exiting." -ForegroundColor Red
+    [System.Windows.Forms.MessageBox]::Show(
+        "No valid VM entries were found in:`n$inputCsv",
+        "CSV Empty or Invalid",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error
+    ) | Out-Null
     return
 }
 
-# Show only the total count from the CSV
-Write-Host "`n===================================================" -ForegroundColor Yellow
-Write-Host "Total VMs found in CSV for deletion: $($vmList.Count)" -ForegroundColor Cyan
-Write-Host "===================================================" -ForegroundColor Yellow
+# Prepare clean preview list
+$previewList = $vmList | Select-Object @{Name='VMName';Expression={$_.VMName.Trim()}}, @{Name='SubscriptionId';Expression={$_.SubscriptionId.Trim()}}
 
-# Mandatory Confirmation Gate
-$confirm = Read-Host "`nType YES to proceed with deletion, or press Enter to cancel"
-if ($confirm -ne "YES") {
+# ===========================
+# 2. POPUP STEP 1: VALIDATE VM LIST
+# ===========================
+# Opens a native Windows table showing all VMs from the CSV; pauses until the user clicks OK or closes the window
+$previewList | Out-GridView -Title "Step 1 of 2: Review Target VMs ($($vmList.Count) Total) - Click OK to Continue" -Wait
+
+# ===========================
+# 3. POPUP STEP 2: YES / NO CONFIRMATION
+# ===========================
+$msg = "You are about to permanently delete $($vmList.Count) Virtual Machine(s) along with their attached NICs and OS Disks.`n`nAre you sure you want to proceed?"
+$confirmResult = [System.Windows.Forms.MessageBox]::Show(
+    $msg,
+    "Step 2 of 2: Confirm Permanent VM Deletion",
+    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+    [System.Windows.Forms.MessageBoxIcon]::Warning,
+    [System.Windows.Forms.MessageBoxDefaultButton]::Button2  # Defaults to 'No' for safety
+)
+
+if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) {
     Write-Host "Operation cancelled by user. No VMs were modified or deleted." -ForegroundColor Red
     return
 }
 
 # ===========================
-# AZURE LOGIN
+# 4. AZURE LOGIN
 # ===========================
-$firstSubId = $vmList[0].SubscriptionId.Trim()
+$firstSubId = ($vmList | Select-Object -First 1).SubscriptionId.Trim()
 Write-Host "`nAuthenticating to Azure..." -ForegroundColor Cyan
 Connect-AzAccount -Subscription $firstSubId -ErrorAction Stop | Out-Null
 
 Write-Host "`n--- Starting Deletion Process for $($vmList.Count) VMs ---" -ForegroundColor White
 
 # ===========================
-# PROCESSING BY SUBSCRIPTION
+# 5. PROCESSING BY SUBSCRIPTION
 # ===========================
 $groupedBySub = $vmList | Group-Object -Property { $_.SubscriptionId.Trim() }
 
@@ -58,7 +79,7 @@ $results = foreach ($subGroup in $groupedBySub) {
         continue
     }
 
-    # Get all VMs in this subscription once for speed
+    Write-Host "Querying Azure VM inventory in subscription (please wait)..." -ForegroundColor DarkGray
     $allVmsInSub = Get-AzVM 
 
     foreach ($row in $subGroup.Group) {
@@ -83,7 +104,6 @@ $results = foreach ($subGroup in $groupedBySub) {
         $actionStatus = "Success"
 
         try {
-            # Capture IDs before VM is gone
             $osDiskId = $foundVm.StorageProfile.OsDisk.ManagedDisk.Id
             $nicIds = $foundVm.NetworkProfile.NetworkInterfaces.Id
 
@@ -123,10 +143,17 @@ $results = foreach ($subGroup in $groupedBySub) {
 Write-Host "`n--------------------------------------------------" -ForegroundColor Gray
 
 # ===========================
-# EXPORT REPORT
+# 6. EXPORT REPORT & COMPLETION POPUP
 # ===========================
 $outputPath = "C:\Temp\VM_Deletion_Report.csv"
 if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
 
 $results | Export-Csv -Path $outputPath -NoTypeInformation -Force
 Write-Host "`nProcess Complete. Summary exported to $outputPath" -ForegroundColor Green
+
+[System.Windows.Forms.MessageBox]::Show(
+    "Deletion process complete for $($vmList.Count) VM(s).`n`nReport saved to:`n$outputPath",
+    "AVD Cleanup Complete",
+    [System.Windows.Forms.MessageBoxButtons]::OK,
+    [System.Windows.Forms.MessageBoxIcon]::Information
+) | Out-Null
