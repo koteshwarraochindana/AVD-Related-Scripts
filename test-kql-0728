@@ -1,86 +1,18 @@
-Import-Module ActiveDirectory
-Import-Module ImportExcel
+$agent = Get-Service -Name WindowsAzureGuestAgent `
+    -ErrorAction SilentlyContinue
 
-# Configuration Paths
-$userFile = "C:\temp\users.txt"
-$excelPath = "C:\temp\status.xlsx"
-$domains = @("adhcscint.net", "prd.hcscad.net")
+if ($agent) {
 
-# Verify input file exists
-if (-not (Test-Path $userFile)) {
-    Write-Error "Input file not found at $userFile"
-    return
+    Write-Host "Current Agent Status: $($agent.Status)"
+
+    Restart-Service -Name WindowsAzureGuestAgent `
+        -Force
+
+    Start-Sleep -Seconds 10
+
+    Get-Service -Name WindowsAzureGuestAgent |
+        Select-Object Name, Status
 }
-
-$users = Get-Content $userFile | Where-Object { $_ -match '\S' } # Remove empty lines
-$results = @()
-
-foreach ($user in $users) {
-    $bestMatch = $null
-    $matchedDomain = "N/A"
-
-    # Scan all domains for the current user
-    foreach ($domain in $domains) {
-        try {
-            $found = Get-ADUser `
-                -Server $domain `
-                -Filter "SamAccountName -eq '$user' -or UserPrincipalName -eq '$user' -or mail -eq '$user'" `
-                -Properties Enabled, LastLogonDate, DistinguishedName, UserPrincipalName, Mail `
-                -ErrorAction Stop
-
-            if ($null -ne $found) {
-
-                # Prioritize Enabled account if found in another domain
-                if ($null -eq $bestMatch -or (-not $bestMatch.Enabled -and $found.Enabled)) {
-                    $bestMatch = $found
-                    $matchedDomain = $domain
-                }
-            }
-        }
-        catch {
-            # Skip unavailable domains and continue processing
-        }
-    }
-
-    # Output one row per input value
-    if ($null -ne $bestMatch) {
-        $results += [PSCustomObject]@{
-            "Search Input"        = $user
-            "SAM Account Name"    = $bestMatch.SamAccountName
-            "User Principal Name" = $bestMatch.UserPrincipalName
-            "Email Address"       = $bestMatch.Mail
-            "Target Domain"       = $matchedDomain
-            "AD Status"           = if ($bestMatch.Enabled) { "Enabled" } else { "Disabled" }
-            "Last Logon Date"     = if ($bestMatch.LastLogonDate) { $bestMatch.LastLogonDate } else { "Never Logged On" }
-            "Distinguished Name"  = $bestMatch.DistinguishedName
-        }
-    }
-    else {
-        $results += [PSCustomObject]@{
-            "Search Input"        = $user
-            "SAM Account Name"    = "N/A"
-            "User Principal Name" = "N/A"
-            "Email Address"       = "N/A"
-            "Target Domain"       = "Not Found"
-            "AD Status"           = "Absent"
-            "Last Logon Date"     = "N/A"
-            "Distinguished Name"  = "N/A"
-        }
-    }
+else {
+    Write-Host "Azure VM Agent service not found."
 }
-
-# Remove existing report
-if (Test-Path $excelPath) {
-    Remove-Item $excelPath -Force
-}
-
-# Export report
-$results | Export-Excel `
-    -Path $excelPath `
-    -WorksheetName "AD Status Report" `
-    -AutoSize `
-    -FreezeTopRow `
-    -BoldTopRow `
-    -AutoFilter
-
-Write-Host "Process completed successfully. $($results.Count) records saved to $excelPath" -ForegroundColor Green
