@@ -1,18 +1,13 @@
-$agent = Get-Service -Name WindowsAzureGuestAgent `
-    -ErrorAction SilentlyContinue
+Get-WinEvent -LogName System | 
+Where-Object { 
+    $_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient" -and 
+    $_.Id -eq 20 
+} | 
+Select-Object TimeCreated, Message | 
+Format-List
 
-if ($agent) {
+-----------------------------
 
-    Write-Host "Current Agent Status: $($agent.Status)"
-
-    Restart-Service -Name WindowsAzureGuestAgent `
-        -Force
-
-    Start-Sleep -Seconds 10
-
-    Get-Service -Name WindowsAzureGuestAgent |
-        Select-Object Name, Status
-}
-else {
-    Write-Host "Azure VM Agent service not found."
-}
+Get-WinEvent -LogName System | 
+Where-Object {$_.ProviderName -eq "Microsoft-Windows-WindowsUpdateClient"} | 
+Select-Object TimeCreated, Id, LevelDisplayName, Message -First 5 
