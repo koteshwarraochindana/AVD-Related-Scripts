@@ -1,182 +1,68 @@
-#Requires -Version 5.1
-#Requires -Modules Az.Accounts, Az.Compute
+Dispatching cleanup script to all VMs...
 
-[CmdletBinding()]
-param(
-    [switch]$CleanUpRunCommand
-)
+======================================================
+   DISPATCH SUMMARY
+======================================================
+Total VMs    : 53
+Dispatched   : 0
+Failed       : 53
+Elapsed Time : 211.4 seconds
 
-# ======================== CONFIGURATION ========================
-$CsvPath        = "C:\Temp\Ghost\CleanUp\avd_hosts_cleanup.csv"
-$RunCommandName = "GhostedNICCleanup"
-$MaxThreads     = 50
+FAILED DISPATCHES
 
-$ErrorActionPreference = "Stop"
-
-if (!(Test-Path -LiteralPath $CsvPath)) { throw "CSV file not found: $CsvPath" }
-
-$VMList = @(
-    Import-Csv -LiteralPath $CsvPath |
-    Where-Object {
-        ![string]::IsNullOrWhiteSpace($_.VMName) -and
-        ![string]::IsNullOrWhiteSpace($_.ResourceGroupName) -and
-        ![string]::IsNullOrWhiteSpace($_.SubscriptionId)
-    } |
-    ForEach-Object {
-        [PSCustomObject]@{
-            VMName            = $_.VMName.Trim()
-            ResourceGroupName = $_.ResourceGroupName.Trim()
-            SubscriptionId    = $_.SubscriptionId.Trim()
-        }
-    } |
-    Group-Object { "$($_.SubscriptionId.ToLower())|$($_.ResourceGroupName.ToLower())|$($_.VMName.ToLower())" } |
-    ForEach-Object { $_.Group[0] }
-)
-
-if (-not (Get-AzContext)) {
-    Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop | Out-Null
-}
-
-$SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-$SessionState.ImportPSModule(@("Az.Accounts", "Az.Compute"))
-
-$Pool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads, $SessionState, $Host)
-$Pool.Open()
-
-$CheckWorker = {
-    param($VMName, $ResourceGroupName, $SubscriptionId, $CmdName, $RemoveAfter)
-    try {
-        Set-AzContext -SubscriptionId $SubscriptionId -Scope Process -ErrorAction Stop | Out-Null
-
-        $Cmd = Get-AzVMRunCommand `
-            -ResourceGroupName $ResourceGroupName `
-            -VMName $VMName `
-            -RunCommandName $CmdName `
-            -Expand InstanceView `
-            -ErrorAction Stop
-
-        $State  = $Cmd.InstanceView.ExecutionState
-        $Output = $Cmd.InstanceView.Output
-        $Marker = [regex]::Match($Output, '(?m)GHOSTED_NIC_CLEANUP\|Done\|[^\r\n]+')
-
-        if ($Marker.Success) {
-            $P = $Marker.Value -split '\|'
-            if ($RemoveAfter -and $State -eq "Succeeded") {
-                Remove-AzVMRunCommand -ResourceGroupName $ResourceGroupName -VMName $VMName -RunCommandName $CmdName -ErrorAction SilentlyContinue | Out-Null
-            }
-
-            [PSCustomObject]@{
-                VMName         = $VMName
-                ExecutionState = $State
-                GhostedBefore  = [int]$P[3]
-                GhostedAfter   = [int]$P[4]
-                AdaptersBefore = [int]$P[5]
-                AdaptersAfter  = [int]$P[6]
-                RegGhostsFound = [int]$P[7]
-                Error          = ""
-            }
-        } else {
-            [PSCustomObject]@{
-                VMName         = $VMName
-                ExecutionState = $State
-                GhostedBefore  = $null
-                GhostedAfter   = $null
-                AdaptersBefore = $null
-                AdaptersAfter  = $null
-                RegGhostsFound = $null
-                Error          = if ($State -eq "Running") { "Still running on VM" } else { $Cmd.InstanceView.Error }
-            }
-        }
-    } catch {
-        [PSCustomObject]@{
-            VMName         = $VMName
-            ExecutionState = "CheckFailed"
-            GhostedBefore  = $null
-            GhostedAfter   = $null
-            AdaptersBefore = $null
-            AdaptersAfter  = $null
-            RegGhostsFound = $null
-            Error          = $_.Exception.Message
-        }
-    }
-}
-
-$Jobs = New-Object System.Collections.Generic.List[object]
-
-foreach ($VM in $VMList) {
-    $PS = [powershell]::Create()
-    $PS.RunspacePool = $Pool
-    [void]$PS.AddScript($CheckWorker)
-    [void]$PS.AddArgument($VM.VMName)
-    [void]$PS.AddArgument($VM.ResourceGroupName)
-    [void]$PS.AddArgument($VM.SubscriptionId)
-    [void]$PS.AddArgument($RunCommandName)
-    [void]$PS.AddArgument($CleanUpRunCommand.IsPresent)
-
-    $Jobs.Add([PSCustomObject]@{
-        VM     = $VM
-        Pipe   = $PS
-        Handle = $PS.BeginInvoke()
-    })
-}
-
-$Report = New-Object System.Collections.Generic.List[object]
-$TotalCount = $Jobs.Count
-
-while ($Jobs.Count -gt 0) {
-    $Completed = @($Jobs | Where-Object { $_.Handle.IsCompleted })
-    foreach ($Item in $Completed) {
-        try {
-            $Output = $Item.Pipe.EndInvoke($Item.Handle)
-            foreach ($Row in $Output) { $Report.Add($Row) }
-        } catch {
-            $Report.Add([PSCustomObject]@{
-                VMName         = $Item.VM.VMName
-                ExecutionState = "CheckFailed"
-                GhostedBefore  = $null
-                GhostedAfter   = $null
-                AdaptersBefore = $null
-                AdaptersAfter  = $null
-                RegGhostsFound = $null
-                Error          = $_.Exception.Message
-            })
-        } finally {
-            $Item.Pipe.Dispose()
-            [void]$Jobs.Remove($Item)
-        }
-    }
-
-    $DoneCount = $TotalCount - $Jobs.Count
-    $Percent = if ($TotalCount -gt 0) { [int](100 * $DoneCount / $TotalCount) } else { 100 }
-    Write-Progress -Activity "Checking Ghosted NIC Cleanup Results" `
-        -Status ("Checked {0}/{1}" -f $DoneCount, $TotalCount) `
-        -PercentComplete $Percent
-
-    if ($Jobs.Count -gt 0) { Start-Sleep -Milliseconds 200 }
-}
-
-Write-Progress -Activity "Checking Ghosted NIC Cleanup Results" -Completed
-$Pool.Close()
-$Pool.Dispose()
-
-# ======================== CONSOLE OUTPUT ========================
-$Succeeded = @($Report | Where-Object { $_.ExecutionState -eq "Succeeded" })
-$Running   = @($Report | Where-Object { $_.ExecutionState -eq "Running" })
-$Failed    = @($Report | Where-Object { $_.ExecutionState -notin @("Succeeded", "Running") })
-
-Write-Host ""
-Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "   GHOSTED NIC CLEANUP STATUS"                         -ForegroundColor Cyan
-Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host ("Total VMs : {0}" -f $TotalCount)
-Write-Host ("Succeeded : {0}" -f $Succeeded.Count) -ForegroundColor Green
-Write-Host ("Running   : {0}" -f $Running.Count)   -ForegroundColor Yellow
-Write-Host ("Failed    : {0}" -f $Failed.Count)    -ForegroundColor Red
-Write-Host ""
-
-$Report | Sort-Object VMName | Select-Object VMName, ExecutionState, GhostedBefore, GhostedAfter, AdaptersBefore, AdaptersAfter, RegGhostsFound | Format-Table -AutoSize
-
-if ($Failed.Count -gt 0) {
-    Write-Host "FAILED / INCOMPLETE VMS" -ForegroundColor Red
-    $Failed | Sort-Object VMName | Select-Object VMName, ExecutionState, Error | Format-Table -AutoSize -Wrap
-}
+VMName         ResourceGroupName Error                                                                                                                                   
+------         ----------------- -----                                                                                                                                   
+MS-E2-GEN-0003 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0015 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0025 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0044 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0045 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0068 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0082 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0088 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0090 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0110 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0129 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0130 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0150 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0157 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0182 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0196 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0197 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
+MS-E2-GEN-0202 General           [RequestDisallowedByPolicy] : Resource 'GhostedNICCleanup' was disallowed by policy. Reasons: 'Mandatory tags must be applied to        
+                                 Resources and Resource Groups.','Mandatory tags must be applied to Resources and Resource Groups.'. See error details for policy        
+                                 resource IDs.                                                                                                                           
