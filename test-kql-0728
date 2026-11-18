@@ -1,25 +1,205 @@
-Dispatching cleanup script to all VMs...
+#Requires -Version 5.1
+#Requires -Modules Az.Accounts, Az.Compute
 
-======================================================
-   DISPATCH SUMMARY
-======================================================
-Total VMs    : 53
-Dispatched   : 0
-Failed       : 53
-Elapsed Time : 26 seconds
+[CmdletBinding()]
+param(
+    [string]$OnlyVM = "",
+    [switch]$Force
+)
 
-FAILED DISPATCHES
+# ======================== CONFIGURATION ========================
+$CsvPath           = "C:\Temp\Ghost\CleanUp\avd_hosts_cleanup.csv"
+$CleanupScriptPath = "C:\Temp\Ghost\CleanUp\Windows_GhostedNIC_Removal.ps1"
+$MaxThreads        = 50
 
-VMName         ResourceGroupName Error                                                            
-------         ----------------- -----                                                            
-MS-E2-GEN-0003 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0015 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0025 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0044 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0045 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0068 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0082 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0088 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0090 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0110 General           A parameter cannot be found that matches parameter name 'NoWait'.
-MS-E2-GEN-0129 General           A parameter cannot be found that matches parameter name 'NoWait'.
+$ErrorActionPreference = "Stop"
+
+Write-Host ""
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "   FAST GHOSTED NIC CLEANUP DISPATCHER (-AsJob)"        -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+
+# ======================== VALIDATE INPUT ========================
+if (!(Test-Path -LiteralPath $CsvPath)) { throw "CSV file not found: $CsvPath" }
+if (!(Test-Path -LiteralPath $CleanupScriptPath)) { throw "Microsoft script not found: $CleanupScriptPath" }
+
+$RawCsv = @(Import-Csv -LiteralPath $CsvPath)
+if ($RawCsv.Count -eq 0) { throw "CSV contains no VM records." }
+
+$CsvColumns = $RawCsv[0].PSObject.Properties.Name
+foreach ($Column in @("VMName", "ResourceGroupName", "SubscriptionId")) {
+    if ($Column -notin $CsvColumns) {
+        throw "Missing required CSV column: $Column"
+    }
+}
+
+$VMList = @(
+    $RawCsv |
+    Where-Object {
+        ![string]::IsNullOrWhiteSpace($_.VMName) -and
+        ![string]::IsNullOrWhiteSpace($_.ResourceGroupName) -and
+        ![string]::IsNullOrWhiteSpace($_.SubscriptionId)
+    } |
+    ForEach-Object {
+        [PSCustomObject]@{
+            VMName            = $_.VMName.Trim()
+            ResourceGroupName = $_.ResourceGroupName.Trim()
+            SubscriptionId    = $_.SubscriptionId.Trim()
+        }
+    } |
+    Group-Object { "$($_.SubscriptionId.ToLower())|$($_.ResourceGroupName.ToLower())|$($_.VMName.ToLower())" } |
+    ForEach-Object { $_.Group[0] }
+)
+
+if (![string]::IsNullOrWhiteSpace($OnlyVM)) {
+    $VMList = @($VMList | Where-Object { $_.VMName -eq $OnlyVM.Trim() })
+    if ($VMList.Count -eq 0) { throw "VM '$OnlyVM' not found in CSV." }
+}
+
+Write-Host ("Total VMs       : {0}" -f $VMList.Count)
+Write-Host ("Parallel threads: {0}" -f $MaxThreads)
+Write-Host ""
+
+# ======================== CONFIRMATION ========================
+if (!$Force) {
+    Write-Host "This dispatches Windows_GhostedNIC_Removal.ps1 to all target VMs in the background." -ForegroundColor Yellow
+    $Answer = Read-Host "Type YES to continue"
+    if ($Answer -cne "YES") {
+        Write-Host "Cancelled. No changes made." -ForegroundColor Green
+        return
+    }
+}
+
+# ======================== AZURE AUTHENTICATION ========================
+Write-Host "Starting Azure device-code authentication..." -ForegroundColor Cyan
+$Login = Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop
+if (!$Login) { throw "Connect-AzAccount did not return an authenticated context." }
+
+$Context = Get-AzContext
+if (!$Context) { throw "Get-AzContext returned no context." }
+Write-Host ("Authenticated   : {0}" -f $Context.Account.Id) -ForegroundColor Green
+
+# ======================== RUNSPACE POOL EXECUTION ========================
+$SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$SessionState.ImportPSModule(@("Az.Accounts", "Az.Compute"))
+
+$Pool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads, $SessionState, $Host)
+$Pool.Open()
+
+$WorkerScript = {
+    param($VMName, $ResourceGroupName, $SubscriptionId, $ScriptPath)
+    try {
+        Set-AzContext -SubscriptionId $SubscriptionId -Scope Process -ErrorAction Stop | Out-Null
+
+        # -AsJob triggers the Azure Run Command HTTP POST immediately without waiting for completion
+        $AzJob = Invoke-AzVMRunCommand `
+            -ResourceGroupName $ResourceGroupName `
+            -VMName $VMName `
+            -CommandId "RunPowerShellScript" `
+            -ScriptPath $ScriptPath `
+            -AsJob `
+            -ErrorAction Stop
+
+        # Brief pause to catch immediate HTTP errors (e.g., VM deallocated, not found, or conflict)
+        Start-Sleep -Seconds 2
+        if ($AzJob.State -eq "Failed") {
+            $ErrDetail = ($AzJob.ChildJobs[0].JobStateInfo.Reason.Message)
+            if ([string]::IsNullOrWhiteSpace($ErrDetail)) { $ErrDetail = "Azure rejected the Run Command request." }
+            throw $ErrDetail
+        }
+
+        [PSCustomObject]@{
+            VMName            = $VMName
+            ResourceGroupName = $ResourceGroupName
+            SubscriptionId    = $SubscriptionId
+            Status            = "Dispatched"
+            Error             = ""
+        }
+    } catch {
+        [PSCustomObject]@{
+            VMName            = $VMName
+            ResourceGroupName = $ResourceGroupName
+            SubscriptionId    = $SubscriptionId
+            Status            = "Failed"
+            Error             = $_.Exception.Message
+        }
+    }
+}
+
+$Jobs = New-Object System.Collections.Generic.List[object]
+$Watch = [System.Diagnostics.Stopwatch]::StartNew()
+
+Write-Host ""
+Write-Host "Dispatching cleanup script to all VMs..." -ForegroundColor Cyan
+
+foreach ($VM in $VMList) {
+    $PS = [powershell]::Create()
+    $PS.RunspacePool = $Pool
+    [void]$PS.AddScript($WorkerScript)
+    [void]$PS.AddArgument($VM.VMName)
+    [void]$PS.AddArgument($VM.ResourceGroupName)
+    [void]$PS.AddArgument($VM.SubscriptionId)
+    [void]$PS.AddArgument($CleanupScriptPath)
+
+    $Jobs.Add([PSCustomObject]@{
+        VM     = $VM
+        Pipe   = $PS
+        Handle = $PS.BeginInvoke()
+    })
+}
+
+$AllResults = New-Object System.Collections.Generic.List[object]
+$TotalCount = $Jobs.Count
+
+while ($Jobs.Count -gt 0) {
+    $Completed = @($Jobs | Where-Object { $_.Handle.IsCompleted })
+    foreach ($Item in $Completed) {
+        try {
+            $Output = $Item.Pipe.EndInvoke($Item.Handle)
+            foreach ($Row in $Output) { $AllResults.Add($Row) }
+        } catch {
+            $AllResults.Add([PSCustomObject]@{
+                VMName            = $Item.VM.VMName
+                ResourceGroupName = $Item.VM.ResourceGroupName
+                SubscriptionId    = $Item.VM.SubscriptionId
+                Status            = "Failed"
+                Error             = $_.Exception.Message
+            })
+        } finally {
+            $Item.Pipe.Dispose()
+            [void]$Jobs.Remove($Item)
+        }
+    }
+
+    $DoneCount = $TotalCount - $Jobs.Count
+    $Percent = if ($TotalCount -gt 0) { [int](100 * $DoneCount / $TotalCount) } else { 100 }
+    Write-Progress -Activity "Dispatching Ghosted NIC Cleanup" `
+        -Status ("Dispatched {0}/{1} | Remaining {2}" -f $DoneCount, $TotalCount, $Jobs.Count) `
+        -PercentComplete $Percent
+
+    if ($Jobs.Count -gt 0) { Start-Sleep -Milliseconds 200 }
+}
+
+Write-Progress -Activity "Dispatching Ghosted NIC Cleanup" -Completed
+$Pool.Close()
+$Pool.Dispose()
+$Watch.Stop()
+
+# ======================== CONSOLE SUMMARY ========================
+$Dispatched = @($AllResults | Where-Object { $_.Status -eq "Dispatched" })
+$Failed     = @($AllResults | Where-Object { $_.Status -eq "Failed" })
+
+Write-Host ""
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host "   DISPATCH SUMMARY"                                   -ForegroundColor Cyan
+Write-Host "======================================================" -ForegroundColor Cyan
+Write-Host ("Total VMs    : {0}" -f $TotalCount)
+Write-Host ("Dispatched   : {0}" -f $Dispatched.Count) -ForegroundColor Green
+Write-Host ("Failed       : {0}" -f $Failed.Count)     -ForegroundColor Red
+Write-Host ("Elapsed Time : {0} seconds" -f [math]::Round($Watch.Elapsed.TotalSeconds, 1))
+Write-Host ""
+
+if ($Failed.Count -gt 0) {
+    Write-Host "FAILED DISPATCHES" -ForegroundColor Red
+    $Failed | Sort-Object VMName | Select-Object VMName, ResourceGroupName, Error | Format-Table -AutoSize -Wrap
+}
