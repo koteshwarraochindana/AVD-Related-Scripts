@@ -6,23 +6,20 @@
     Parallel ghosted network adapter cleanup using Azure VM Run Command.
 
 .DESCRIPTION
-    1. Inventories all VMs in the input CSV.
-    2. Immediately launches cleanup jobs for VMs already running.
-    3. Starts stopped/deallocated VMs while running-VM cleanup jobs continue.
-    4. After all successful start requests finish, waits 5 minutes.
-    5. Launches cleanup for successfully started VMs and VMs already starting.
-    6. Waits for all cleanup jobs and exports one consolidated CSV.
+    Skips VM power-state inventory and invokes Azure VM Run Command directly
+    against every VM in the input CSV, using parallel PowerShell jobs.
+    This version does not start or stop VMs and assumes all target VMs are running.
 
 .NOTES
     PowerShell 5.1 compatible.
     Uses Start-Job; each worker imports the saved Az context.
+    Power state is not queried; Run Command is invoked directly.
     Run initially against a small test CSV.
 #>
 
 [CmdletBinding()]
 param(
     [string]$OnlyVM = "",
-    [switch]$RestorePowerState,
     [switch]$Force
 )
 
@@ -33,9 +30,6 @@ $CleanupScriptPath = "C:\Temp\Ghost\Windows_GhostedNIC_Removal.ps1"
 $OutputPath        = "C:\Temp\Ghost\Remove-nics\GhostedNIC_Cleanup_Results.csv"
 
 $MaxParallelJobs   = 20
-$BootWaitSeconds   = 30
-$AgentTimeoutMin   = 10
-$AgentPollSeconds  = 15
 
 $ErrorActionPreference = "Stop"
 
@@ -93,21 +87,14 @@ if (![string]::IsNullOrWhiteSpace($OnlyVM)) {
 
 Write-Host "Total VMs      : $($VMList.Count)"
 Write-Host "Parallel limit : $MaxParallelJobs"
-Write-Host "Boot wait      : $BootWaitSeconds seconds"
 Write-Host ""
 
 # ======================== CONFIRMATION ========================
 
 if (!$Force) {
     Write-Host "WARNING: The Microsoft cleanup script may remove ALL non-present devices, not only NICs." -ForegroundColor Yellow
-    Write-Host "Stopped/deallocated VMs will be started. Azure compute charges may apply." -ForegroundColor Yellow
-
-    if ($RestorePowerState) {
-        Write-Host "Successfully cleaned VMs started by this script will be deallocated afterward." -ForegroundColor Yellow
-    }
-    else {
-        Write-Host "VMs started by this script will remain running." -ForegroundColor Yellow
-    }
+    Write-Host "This script assumes every VM in the CSV is already running." -ForegroundColor Yellow
+    Write-Host "No VM power-state checks, starts, or stops will be performed." -ForegroundColor Yellow
 
     $Answer = Read-Host "Type YES to continue"
     if ($Answer -cne "YES") {
@@ -302,76 +289,6 @@ function Wait-QueueGroup {
     }
 }
 
-# ======================== INVENTORY WORKER ========================
-
-$InventoryWorker = {
-    param($VM, $ContextFile, $UnusedScript, $UnusedRestore)
-
-    try {
-        Import-Module Az.Accounts -ErrorAction Stop
-        Import-Module Az.Compute -ErrorAction Stop
-        Import-AzContext -Path $ContextFile -ErrorAction Stop | Out-Null
-
-        Set-AzContext -SubscriptionId $VM.SubscriptionId -ErrorAction Stop | Out-Null
-
-        $S = Get-AzVM `
-            -ResourceGroupName $VM.ResourceGroupName `
-            -Name $VM.VMName `
-            -Status `
-            -ErrorAction Stop
-
-        $Code = ($S.Statuses |
-            Where-Object { $_.Code -like "PowerState/*" } |
-            Select-Object -First 1).Code
-
-        $Power = if ($Code) { $Code -replace '^PowerState/', '' } else { "unknown" }
-
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = $Power
-            ResultStatus      = "Success"
-            Error             = ""
-        }
-    }
-    catch {
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = "Unknown"
-            ResultStatus      = "Inventory Failed"
-            Error             = $_.Exception.Message
-        }
-    }
-}
-
-# ======================== PHASE 1: INVENTORY ========================
-
-Write-Host ""
-Write-Host "PHASE 1: INVENTORY - Checking VM power states in parallel" -ForegroundColor Cyan
-
-$InventoryQueue = New-JobQueue -Items $VMList -Worker $InventoryWorker -Name "Inventory"
-Wait-QueueGroup -Queues @($InventoryQueue) -Throttle $MaxParallelJobs
-
-$Inventory = @($InventoryQueue.Results)
-
-$RunningVMs = @($Inventory | Where-Object { $_.PowerBefore -eq "running" })
-$StoppedVMs = @($Inventory | Where-Object { $_.PowerBefore -in @("stopped", "deallocated") })
-$StartingVMs = @($Inventory | Where-Object { $_.PowerBefore -eq "starting" })
-$SkippedVMs = @($Inventory | Where-Object {
-    $_.PowerBefore -notin @("running", "stopped", "deallocated", "starting")
-})
-
-Write-Host ""
-Write-Host "Running VMs   : $($RunningVMs.Count)" -ForegroundColor Green
-Write-Host "Stopped VMs   : $($StoppedVMs.Count)" -ForegroundColor Yellow
-Write-Host "Starting VMs  : $($StartingVMs.Count)" -ForegroundColor Yellow
-Write-Host "Other/Unknown : $($SkippedVMs.Count)" -ForegroundColor Red
-
-# ======================== CLEANUP WORKER ========================
-
 $CleanupWorker = {
     param($VM, $ContextFile, $RemoteScript, $DoRestore)
 
@@ -384,43 +301,7 @@ $CleanupWorker = {
 
         Set-AzContext -SubscriptionId $VM.SubscriptionId -ErrorAction Stop | Out-Null
 
-        # Wait for the VM to be running and the Azure VM Agent to be ready.
-        $Deadline = (Get-Date).AddMinutes(10)
-        $AgentReady = $false
-        $PowerCode = $null
-
-        while ((Get-Date) -lt $Deadline) {
-            $S = Get-AzVM `
-                -ResourceGroupName $VM.ResourceGroupName `
-                -Name $VM.VMName `
-                -Status `
-                -ErrorAction Stop
-
-            $PowerCode = ($S.Statuses |
-                Where-Object { $_.Code -like "PowerState/*" } |
-                Select-Object -First 1).Code
-
-            $AgentReady = $false
-
-            if ($S.VMAgent -and $S.VMAgent.Statuses) {
-                $AgentReady = [bool](
-                    $S.VMAgent.Statuses | Where-Object {
-                        $_.DisplayStatus -match "Ready" -or
-                        $_.Code -match "ProvisioningState/succeeded"
-                    } | Select-Object -First 1
-                )
-            }
-
-            if ($PowerCode -eq "PowerState/running" -and $AgentReady) {
-                break
-            }
-
-            Start-Sleep -Seconds 15
-        }
-
-        if ($PowerCode -ne "PowerState/running" -or !$AgentReady) {
-            throw "VM or guest agent did not become ready within 10 minutes."
-        }
+        # No power-state inventory or guest-agent polling: invoke Run Command directly.
 
         $Response = Invoke-AzVMRunCommand `
             -ResourceGroupName $VM.ResourceGroupName `
@@ -467,28 +348,12 @@ $CleanupWorker = {
         $PoweredOff = $false
         $ErrorText = ""
 
-        if ($VM.StartedByScript -and $DoRestore -and $Status -eq "Success") {
-            try {
-                Stop-AzVM `
-                    -ResourceGroupName $VM.ResourceGroupName `
-                    -Name $VM.VMName `
-                    -Force `
-                    -ErrorAction Stop | Out-Null
-
-                $PoweredOff = $true
-            }
-            catch {
-                $ErrorText = "Cleanup succeeded, but deallocation failed: " +
-                    $_.Exception.Message
-            }
-        }
-
         [PSCustomObject]@{
             VMName            = $VM.VMName
             ResourceGroupName = $VM.ResourceGroupName
             SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = $VM.PowerBefore
-            StartedByScript   = $VM.StartedByScript
+            PowerBefore       = "AssumedRunning"
+            StartedByScript   = $false
             PoweredOffAfter   = $PoweredOff
             GhostedBefore     = $GhostBefore
             GhostedAfter      = $GhostAfter
@@ -504,8 +369,8 @@ $CleanupWorker = {
             VMName            = $VM.VMName
             ResourceGroupName = $VM.ResourceGroupName
             SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = $VM.PowerBefore
-            StartedByScript   = $VM.StartedByScript
+            PowerBefore       = "AssumedRunning"
+            StartedByScript   = $false
             PoweredOffAfter   = $false
             GhostedBefore     = $null
             GhostedAfter      = $null
@@ -518,228 +383,40 @@ $CleanupWorker = {
     }
 }
 
-# ======================== PHASE 2: LAUNCH RUNNING VM CLEANUP ========================
+# ======================== DIRECT PARALLEL CLEANUP ========================
 
-$RunningCleanupItems = @(
-    foreach ($VM in $RunningVMs) {
+$CleanupItems = @(
+    foreach ($VM in $VMList) {
         [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = "running"
+            VMName            = $VM.VMName.Trim()
+            ResourceGroupName = $VM.ResourceGroupName.Trim()
+            SubscriptionId    = $VM.SubscriptionId.Trim()
+            PowerBefore       = "AssumedRunning"
             StartedByScript   = $false
         }
     }
 )
 
-$RunningCleanupQueue = New-JobQueue `
-    -Items $RunningCleanupItems `
+$CleanupQueue = New-JobQueue `
+    -Items $CleanupItems `
     -Worker $CleanupWorker `
-    -Name "RunningCleanup" `
-    -Restore ([bool]$RestorePowerState)
+    -Name "DirectCleanup" `
+    -Restore $false
 
 Write-Host ""
-Write-Host "PHASE 2: LAUNCHING CLEANUP ON ALREADY-RUNNING VMS" -ForegroundColor Cyan
-
-Start-QueuedJobs -Queue $RunningCleanupQueue -Throttle $MaxParallelJobs
-
-Write-Host "Initial running-VM cleanup jobs launched." -ForegroundColor Green
-
-# ======================== START WORKER ========================
-
-$StartWorker = {
-    param($VM, $ContextFile, $UnusedScript, $UnusedRestore)
-
-    try {
-        Import-Module Az.Accounts -ErrorAction Stop
-        Import-Module Az.Compute -ErrorAction Stop
-        Import-AzContext -Path $ContextFile -ErrorAction Stop | Out-Null
-
-        Set-AzContext -SubscriptionId $VM.SubscriptionId -ErrorAction Stop | Out-Null
-
-        Start-AzVM `
-            -ResourceGroupName $VM.ResourceGroupName `
-            -Name $VM.VMName `
-            -ErrorAction Stop | Out-Null
-
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            StartStatus       = "Success"
-            Error             = ""
-        }
-    }
-    catch {
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            StartStatus       = "Failed"
-            Error             = $_.Exception.Message
-        }
-    }
-}
-
-# ======================== PHASE 3: START STOPPED VMS ========================
-
-$StartQueue = New-JobQueue -Items $StoppedVMs -Worker $StartWorker -Name "StartVMs"
-
+Write-Host "DIRECT CLEANUP: RUNNING ON ALL CSV VMS" -ForegroundColor Cyan
+Write-Host "Power-state inventory : SKIPPED" -ForegroundColor Green
+Write-Host "VM start/stop actions : DISABLED" -ForegroundColor Green
+Write-Host "Cleanup targets       : $($CleanupItems.Count)"
+Write-Host "Parallel limit        : $MaxParallelJobs"
 Write-Host ""
-Write-Host "PHASE 3: STARTING ALL STOPPED/DEALLOCATED VMS" -ForegroundColor Cyan
 
-# Keep both queues moving. Do NOT wait for running-VM cleanup to finish here.
-while (!(Test-QueueComplete -Queue $StartQueue)) {
-    Pump-Queues `
-        -Queues @($RunningCleanupQueue, $StartQueue) `
-        -Throttle $MaxParallelJobs
+Wait-QueueGroup -Queues @($CleanupQueue) -Throttle $MaxParallelJobs
+$AllResults = @($CleanupQueue.Results)
 
-    Start-Sleep -Seconds 2
-}
-
-$StartResults = @($StartQueue.Results)
-
-$StartedVMs = @($StartResults | Where-Object { $_.StartStatus -eq "Success" })
-$StartFailedVMs = @($StartResults | Where-Object { $_.StartStatus -eq "Failed" })
-
-Write-Host "Successfully started : $($StartedVMs.Count)" -ForegroundColor Green
-Write-Host "Startup failures     : $($StartFailedVMs.Count)" -ForegroundColor Red
-
-# ======================== PHASE 4: FIVE-MINUTE BOOT WAIT ========================
-
-if ($StartedVMs.Count -gt 0) {
-    Write-Host ""
-    Write-Host "PHASE 4: WAITING 5 MINUTES FOR WINDOWS INITIALIZATION" -ForegroundColor Yellow
-
-    $Deadline = (Get-Date).AddSeconds($BootWaitSeconds)
-
-    while ((Get-Date) -lt $Deadline) {
-        # Running-VM cleanup continues during the five-minute wait.
-        Pump-Queues -Queues @($RunningCleanupQueue) -Throttle $MaxParallelJobs
-
-        $Remaining = [math]::Ceiling(($Deadline - (Get-Date)).TotalSeconds)
-
-        Write-Progress `
-            -Activity "Windows startup wait" `
-            -Status "$Remaining seconds remaining" `
-            -PercentComplete ([math]::Max(0, [math]::Min(100, (($BootWaitSeconds - $Remaining) / $BootWaitSeconds * 100))))
-
-        Start-Sleep -Seconds 2
-    }
-
-    Write-Progress -Activity "Windows startup wait" -Completed
-}
-else {
-    Write-Host "No newly started VMs. Skipping five-minute wait." -ForegroundColor Yellow
-}
-
-# ======================== PHASE 5: CLEANUP NEWLY STARTED VMS ========================
-
-$DelayedCleanupItems = @(
-    foreach ($VM in $StartedVMs) {
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = "stopped/deallocated"
-            StartedByScript   = $true
-        }
-    }
-
-    foreach ($VM in $StartingVMs) {
-        [PSCustomObject]@{
-            VMName            = $VM.VMName
-            ResourceGroupName = $VM.ResourceGroupName
-            SubscriptionId    = $VM.SubscriptionId
-            PowerBefore       = "starting"
-            StartedByScript   = $false
-        }
-    }
-)
-
-$DelayedCleanupQueue = New-JobQueue `
-    -Items $DelayedCleanupItems `
-    -Worker $CleanupWorker `
-    -Name "DelayedCleanup" `
-    -Restore ([bool]$RestorePowerState)
-
-Write-Host ""
-Write-Host "PHASE 5: CLEANUP ON NEWLY STARTED VMS" -ForegroundColor Cyan
-Write-Host "Cleanup targets: $($DelayedCleanupItems.Count)"
-
-# Wait for both the original running-VM queue and the newly started-VM queue.
-Wait-QueueGroup `
-    -Queues @($RunningCleanupQueue, $DelayedCleanupQueue) `
-    -Throttle $MaxParallelJobs
-
-# ======================== PHASE 6: CONSOLIDATE RESULTS ========================
-
-foreach ($Result in $RunningCleanupQueue.Results) {
-    [void]$AllResults.Add($Result)
-}
-
-foreach ($Result in $DelayedCleanupQueue.Results) {
-    [void]$AllResults.Add($Result)
-}
-
-foreach ($VM in $Inventory | Where-Object { $_.ResultStatus -eq "Inventory Failed" }) {
-    [void]$AllResults.Add([PSCustomObject]@{
-        VMName            = $VM.VMName
-        ResourceGroupName = $VM.ResourceGroupName
-        SubscriptionId    = $VM.SubscriptionId
-        PowerBefore       = "Unknown"
-        StartedByScript   = $false
-        PoweredOffAfter   = $false
-        GhostedBefore     = $null
-        GhostedAfter      = $null
-        AdaptersBefore    = $null
-        AdaptersAfter     = $null
-        Minutes           = 0
-        CleanupStatus     = "Inventory Failed"
-        Error             = $VM.Error
-    })
-}
-
-foreach ($VM in $SkippedVMs) {
-    [void]$AllResults.Add([PSCustomObject]@{
-        VMName            = $VM.VMName
-        ResourceGroupName = $VM.ResourceGroupName
-        SubscriptionId    = $VM.SubscriptionId
-        PowerBefore       = $VM.PowerBefore
-        StartedByScript   = $false
-        PoweredOffAfter   = $false
-        GhostedBefore     = $null
-        GhostedAfter      = $null
-        AdaptersBefore    = $null
-        AdaptersAfter     = $null
-        Minutes           = 0
-        CleanupStatus     = "Skipped - Unsupported Power State"
-        Error             = ""
-    })
-}
-
-foreach ($VM in $StartFailedVMs) {
-    [void]$AllResults.Add([PSCustomObject]@{
-        VMName            = $VM.VMName
-        ResourceGroupName = $VM.ResourceGroupName
-        SubscriptionId    = $VM.SubscriptionId
-        PowerBefore       = "stopped/deallocated"
-        StartedByScript   = $false
-        PoweredOffAfter   = $false
-        GhostedBefore     = $null
-        GhostedAfter      = $null
-        AdaptersBefore    = $null
-        AdaptersAfter     = $null
-        Minutes           = 0
-        CleanupStatus     = "VM Start Failed"
-        Error             = $VM.Error
-    })
-}
-
-# ======================== PHASE 7: EXPORT CSV ========================
+# ======================== EXPORT RESULTS ========================
 
 $OutputDirectory = Split-Path $OutputPath -Parent
-
 if (!(Test-Path -LiteralPath $OutputDirectory)) {
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 }
@@ -748,65 +425,32 @@ $AllResults |
     Sort-Object VMName |
     Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Force
 
-# ======================== PHASE 8: SUMMARY ========================
-
 $Success = @($AllResults | Where-Object { $_.CleanupStatus -eq "Success" })
 $Warnings = @($AllResults | Where-Object { $_.CleanupStatus -like "WARNING*" })
-
 $Failed = @($AllResults | Where-Object {
-    $_.CleanupStatus -in @(
-        "Run Command Failed",
-        "VM Start Failed",
-        "Inventory Failed",
-        "Background Job Failed"
-    )
+    $_.CleanupStatus -in @("Run Command Failed", "Background Job Failed")
 })
-
-$Skipped = @($AllResults | Where-Object {
-    $_.CleanupStatus -like "Skipped*"
-})
-
-$Started = @($AllResults | Where-Object { $_.StartedByScript })
-$StillOn = @($Started | Where-Object { !$_.PoweredOffAfter })
 
 Write-Host ""
 Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "                 FINAL CLEANUP SUMMARY" -ForegroundColor Cyan
+Write-Host "             FINAL CLEANUP SUMMARY" -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Cyan
-
-Write-Host "Total CSV VMs          : $($VMList.Count)"
-Write-Host "Running VMs initially  : $($RunningVMs.Count)"
-Write-Host "Stopped VMs initially  : $($StoppedVMs.Count)"
-Write-Host "Successfully started   : $($StartedVMs.Count)"
-Write-Host "Cleanup succeeded      : $($Success.Count)" -ForegroundColor Green
-Write-Host "Warnings               : $($Warnings.Count)" -ForegroundColor Yellow
-Write-Host "Failed                 : $($Failed.Count)" -ForegroundColor Red
-Write-Host "Skipped                : $($Skipped.Count)"
-Write-Host "Started by script      : $($Started.Count)"
-Write-Host "Started and still on   : $($StillOn.Count)" -ForegroundColor Yellow
-
+Write-Host "Total CSV VMs       : $($VMList.Count)"
+Write-Host "Cleanup succeeded   : $($Success.Count)" -ForegroundColor Green
+Write-Host "Warnings            : $($Warnings.Count)" -ForegroundColor Yellow
+Write-Host "Failed              : $($Failed.Count)" -ForegroundColor Red
 Write-Host ""
-Write-Host "DETAILED RESULTS" -ForegroundColor Cyan
-
 $AllResults |
     Sort-Object VMName |
-    Format-Table VMName, PowerBefore, StartedByScript,
-        GhostedBefore, GhostedAfter, AdaptersBefore, AdaptersAfter,
-        Minutes, CleanupStatus -AutoSize -Wrap
+    Format-Table VMName, GhostedBefore, GhostedAfter, AdaptersBefore, AdaptersAfter, Minutes, CleanupStatus -AutoSize -Wrap
 
 if ($Failed.Count -gt 0) {
-    Write-Host ""
     Write-Host "FAILED VMS" -ForegroundColor Red
     $Failed | Select-Object VMName, CleanupStatus, Error | Format-Table -AutoSize -Wrap
 }
 
 Write-Host ""
 Write-Host "CSV OUTPUT: $OutputPath" -ForegroundColor Green
-
-# ======================== PHASE 9: CLEANUP TEMP FILES ========================
-
 Remove-Item -LiteralPath $TempScript -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $ContextPath -Force -ErrorAction SilentlyContinue
-
-Write-Host ""
 Write-Host "Ghosted NIC cleanup execution completed." -ForegroundColor Green
