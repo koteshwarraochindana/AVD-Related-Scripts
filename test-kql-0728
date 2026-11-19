@@ -3,25 +3,22 @@
 
 [CmdletBinding()]
 param(
-    [string]$OnlyVM = "",
-    [switch]$Force
+    [string]$OnlyVM = ""
 )
 
 # ======================== CONFIGURATION ========================
-$CsvPath           = "C:\Temp\Ghost\CleanUp\avd_hosts_cleanup.csv"
-$CleanupScriptPath = "C:\Temp\Ghost\CleanUp\Windows_GhostedNIC_Removal.ps1"
-$MaxThreads        = 50
+$CsvPath    = "C:\Temp\Ghost\CleanUp\avd_hosts_cleanup.csv"
+$MaxThreads = 50
 
 $ErrorActionPreference = "Stop"
 
 Write-Host ""
 Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "   FAST GHOSTED NIC CLEANUP DISPATCHER (-AsJob)"        -ForegroundColor Cyan
+Write-Host "   PARALLEL GHOSTED NIC VERIFICATION CHECK"            -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Cyan
 
 # ======================== VALIDATE INPUT ========================
 if (!(Test-Path -LiteralPath $CsvPath)) { throw "CSV file not found: $CsvPath" }
-if (!(Test-Path -LiteralPath $CleanupScriptPath)) { throw "Microsoft script not found: $CleanupScriptPath" }
 
 $RawCsv = @(Import-Csv -LiteralPath $CsvPath)
 if ($RawCsv.Count -eq 0) { throw "CSV contains no VM records." }
@@ -60,17 +57,8 @@ Write-Host ("Total VMs       : {0}" -f $VMList.Count)
 Write-Host ("Parallel threads: {0}" -f $MaxThreads)
 Write-Host ""
 
-# ======================== CONFIRMATION ========================
-if (!$Force) {
-    Write-Host "This dispatches Windows_GhostedNIC_Removal.ps1 to all target VMs in the background." -ForegroundColor Yellow
-    $Answer = Read-Host "Type YES to continue"
-    if ($Answer -cne "YES") {
-        Write-Host "Cancelled. No changes made." -ForegroundColor Green
-        return
-    }
-}
-
 # ======================== AZURE AUTHENTICATION ========================
+Disable-AzContextAutosave -Scope Process | Out-Null
 Write-Host "Starting Azure device-code authentication..." -ForegroundColor Cyan
 $Login = Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop
 if (!$Login) { throw "Connect-AzAccount did not return an authenticated context." }
@@ -78,6 +66,15 @@ if (!$Login) { throw "Connect-AzAccount did not return an authenticated context.
 $Context = Get-AzContext
 if (!$Context) { throw "Get-AzContext returned no context." }
 Write-Host ("Authenticated   : {0}" -f $Context.Account.Id) -ForegroundColor Green
+
+# ======================== REMOTE CHECK PAYLOAD ========================
+# Fast read-only check that counts remaining ghosted NICs and active adapters
+$CheckScriptBlock = @'
+$ErrorActionPreference = "SilentlyContinue"
+$Ghosts   = @(Get-PnpDevice -Class Net | Where-Object { $_.Present -eq $false }).Count
+$Adapters = @(Get-NetAdapter).Count
+Write-Output ("VERIFY_NIC|{0}|{1}|{2}" -f $env:COMPUTERNAME, $Ghosts, $Adapters)
+'@
 
 # ======================== RUNSPACE POOL EXECUTION ========================
 $SessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -87,50 +84,53 @@ $Pool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads, $SessionState, $Ho
 $Pool.Open()
 
 $WorkerScript = {
-    param($VMName, $ResourceGroupName, $SubscriptionId, $ScriptPath)
+    param($VMName, $ResourceGroupName, $SubscriptionId, $RemoteCode)
     try {
         Set-AzContext -SubscriptionId $SubscriptionId -Scope Process -ErrorAction Stop | Out-Null
 
-        # -AsJob triggers the Azure Run Command HTTP POST immediately without waiting for completion
-        $AzJob = Invoke-AzVMRunCommand `
+        $Response = Invoke-AzVMRunCommand `
             -ResourceGroupName $ResourceGroupName `
             -VMName $VMName `
             -CommandId "RunPowerShellScript" `
-            -ScriptPath $ScriptPath `
-            -AsJob `
+            -ScriptString $RemoteCode `
             -ErrorAction Stop
 
-        # Brief pause to catch immediate HTTP errors (e.g., VM deallocated, not found, or conflict)
-        Start-Sleep -Seconds 2
-        if ($AzJob.State -eq "Failed") {
-            $ErrDetail = ($AzJob.ChildJobs[0].JobStateInfo.Reason.Message)
-            if ([string]::IsNullOrWhiteSpace($ErrDetail)) { $ErrDetail = "Azure rejected the Run Command request." }
-            throw $ErrDetail
-        }
+        $Message = ($Response.Value | ForEach-Object { $_.Message }) -join "`n"
+        $Marker  = [regex]::Match($Message, '(?m)VERIFY_NIC\|[^\r\n]+')
 
-        [PSCustomObject]@{
-            VMName            = $VMName
-            ResourceGroupName = $ResourceGroupName
-            SubscriptionId    = $SubscriptionId
-            Status            = "Dispatched"
-            Error             = ""
+        if ($Marker.Success) {
+            $Parts = $Marker.Value -split '\|'
+            $GhostCount   = [int]$Parts[2]
+            $AdapterCount = [int]$Parts[3]
+
+            $State = if ($GhostCount -eq 0) { "Clean" } else { "Ghosts Remaining" }
+
+            [PSCustomObject]@{
+                VMName         = $VMName
+                RemainingGhosts = $GhostCount
+                ActiveAdapters = $AdapterCount
+                Status         = $State
+                Error          = ""
+            }
+        } else {
+            throw "Unexpected output: $Message"
         }
     } catch {
         [PSCustomObject]@{
-            VMName            = $VMName
-            ResourceGroupName = $ResourceGroupName
-            SubscriptionId    = $SubscriptionId
-            Status            = "Failed"
-            Error             = $_.Exception.Message
+            VMName          = $VMName
+            RemainingGhosts = $null
+            ActiveAdapters  = $null
+            Status          = "Check Failed"
+            Error           = $_.Exception.Message
         }
     }
 }
 
-$Jobs = New-Object System.Collections.Generic.List[object]
+$Jobs  = New-Object System.Collections.Generic.List[object]
 $Watch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host ""
-Write-Host "Dispatching cleanup script to all VMs..." -ForegroundColor Cyan
+Write-Host "Checking remaining ghosted NICs across VMs..." -ForegroundColor Cyan
 
 foreach ($VM in $VMList) {
     $PS = [powershell]::Create()
@@ -139,7 +139,7 @@ foreach ($VM in $VMList) {
     [void]$PS.AddArgument($VM.VMName)
     [void]$PS.AddArgument($VM.ResourceGroupName)
     [void]$PS.AddArgument($VM.SubscriptionId)
-    [void]$PS.AddArgument($CleanupScriptPath)
+    [void]$PS.AddArgument($CheckScriptBlock)
 
     $Jobs.Add([PSCustomObject]@{
         VM     = $VM
@@ -159,11 +159,11 @@ while ($Jobs.Count -gt 0) {
             foreach ($Row in $Output) { $AllResults.Add($Row) }
         } catch {
             $AllResults.Add([PSCustomObject]@{
-                VMName            = $Item.VM.VMName
-                ResourceGroupName = $Item.VM.ResourceGroupName
-                SubscriptionId    = $Item.VM.SubscriptionId
-                Status            = "Failed"
-                Error             = $_.Exception.Message
+                VMName          = $Item.VM.VMName
+                RemainingGhosts = $null
+                ActiveAdapters  = $null
+                Status          = "Check Failed"
+                Error           = $_.Exception.Message
             })
         } finally {
             $Item.Pipe.Dispose()
@@ -172,34 +172,38 @@ while ($Jobs.Count -gt 0) {
     }
 
     $DoneCount = $TotalCount - $Jobs.Count
-    $Percent = if ($TotalCount -gt 0) { [int](100 * $DoneCount / $TotalCount) } else { 100 }
-    Write-Progress -Activity "Dispatching Ghosted NIC Cleanup" `
-        -Status ("Dispatched {0}/{1} | Remaining {2}" -f $DoneCount, $TotalCount, $Jobs.Count) `
+    $Percent   = if ($TotalCount -gt 0) { [int](100 * $DoneCount / $TotalCount) } else { 100 }
+    Write-Progress -Activity "Verifying Ghosted NIC Cleanup" `
+        -Status ("Checked {0}/{1} | Remaining {2}" -f $DoneCount, $TotalCount, $Jobs.Count) `
         -PercentComplete $Percent
 
-    if ($Jobs.Count -gt 0) { Start-Sleep -Milliseconds 200 }
+    if ($Jobs.Count -gt 0) { Start-Sleep -Milliseconds 250 }
 }
 
-Write-Progress -Activity "Dispatching Ghosted NIC Cleanup" -Completed
+Write-Progress -Activity "Verifying Ghosted NIC Cleanup" -Completed
 $Pool.Close()
 $Pool.Dispose()
 $Watch.Stop()
 
 # ======================== CONSOLE SUMMARY ========================
-$Dispatched = @($AllResults | Where-Object { $_.Status -eq "Dispatched" })
-$Failed     = @($AllResults | Where-Object { $_.Status -eq "Failed" })
+$Clean     = @($AllResults | Where-Object { $_.Status -eq "Clean" })
+$Remaining = @($AllResults | Where-Object { $_.Status -eq "Ghosts Remaining" })
+$Failed    = @($AllResults | Where-Object { $_.Status -eq "Check Failed" })
 
 Write-Host ""
 Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host "   DISPATCH SUMMARY"                                   -ForegroundColor Cyan
+Write-Host "   VERIFICATION SUMMARY"                                 -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Cyan
-Write-Host ("Total VMs    : {0}" -f $TotalCount)
-Write-Host ("Dispatched   : {0}" -f $Dispatched.Count) -ForegroundColor Green
-Write-Host ("Failed       : {0}" -f $Failed.Count)     -ForegroundColor Red
-Write-Host ("Elapsed Time : {0} seconds" -f [math]::Round($Watch.Elapsed.TotalSeconds, 1))
+Write-Host ("Total VMs        : {0}" -f $TotalCount)
+Write-Host ("Clean (0 Ghosts) : {0}" -f $Clean.Count)     -ForegroundColor Green
+Write-Host ("Ghosts Remaining : {0}" -f $Remaining.Count) -ForegroundColor Yellow
+Write-Host ("Check Failed     : {0}" -f $Failed.Count)    -ForegroundColor Red
+Write-Host ("Elapsed Time     : {0} seconds" -f [math]::Round($Watch.Elapsed.TotalSeconds, 1))
 Write-Host ""
+
+$AllResults | Sort-Object RemainingGhosts -Descending | Select-Object VMName, RemainingGhosts, ActiveAdapters, Status | Format-Table -AutoSize
 
 if ($Failed.Count -gt 0) {
-    Write-Host "FAILED DISPATCHES" -ForegroundColor Red
-    $Failed | Sort-Object VMName | Select-Object VMName, ResourceGroupName, Error | Format-Table -AutoSize -Wrap
+    Write-Host "FAILED CHECKS (VM may still be running Step 1 cleanup)" -ForegroundColor Red
+    $Failed | Sort-Object VMName | Select-Object VMName, Error | Format-Table -AutoSize -Wrap
 }
