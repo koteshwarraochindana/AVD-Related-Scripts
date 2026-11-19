@@ -3,7 +3,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$OnlyVM = ""
+    [string]$OnlyVM = "",
+    [int]$TimeoutSeconds = 60
 )
 
 # ======================== CONFIGURATION ========================
@@ -55,6 +56,7 @@ if (![string]::IsNullOrWhiteSpace($OnlyVM)) {
 
 Write-Host ("Total VMs       : {0}" -f $VMList.Count)
 Write-Host ("Parallel threads: {0}" -f $MaxThreads)
+Write-Host ("Per-VM timeout  : {0} seconds" -f $TimeoutSeconds)
 Write-Host ""
 
 # ======================== AZURE AUTHENTICATION ========================
@@ -68,7 +70,6 @@ if (!$Context) { throw "Get-AzContext returned no context." }
 Write-Host ("Authenticated   : {0}" -f $Context.Account.Id) -ForegroundColor Green
 
 # ======================== REMOTE CHECK PAYLOAD ========================
-# Fast read-only check that counts remaining ghosted NICs and active adapters
 $CheckScriptBlock = @'
 $ErrorActionPreference = "SilentlyContinue"
 $Ghosts   = @(Get-PnpDevice -Class Net | Where-Object { $_.Present -eq $false }).Count
@@ -99,18 +100,17 @@ $WorkerScript = {
         $Marker  = [regex]::Match($Message, '(?m)VERIFY_NIC\|[^\r\n]+')
 
         if ($Marker.Success) {
-            $Parts = $Marker.Value -split '\|'
+            $Parts        = $Marker.Value -split '\|'
             $GhostCount   = [int]$Parts[2]
             $AdapterCount = [int]$Parts[3]
-
-            $State = if ($GhostCount -eq 0) { "Clean" } else { "Ghosts Remaining" }
+            $State        = if ($GhostCount -eq 0) { "Clean" } else { "Ghosts Remaining" }
 
             [PSCustomObject]@{
-                VMName         = $VMName
+                VMName          = $VMName
                 RemainingGhosts = $GhostCount
-                ActiveAdapters = $AdapterCount
-                Status         = $State
-                Error          = ""
+                ActiveAdapters  = $AdapterCount
+                Status          = $State
+                Error           = ""
             }
         } else {
             throw "Unexpected output: $Message"
@@ -130,7 +130,7 @@ $Jobs  = New-Object System.Collections.Generic.List[object]
 $Watch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host ""
-Write-Host "Checking remaining ghosted NICs across VMs..." -ForegroundColor Cyan
+Write-Host "Checking remaining ghosted NICs across VMs (live output below)..." -ForegroundColor Cyan
 
 foreach ($VM in $VMList) {
     $PS = [powershell]::Create()
@@ -142,9 +142,10 @@ foreach ($VM in $VMList) {
     [void]$PS.AddArgument($CheckScriptBlock)
 
     $Jobs.Add([PSCustomObject]@{
-        VM     = $VM
-        Pipe   = $PS
-        Handle = $PS.BeginInvoke()
+        VM        = $VM
+        Pipe      = $PS
+        Handle    = $PS.BeginInvoke()
+        StartedAt = Get-Date
     })
 }
 
@@ -152,11 +153,23 @@ $AllResults = New-Object System.Collections.Generic.List[object]
 $TotalCount = $Jobs.Count
 
 while ($Jobs.Count -gt 0) {
+    $Now       = Get-Date
     $Completed = @($Jobs | Where-Object { $_.Handle.IsCompleted })
+
     foreach ($Item in $Completed) {
         try {
             $Output = $Item.Pipe.EndInvoke($Item.Handle)
-            foreach ($Row in $Output) { $AllResults.Add($Row) }
+            foreach ($Row in $Output) {
+                $AllResults.Add($Row)
+                $DoneSoFar = $AllResults.Count
+                if ($Row.Status -eq "Clean") {
+                    Write-Host ("[{0}/{1}] {2} -> Clean (Ghosts: 0 | Active: {3})" -f $DoneSoFar, $TotalCount, $Row.VMName, $Row.ActiveAdapters) -ForegroundColor Green
+                } elseif ($Row.Status -eq "Ghosts Remaining") {
+                    Write-Host ("[{0}/{1}] {2} -> Ghosts Remaining: {3} (Active: {4})" -f $DoneSoFar, $TotalCount, $Row.VMName, $Row.RemainingGhosts, $Row.ActiveAdapters) -ForegroundColor Yellow
+                } else {
+                    Write-Host ("[{0}/{1}] {2} -> Check Failed" -f $DoneSoFar, $TotalCount, $Row.VMName) -ForegroundColor Red
+                }
+            }
         } catch {
             $AllResults.Add([PSCustomObject]@{
                 VMName          = $Item.VM.VMName
@@ -165,10 +178,27 @@ while ($Jobs.Count -gt 0) {
                 Status          = "Check Failed"
                 Error           = $_.Exception.Message
             })
+            Write-Host ("[{0}/{1}] {2} -> Check Failed" -f $AllResults.Count, $TotalCount, $Item.VM.VMName) -ForegroundColor Red
         } finally {
             $Item.Pipe.Dispose()
             [void]$Jobs.Remove($Item)
         }
+    }
+
+    # Cancel any straggler thread exceeding $TimeoutSeconds
+    $TimedOut = @($Jobs | Where-Object { ($Now - $_.StartedAt).TotalSeconds -gt $TimeoutSeconds })
+    foreach ($Item in $TimedOut) {
+        $Item.Pipe.Stop()
+        $Item.Pipe.Dispose()
+        $AllResults.Add([PSCustomObject]@{
+            VMName          = $Item.VM.VMName
+            RemainingGhosts = $null
+            ActiveAdapters  = $null
+            Status          = "Timed Out"
+            Error           = "Check exceeded ${TimeoutSeconds}s (Step 1 likely still running on this VM)."
+        })
+        Write-Host ("[{0}/{1}] {2} -> Timed Out ({3}s)" -f $AllResults.Count, $TotalCount, $Item.VM.VMName, $TimeoutSeconds) -ForegroundColor DarkYellow
+        [void]$Jobs.Remove($Item)
     }
 
     $DoneCount = $TotalCount - $Jobs.Count
@@ -188,7 +218,7 @@ $Watch.Stop()
 # ======================== CONSOLE SUMMARY ========================
 $Clean     = @($AllResults | Where-Object { $_.Status -eq "Clean" })
 $Remaining = @($AllResults | Where-Object { $_.Status -eq "Ghosts Remaining" })
-$Failed    = @($AllResults | Where-Object { $_.Status -eq "Check Failed" })
+$Failed    = @($AllResults | Where-Object { $_.Status -notin @("Clean", "Ghosts Remaining") })
 
 Write-Host ""
 Write-Host "======================================================" -ForegroundColor Cyan
@@ -197,13 +227,16 @@ Write-Host "======================================================" -ForegroundC
 Write-Host ("Total VMs        : {0}" -f $TotalCount)
 Write-Host ("Clean (0 Ghosts) : {0}" -f $Clean.Count)     -ForegroundColor Green
 Write-Host ("Ghosts Remaining : {0}" -f $Remaining.Count) -ForegroundColor Yellow
-Write-Host ("Check Failed     : {0}" -f $Failed.Count)    -ForegroundColor Red
+Write-Host ("Failed/Timed Out : {0}" -f $Failed.Count)    -ForegroundColor Red
 Write-Host ("Elapsed Time     : {0} seconds" -f [math]::Round($Watch.Elapsed.TotalSeconds, 1))
 Write-Host ""
 
-$AllResults | Sort-Object RemainingGhosts -Descending | Select-Object VMName, RemainingGhosts, ActiveAdapters, Status | Format-Table -AutoSize
+if ($Remaining.Count -gt 0) {
+    Write-Host "VMS WITH REMAINING GHOSTED NICS" -ForegroundColor Yellow
+    $Remaining | Sort-Object RemainingGhosts -Descending | Select-Object VMName, RemainingGhosts, ActiveAdapters, Status | Format-Table -AutoSize
+}
 
 if ($Failed.Count -gt 0) {
-    Write-Host "FAILED CHECKS (VM may still be running Step 1 cleanup)" -ForegroundColor Red
-    $Failed | Sort-Object VMName | Select-Object VMName, Error | Format-Table -AutoSize -Wrap
+    Write-Host "FAILED / TIMED OUT CHECKS" -ForegroundColor Red
+    $Failed | Sort-Object VMName | Select-Object VMName, Status, Error | Format-Table -AutoSize -Wrap
 }
